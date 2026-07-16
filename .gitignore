@@ -1,0 +1,23 @@
+# large local-only source data — regenerate via scripts/ingest_dbn.py / ingest.mjs
+/NQ_1min.csv
+/newdata/
+
+# local Claude Code settings (locally-approved command permissions, not for sharing)
+.claude/settings.local.json
+
+# node
+node_modules/
+.next/
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+
+# python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

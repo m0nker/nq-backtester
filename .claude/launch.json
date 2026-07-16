@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": [
+        "/c",
+        "set PATH=C:\\Users\\ezdpr\\.node\\node-v24.18.0-win-x64;%PATH% && npm run dev --prefix web"
+      ],
+      "port": 3000
+    }
+  ]
+}
