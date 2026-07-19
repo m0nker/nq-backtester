@@ -15,6 +15,8 @@ export default function OrderPanel() {
     placeMarket,
     pendingClick,
     setPendingClick,
+    schema,
+    startSchema,
   } = useTrading();
 
   const chip = (active: boolean) =>
@@ -74,6 +76,30 @@ export default function OrderPanel() {
         <p className="mb-2 text-xs text-amber-400">click the chart to set the price · esc to cancel</p>
       )}
 
+      {/* schema (draft) bracket: entry+SL+TP lines on the chart, placed only
+          when the on-chart Place button is confirmed */}
+      <div className="mb-2 grid grid-cols-2 gap-1">
+        <button
+          className={chip(schema?.side === 'buy')}
+          onClick={() => startSchema('buy')}
+          title="Draft a bracket on the chart: drag entry/SL/TP, then Place"
+        >
+          Buy Bracket
+        </button>
+        <button
+          className={chip(schema?.side === 'sell')}
+          onClick={() => startSchema('sell')}
+          title="Draft a bracket on the chart: drag entry/SL/TP, then Place"
+        >
+          Sell Bracket
+        </button>
+      </div>
+      {schema && (
+        <p className="mb-2 text-xs text-sky-400">
+          draft on chart — drag the lines, then hit Place on the entry chip
+        </p>
+      )}
+
       <div className="border-t border-slate-800 pt-2">
         <label className="flex items-center gap-2 text-xs text-slate-300">
           <input
@@ -109,7 +135,7 @@ export default function OrderPanel() {
       </div>
 
       <p className="mt-2 border-t border-slate-800 pt-1.5 text-[10px] leading-tight text-slate-600">
-        market fills at next bar open · limit fills through level · stop on touch · SL first on ambiguous bars
+        market fills at next bar open · limit fills through level · stop on touch · same-bar SL/TP sequenced by 1s data when available (else SL first)
       </p>
     </div>
   );

@@ -364,6 +364,31 @@ export class InstrumentSource {
     );
   }
 
+  // Loaded 1s bars with t in [fromTs, toTs), for intrabar sequencing of a
+  // CLOSED minute bar (caller guarantees toTs <= the replay clock — the fill
+  // simulator only sees closed bars). Returns null when the day has no 1s
+  // coverage or the chunk isn't loaded — caller falls back to the SL-first
+  // heuristic.
+  getSecondsBarsIn(fromTs: number, toTs: number): Bar[] | null {
+    if (!this.hasSecondsAt(fromTs)) return null;
+    const bars = this.seconds.bars;
+    let lo = 0,
+      hi = bars.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (bars[mid].t < fromTs) lo = mid + 1;
+      else hi = mid;
+    }
+    let end = lo,
+      hi3 = bars.length;
+    while (end < hi3) {
+      const mid = (end + hi3) >> 1;
+      if (bars[mid].t < toTs) end = mid + 1;
+      else hi3 = mid;
+    }
+    return end > lo ? bars.slice(lo, end) : null;
+  }
+
   async getHistoricalBars(fromTs: number, toTs: number, guardTs: number): Promise<Bar[]> {
     const ds = this.minute;
     const end = Math.min(toTs, guardTs);
@@ -469,6 +494,9 @@ export function getVisibleCandlesIncremental(upTo: number, tf: Timeframe): Candl
 }
 export function getBarsInWindow(afterTs: number, upTo: number): Bar[] {
   return sources.NQ.getBarsInWindow(afterTs, upTo);
+}
+export function getSecondsBarsIn(fromTs: number, toTs: number): Bar[] | null {
+  return sources.NQ.getSecondsBarsIn(fromTs, toTs);
 }
 export function getHistoricalBars(fromTs: number, toTs: number, guardTs: number): Promise<Bar[]> {
   return sources.NQ.getHistoricalBars(fromTs, toTs, guardTs);

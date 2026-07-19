@@ -9,9 +9,11 @@
 //    stop) (gap-through fills worse, at open). Sell stop mirrored.
 //  - Within one bar, stops are evaluated BEFORE limits (conservative).
 //  - If a bracket's stop-loss AND take-profit both trigger in the same base
-//    bar, the STOP-LOSS is honored and the fill is flagged ambiguousBar —
-//    1m bars can't order intrabar ticks; this is the conservative default.
-//    Second-level data later shrinks this ambiguity.
+//    bar, the 1-second data for that minute (when available) is replayed to
+//    find which level was touched FIRST; the winner fills at the usual
+//    1m-bar price formula. Only when 1s coverage is absent — or both levels
+//    are hit inside the same 1s bar — does the conservative default apply:
+//    STOP-LOSS honored, fill flagged ambiguousBar.
 //  - No partial fills, no commission in v1 (config slot exists).
 
 import type { Bar } from '../types';
@@ -52,12 +54,52 @@ function triggers(o: WorkingOrder, bar: Bar): { hit: boolean; price: number; kin
   return { hit: false, price: 0, kind: 'stop_trigger' };
 }
 
+// Lazy provider of 1s bars covering [fromTs, toTs); null = no coverage.
+export type SecondsResolver = (fromTs: number, toTs: number) => Bar[] | null;
+
 // Evaluate one newly revealed base bar against the working orders.
 // Returns fills in execution order. OCO resolution (cancelling siblings) is
-// the caller's job — but same-bar OCO conflicts are resolved HERE (SL first).
-export function simulateBar(orders: WorkingOrder[], bar: Bar): FillIntent[] {
+// the caller's job — but same-bar OCO conflicts are resolved HERE: by 1s
+// replay when secondsFor provides data, else SL-first + ambiguous flag.
+export function simulateBar(
+  orders: WorkingOrder[],
+  bar: Bar,
+  secondsFor?: SecondsResolver,
+  barDurSec = 60,
+): FillIntent[] {
   const fills: FillIntent[] = [];
   const filledOco = new Set<string>(); // oco group ids consumed this bar
+
+  // Decide same-bar stop+limit OCO conflicts up front. Fill PRICES stay at
+  // 1-minute granularity (the usual bar formulas) — the 1s replay only
+  // decides WHICH leg fills.
+  const decisions = new Map<string, { winnerId: string; ambiguous: boolean }>();
+  const byOco = new Map<string, WorkingOrder[]>();
+  for (const o of orders) {
+    if (o.ocoId) (byOco.get(o.ocoId) ?? byOco.set(o.ocoId, []).get(o.ocoId)!).push(o);
+  }
+  for (const [ocoId, group] of byOco) {
+    if (group.length !== 2) continue;
+    const stop = group.find((o) => o.type === 'stop');
+    const limit = group.find((o) => o.type === 'limit');
+    if (!stop || !limit) continue;
+    if (!triggers(stop, bar).hit || !triggers(limit, bar).hit) continue;
+    let winnerId = stop.id; // conservative default: SL first
+    let ambiguous = true;
+    const secs = secondsFor?.(bar.t, bar.t + barDurSec);
+    if (secs) {
+      for (const sb of secs) {
+        const sHit = triggers(stop, sb).hit;
+        const lHit = triggers(limit, sb).hit;
+        if (!sHit && !lHit) continue;
+        winnerId = sHit ? stop.id : limit.id;
+        ambiguous = sHit && lHit; // both touched inside one second
+        break;
+      }
+      // neither level touched in the 1s replay (data gap): default stands
+    }
+    decisions.set(ocoId, { winnerId, ambiguous });
+  }
 
   // conservative intrabar ordering: markets, then stops, then limits
   const ordered = [
@@ -67,25 +109,20 @@ export function simulateBar(orders: WorkingOrder[], bar: Bar): FillIntent[] {
   ];
 
   for (const o of ordered) {
-    if (o.ocoId && filledOco.has(o.ocoId)) continue; // sibling already filled this bar (SL-first)
+    if (o.ocoId && filledOco.has(o.ocoId)) continue; // sibling already filled this bar
+    const decision = o.ocoId ? decisions.get(o.ocoId) : undefined;
+    if (decision && o.id !== decision.winnerId) continue; // lost the same-bar race
     const t = triggers(o, bar);
     if (!t.hit) continue;
 
-    // ambiguity: this order is a limit whose OCO sibling (a stop) also triggers this bar
-    let ambiguous = false;
-    if (o.ocoId) {
-      const sibling = orders.find((s) => s.id !== o.id && s.ocoId === o.ocoId);
-      if (sibling && triggers(sibling, bar).hit) ambiguous = true;
-      filledOco.add(o.ocoId);
-    }
-
+    if (o.ocoId) filledOco.add(o.ocoId);
     fills.push({
       orderId: o.id,
       side: o.side,
       qty: o.qty,
       price: t.price,
       fillKind: t.kind,
-      ambiguousBar: ambiguous,
+      ambiguousBar: decision?.ambiguous ?? false,
     });
   }
   return fills;

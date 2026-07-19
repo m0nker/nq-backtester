@@ -6,7 +6,7 @@
 'use client';
 
 import { create } from 'zustand';
-import { getBarsInWindow, lastVisibleBar } from '../data/barSource';
+import { getBarsInWindow, getSecondsBarsIn, lastVisibleBar } from '../data/barSource';
 import { appendEvent, endSession, getEvents, resumeSession, startSession } from '../events/eventLog';
 import type { BracketSpec, OrderType, Side } from '../events/types';
 import { useReplay } from '../replay/clock';
@@ -15,6 +15,19 @@ import { deriveState, type EngineState } from './engine';
 import { simulateBar, type FillIntent, type WorkingOrder } from './fills';
 
 export type PendingClick = { type: 'limit' | 'stop'; side: Side } | null;
+
+// A draft ("schema") bracket order group: rendered on the chart as draggable
+// entry/SL/TP lines, but NOTHING is appended to the event log until the user
+// hits Place. Prices are kept unrounded while dragging (exact preview);
+// tick-rounding happens at placement, like every other order.
+export interface SchemaDraft {
+  side: Side;
+  qty: number;
+  entry: number; // preview: last close at creation; exact price once dragged
+  sl: number;
+  tp: number;
+  entryDragged: boolean; // dragged entry => limit/stop entry instead of market
+}
 
 interface TradingState {
   active: boolean;
@@ -25,6 +38,7 @@ interface TradingState {
   slPts: number;
   tpPts: number;
   pendingClick: PendingClick;
+  schema: SchemaDraft | null;
 
   begin: (opts: { startTs: number; endTs: number | null; startingBalance: number }) => Promise<void>;
   resume: (sessionId: string, events: import('../events/types').SessionEvent[]) => Promise<void>;
@@ -35,6 +49,11 @@ interface TradingState {
 
   placeMarket: (side: Side) => void;
   placeAtPrice: (price: number) => void; // consumes pendingClick
+  // schema (draft) bracket lifecycle — see SchemaDraft
+  startSchema: (side: Side) => void;
+  updateSchema: (field: 'entry' | 'sl' | 'tp', price: number) => void;
+  cancelSchema: () => void;
+  placeSchema: () => void;
   // ProjectX-style position drag: above/below current price decides TP vs SL
   placePositionLeg: (price: number) => void;
   cancelOrder: (orderId: string) => void;
@@ -158,23 +177,24 @@ export const useTrading = create<TradingState>((set, get) => {
     slPts: 25,
     tpPts: 50,
     pendingClick: null,
+    schema: null,
 
     begin: async (opts) => {
       await startSession({ ...opts, config: {} });
       nextId = 1;
-      set({ active: true, pendingClick: null });
+      set({ active: true, pendingClick: null, schema: null });
       refresh();
     },
 
     resume: async (sessionId, events) => {
       await resumeSession(sessionId, events);
       nextId = events.length + 1; // oid() also embeds wall time, so ids stay unique
-      set({ active: true, pendingClick: null });
+      set({ active: true, pendingClick: null, schema: null });
       refresh();
     },
 
     end: async () => {
-      set({ active: false, pendingClick: null });
+      set({ active: false, pendingClick: null, schema: null });
       await endSession();
       refresh();
     },
@@ -198,6 +218,78 @@ export const useTrading = create<TradingState>((set, get) => {
       if (pendingClick.type === 'limit') place('limit', pendingClick.side, qty, { limitPrice: p }, bracket);
       else place('stop', pendingClick.side, qty, { stopPrice: p }, bracket);
       set({ pendingClick: null });
+      refresh();
+    },
+
+    startSchema: (side) => {
+      const { qty, slPts, tpPts } = get();
+      const last = lastVisibleBar(now())?.c;
+      if (last === undefined) return;
+      const entry = roundToTick(last);
+      const dir = side === 'buy' ? 1 : -1;
+      set({
+        schema: {
+          side,
+          qty,
+          entry,
+          sl: entry - dir * slPts,
+          tp: entry + dir * tpPts,
+          entryDragged: false,
+        },
+        pendingClick: null,
+      });
+    },
+
+    updateSchema: (field, price) =>
+      set((s) => {
+        if (!s.schema) return {};
+        if (field === 'entry') {
+          // dragging the entry moves the whole group (distances preserved)
+          const d = price - s.schema.entry;
+          return {
+            schema: {
+              ...s.schema,
+              entry: price,
+              sl: s.schema.sl + d,
+              tp: s.schema.tp + d,
+              entryDragged: true,
+            },
+          };
+        }
+        return { schema: { ...s.schema, [field]: price } };
+      }),
+
+    cancelSchema: () => set({ schema: null }),
+
+    // Convert the draft into real events: entry order (market if never
+    // dragged, else limit/stop by side vs market) carrying a bracket spec —
+    // SL/TP legs spawn at fill ± the drafted distances, tick-rounded.
+    placeSchema: () => {
+      const { schema } = get();
+      if (!schema) return;
+      const entry = roundToTick(schema.entry);
+      const sl = roundToTick(schema.sl);
+      const tp = roundToTick(schema.tp);
+      const dir = schema.side === 'buy' ? 1 : -1;
+      if ((tp - entry) * dir <= 0 || (entry - sl) * dir <= 0) return; // invalid geometry
+      const bracket = { stopLossPts: (entry - sl) * dir, takeProfitPts: (tp - entry) * dir };
+      if (!schema.entryDragged) {
+        place('market', schema.side, schema.qty, {}, { bracket });
+      } else {
+        const last = lastVisibleBar(now())?.c;
+        const type =
+          last === undefined || (schema.side === 'buy' ? entry <= last : entry >= last)
+            ? 'limit'
+            : 'stop';
+        place(
+          type,
+          schema.side,
+          schema.qty,
+          type === 'limit' ? { limitPrice: entry } : { stopPrice: entry },
+          { bracket },
+        );
+      }
+      set({ schema: null });
       refresh();
     },
 
@@ -265,7 +357,9 @@ export const useTrading = create<TradingState>((set, get) => {
       let state = deriveState(getEvents());
       for (const bar of newBars) {
         if (state.workingOrders.length === 0) continue;
-        const intents = simulateBar(state.workingOrders, bar);
+        // 1s data (when NQ has coverage for this minute) sequences same-bar
+        // SL/TP conflicts; bars here are closed, so the read is clock-safe.
+        const intents = simulateBar(state.workingOrders, bar, getSecondsBarsIn);
         if (intents.length === 0) continue;
         let changed = false;
         for (const intent of intents) {

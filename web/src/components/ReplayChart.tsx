@@ -22,7 +22,7 @@ import {
 } from 'lightweight-charts';
 import { isSubMinute, sources, type InstrumentId } from '@/lib/data/barSource';
 import { useReplay } from '@/lib/replay/clock';
-import { roundToTick } from '@/lib/trading/contractMath';
+import { fmtPts, fmtUsd, ptsToUsd, roundToTick } from '@/lib/trading/contractMath';
 import { useTrading } from '@/lib/trading/store';
 import { fromChartTime, toChartTime } from '@/lib/time/et';
 
@@ -35,8 +35,8 @@ interface Props {
 }
 
 interface DragState {
-  kind: 'order' | 'pos';
-  id: string;
+  kind: 'order' | 'pos' | 'schema';
+  id: string; // order id | 'pos' | schema field ('entry' | 'sl' | 'tp')
   price: number;
   y: number;
 }
@@ -65,6 +65,10 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
   const moveOrder = useTrading((s) => s.moveOrder);
   const placePositionLeg = useTrading((s) => s.placePositionLeg);
   const flatten = useTrading((s) => s.flatten);
+  const schema = useTrading((s) => s.schema);
+  const updateSchema = useTrading((s) => s.updateSchema);
+  const cancelSchema = useTrading((s) => s.cancelSchema);
+  const placeSchema = useTrading((s) => s.placeSchema);
 
   const clickRef = useRef({ clickMode, onRewindClick, onPriceClick });
   clickRef.current = { clickMode, onRewindClick, onPriceClick };
@@ -230,12 +234,38 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
         }),
       );
     }
+    // draft (schema) bracket lines — dotted, nothing placed yet
+    if (schema) {
+      const lines = [
+        ['entry', schema.entry, '#38bdf8', `draft ${schema.side === 'buy' ? 'B' : 'S'} ${schema.qty}`],
+        ['sl', schema.sl, '#ef5350', 'draft SL'],
+        ['tp', schema.tp, '#26a69a', 'draft TP'],
+      ] as const;
+      for (const [field, price, color, title] of lines) {
+        priceLineMap.current.set(
+          `schema-${field}`,
+          series.createPriceLine({
+            price,
+            color,
+            lineWidth: 1,
+            lineStyle: 1,
+            axisLabelVisible: true,
+            title,
+          }),
+        );
+      }
+    }
     setOverlayTick((t) => t + 1);
-  }, [workingOrders, position, tradingEnabled]);
+  }, [workingOrders, position, tradingEnabled, schema]);
 
   // ---- draggable chip overlay ----
 
-  const startDrag = (e: React.PointerEvent, kind: 'order' | 'pos', id: string, price: number) => {
+  const startDrag = (
+    e: React.PointerEvent,
+    kind: 'order' | 'pos' | 'schema',
+    id: string,
+    price: number,
+  ) => {
     e.preventDefault();
     e.stopPropagation();
     const state: DragState = { kind, id, price, y: 0 };
@@ -249,10 +279,13 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
       const y = ev.clientY - rect.top;
       const raw = series.coordinateToPrice(y);
       if (raw === null) return;
-      const p = roundToTick(raw as number);
+      // schema lines preview at the EXACT dragged price; rounding happens
+      // on placement (like every other order)
+      const p = kind === 'schema' ? (raw as number) : roundToTick(raw as number);
       dragRef.current = { ...dragRef.current, price: p, y };
       setDrag(dragRef.current);
       if (kind === 'order') priceLineMap.current.get(id)?.applyOptions({ price: p });
+      if (kind === 'schema') priceLineMap.current.get(`schema-${id}`)?.applyOptions({ price: p });
     };
     const up = () => {
       window.removeEventListener('pointermove', move);
@@ -262,7 +295,8 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
       setDrag(null);
       if (!final) return;
       if (kind === 'order') moveOrder(id, final.price);
-      else placePositionLeg(final.price);
+      else if (kind === 'pos') placePositionLeg(final.price);
+      else updateSchema(id as 'entry' | 'sl' | 'tp', final.price);
     };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
@@ -276,9 +310,11 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
     y: number;
     label: string;
     cls: string;
-    kind: 'order' | 'pos';
+    kind: 'order' | 'pos' | 'schema';
+    dragId: string;
     price: number;
-    onCancel: () => void;
+    onCancel?: () => void;
+    onPlace?: () => void;
   }[] = [];
   if (series && tradingEnabled) {
     for (const o of workingOrders) {
@@ -301,6 +337,7 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
               ? 'bg-emerald-900/90 text-emerald-200 border-emerald-700'
               : 'bg-rose-900/90 text-rose-200 border-rose-700',
         kind: 'order',
+        dragId: o.id,
         price,
         onCancel: () => cancelOrder(o.id),
       });
@@ -314,8 +351,49 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
           label: `POS ${position.qty > 0 ? '+' : ''}${position.qty}`,
           cls: 'bg-amber-950/90 text-amber-300 border-amber-600',
           kind: 'pos',
+          dragId: 'pos',
           price: position.avgPrice,
           onCancel: flatten,
+        });
+      }
+    }
+    // draft (schema) bracket chips: dashed styling, Place lives on the entry
+    if (schema) {
+      const dir = schema.side === 'buy' ? 1 : -1;
+      const fields = [
+        {
+          field: 'entry',
+          price: schema.entry,
+          label: `${schema.side === 'buy' ? 'BUY' : 'SELL'} ${schema.qty} ${schema.entryDragged ? '@ ' + roundToTick(schema.entry).toFixed(2) : 'mkt'}`,
+          cls: 'border-dashed bg-sky-950/90 text-sky-300 border-sky-500',
+        },
+        {
+          field: 'sl',
+          price: schema.sl,
+          label: `SL ${fmtPts((schema.sl - schema.entry) * dir)}`,
+          cls: 'border-dashed bg-rose-950/90 text-rose-300 border-rose-500',
+        },
+        {
+          field: 'tp',
+          price: schema.tp,
+          label: `TP ${fmtPts((schema.tp - schema.entry) * dir)}`,
+          cls: 'border-dashed bg-emerald-950/90 text-emerald-300 border-emerald-500',
+        },
+      ] as const;
+      for (const f of fields) {
+        if (drag?.kind === 'schema' && drag.id === f.field) continue; // ghost rendered instead
+        const y = series.priceToCoordinate(f.price);
+        if (y === null) continue;
+        chips.push({
+          key: `schema-${f.field}`,
+          y,
+          label: f.label,
+          cls: f.cls,
+          kind: 'schema',
+          dragId: f.field,
+          price: f.price,
+          onCancel: f.field === 'entry' ? cancelSchema : undefined,
+          onPlace: f.field === 'entry' ? placeSchema : undefined,
         });
       }
     }
@@ -326,11 +404,24 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
   if (drag && drag.y > 0) {
     if (drag.kind === 'order') {
       ghost = { y: drag.y, text: `→ ${drag.price.toFixed(2)}` };
-    } else {
+    } else if (drag.kind === 'pos') {
       const last = currentTime !== null ? sources.NQ.lastVisibleBar(currentTime)?.c : undefined;
       const isTp =
         last !== undefined && (position.qty > 0 ? drag.price > last : drag.price < last);
       ghost = { y: drag.y, text: `${isTp ? 'TP' : 'SL'} ${Math.abs(position.qty)} @ ${drag.price.toFixed(2)}` };
+    } else if (schema) {
+      // live projected P&L vs the draft entry while dragging SL/TP
+      const dir = schema.side === 'buy' ? 1 : -1;
+      if (drag.id === 'entry') {
+        ghost = { y: drag.y, text: `entry → ${drag.price.toFixed(2)}` };
+      } else {
+        const pts = (drag.price - schema.entry) * dir;
+        const label = drag.id === 'tp' ? 'TP' : 'SL';
+        ghost = {
+          y: drag.y,
+          text: `${label} ${drag.price.toFixed(2)} · ${fmtPts(pts)} · ${fmtUsd(ptsToUsd(pts, schema.qty))}`,
+        };
+      }
     }
   }
 
@@ -350,17 +441,28 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
             <span
               className="cursor-ns-resize px-1.5 py-0.5"
               title={c.kind === 'pos' ? 'Drag to place SL/TP for the position' : 'Drag to move'}
-              onPointerDown={(e) => startDrag(e, c.kind, c.key, c.price)}
+              onPointerDown={(e) => startDrag(e, c.kind, c.dragId, c.price)}
             >
               {c.label}
             </span>
-            <button
-              className="border-l border-current/30 px-1 py-0.5 opacity-60 hover:opacity-100"
-              title={c.kind === 'pos' ? 'Flatten position' : 'Cancel order'}
-              onClick={c.onCancel}
-            >
-              ✕
-            </button>
+            {c.onPlace && (
+              <button
+                className="border-l border-current/30 bg-sky-600/40 px-1.5 py-0.5 font-semibold hover:bg-sky-500/50"
+                title="Place this bracket order"
+                onClick={c.onPlace}
+              >
+                Place
+              </button>
+            )}
+            {c.onCancel && (
+              <button
+                className="border-l border-current/30 px-1 py-0.5 opacity-60 hover:opacity-100"
+                title={c.kind === 'pos' ? 'Flatten position' : c.kind === 'schema' ? 'Discard draft' : 'Cancel order'}
+                onClick={c.onCancel}
+              >
+                ✕
+              </button>
+            )}
           </div>
         ))}
         {ghost && (
