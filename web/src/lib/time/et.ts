@@ -2,45 +2,44 @@
 // here: session-boundary math and display formatting. Nothing else may do
 // timezone arithmetic.
 
-const probe = new Intl.DateTimeFormat('en-US', {
-  timeZone: 'America/New_York',
-  year: 'numeric',
-  month: '2-digit',
-  day: '2-digit',
-  hour: '2-digit',
-  minute: '2-digit',
-  second: '2-digit',
-  hour12: false,
-});
+// ET offset computed arithmetically from the post-2007 US DST rule (2nd
+// Sunday of March 02:00 EST -> 1st Sunday of November 02:00 EDT). All data is
+// 2010+, where this rule is exact — verified against Intl for every hour of
+// 2008–2030 (scripts/validate_et_offset.mjs). Intl.formatToParts cost ~35µs
+// per call, which made per-bar ET math O(seconds) over the 95k-bar hourly
+// history; this is O(1) arithmetic.
+const dstBoundsCache = new Map<number, [number, number]>(); // year -> [startSec, endSec) in UTC
 
-function parts(tsSec: number) {
-  const p: Record<string, string> = {};
-  for (const { type, value } of probe.formatToParts(tsSec * 1000)) p[type] = value;
-  return {
-    y: +p.year,
-    mo: +p.month,
-    d: +p.day,
-    h: +p.hour % 24, // Intl can emit "24" for midnight
-    mi: +p.minute,
-    s: +p.second,
-  };
+function dstBounds(year: number): [number, number] {
+  let b = dstBoundsCache.get(year);
+  if (!b) {
+    const secondSunMar = 8 + ((7 - new Date(Date.UTC(year, 2, 8)).getUTCDay()) % 7);
+    const firstSunNov = 1 + ((7 - new Date(Date.UTC(year, 10, 1)).getUTCDay()) % 7);
+    b = [
+      Date.UTC(year, 2, secondSunMar, 7) / 1000, // 02:00 EST = 07:00 UTC
+      Date.UTC(year, 10, firstSunNov, 6) / 1000, // 02:00 EDT = 06:00 UTC
+    ];
+    dstBoundsCache.set(year, b);
+  }
+  return b;
 }
 
-// Offset such that: ET wall-clock (as fake-UTC ms) = UTC ms + offset.
-// Cached per hour bucket; the offset only changes Sundays 2:00 AM ET when the
-// market is closed, so hour-granular caching is exact for market data.
-const offsetCache = new Map<number, number>();
-
+// Offset such that: ET wall-clock (as fake-UTC sec) = UTC sec + offset.
 export function etOffsetSec(tsSec: number): number {
-  const key = Math.floor(tsSec / 3600);
-  let off = offsetCache.get(key);
-  if (off === undefined) {
-    const p = parts(tsSec);
-    const wall = Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi, p.s) / 1000;
-    off = wall - tsSec;
-    offsetCache.set(key, off);
-  }
-  return off;
+  const [start, end] = dstBounds(new Date(tsSec * 1000).getUTCFullYear());
+  return tsSec >= start && tsSec < end ? -14_400 : -18_000;
+}
+
+function parts(tsSec: number) {
+  const d = new Date((tsSec + etOffsetSec(tsSec)) * 1000);
+  return {
+    y: d.getUTCFullYear(),
+    mo: d.getUTCMonth() + 1,
+    d: d.getUTCDate(),
+    h: d.getUTCHours(),
+    mi: d.getUTCMinutes(),
+    s: d.getUTCSeconds(),
+  };
 }
 
 // Convert an ET wall-clock time to epoch seconds UTC (DST-correct).

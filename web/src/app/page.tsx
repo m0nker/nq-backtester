@@ -33,18 +33,31 @@ export default function Home() {
 
   const startDividerDrag = (e: React.PointerEvent) => {
     e.preventDefault();
+    // Capture the pointer on the divider itself: once the cursor crosses the
+    // chart canvases their handlers would otherwise swallow the moves (drag
+    // used to die crossing into the ES pane). With capture, every subsequent
+    // pointer event retargets to the divider until release.
+    const el = e.currentTarget as HTMLElement;
+    try {
+      el.setPointerCapture(e.pointerId);
+    } catch {
+      // no active pointer (synthetic events) — listeners below still work
+    }
     const move = (ev: PointerEvent) => {
       const rect = chartsRef.current?.getBoundingClientRect();
       if (!rect) return;
       const pct = ((ev.clientX - rect.left) / rect.width) * 100;
       setLeftPct(Math.min(80, Math.max(20, pct)));
     };
-    const up = () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
+    const done = (ev: PointerEvent) => {
+      if (el.hasPointerCapture(ev.pointerId)) el.releasePointerCapture(ev.pointerId);
+      el.removeEventListener('pointermove', move);
+      el.removeEventListener('pointerup', done);
+      el.removeEventListener('pointercancel', done);
     };
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+    el.addEventListener('pointermove', move);
+    el.addEventListener('pointerup', done);
+    el.addEventListener('pointercancel', done);
   };
 
   const { currentTime, start, reset, loading } = useReplay();

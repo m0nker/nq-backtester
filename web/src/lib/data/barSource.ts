@@ -76,6 +76,7 @@ export class InstrumentSource {
     tf: Timeframe;
     upTo: number;
     baseCount: number;
+    lastBaseT: number; // t of bars[baseCount-1] when cached — detects index shifts
     gen: number;
     candles: Bar[];
     dayStart: number;
@@ -102,6 +103,16 @@ export class InstrumentSource {
   private bump() {
     this.gen++;
     emitChange();
+  }
+
+  // MUST be called at every ds.bars mutation, synchronously with the
+  // mutation. The incremental candle cache addresses ds.bars by index, so a
+  // prepend/trim with a stale gen would make it fold old bars onto the candle
+  // tail (out-of-order candles -> chart update() throws). bump() alone is not
+  // enough: loadRange bumps only after ALL its day-jobs settle, and an effect
+  // can run inside that window (e.g. triggered by the other instrument).
+  private invalidate() {
+    this.gen++;
   }
 
   async init(): Promise<DayMeta[]> {
@@ -165,6 +176,7 @@ export class InstrumentSource {
     ds.loadedDays.add(meta.trading_date);
     ds.loadedIdxs.add(idx);
     ds.bars = ds.bars.concat(dayBars).sort((a, b) => a.t - b.t);
+    this.invalidate();
     return true;
   }
 
@@ -180,6 +192,7 @@ export class InstrumentSource {
       const from = new Date(meta.first_ts).getTime() / 1000;
       const to = new Date(meta.last_ts).getTime() / 1000;
       ds.bars = ds.bars.filter((b) => b.t < from || b.t > to);
+      this.invalidate();
       ds.loadedIdxs.delete(dropIdx);
       ds.loadedDays.delete(meta.trading_date);
     }
@@ -272,11 +285,18 @@ export class InstrumentSource {
 
     const firstBase = ds.bars.length ? ds.bars[0].t : Infinity;
     const histLimit = live.length ? firstBase : upTo - 3600;
-    const out: Bar[] = [];
-    for (const b of hist) {
-      if (b.t >= histLimit || bucketEnd(b.t, tf) > upTo) break;
-      out.push(b);
+    // Binary-search the cutoff instead of scanning: bucketEnd() does ET math
+    // per call, and a linear scan over the full-history series (95k+ bars)
+    // took seconds. Ends are monotonic in t, so only the boundary needs it.
+    let cut = 0,
+      hi2 = hist.length;
+    while (cut < hi2) {
+      const mid = (cut + hi2) >> 1;
+      if (hist[mid].t < histLimit) cut = mid + 1;
+      else hi2 = mid;
     }
+    while (cut > 0 && bucketEnd(hist[cut - 1].t, tf) > upTo) cut--;
+    const out = hist.slice(0, cut);
     let liveFrom = 0;
     const lastHistT = out.length ? out[out.length - 1].t : -Infinity;
     while (liveFrom < live.length && live[liveFrom].t <= lastHistT) liveFrom++;
@@ -293,7 +313,9 @@ export class InstrumentSource {
       cc.gen === this.gen &&
       upTo >= cc.upTo &&
       firstHidden >= cc.baseCount &&
-      cc.baseCount > 0
+      cc.baseCount > 0 &&
+      // index still addresses the same bar (no prepend/trim slipped through)
+      ds.bars[cc.baseCount - 1]?.t === cc.lastBaseT
     ) {
       let dirtyFrom = cc.candles.length;
       let dayStart = cc.dayStart;
@@ -315,6 +337,7 @@ export class InstrumentSource {
       }
       cc.upTo = upTo;
       cc.baseCount = firstHidden;
+      cc.lastBaseT = ds.bars[firstHidden - 1]?.t ?? cc.lastBaseT;
       cc.dayStart = dayStart;
       return { candles: cc.candles, dirtyFrom };
     }
@@ -325,6 +348,7 @@ export class InstrumentSource {
       tf,
       upTo,
       baseCount: firstHidden,
+      lastBaseT: lastBase?.t ?? -1,
       gen: this.gen,
       candles,
       dayStart: lastBase ? tradingDayStartSec(lastBase.t) : -1,
