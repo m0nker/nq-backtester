@@ -29,38 +29,33 @@ export default function Home() {
   const [resuming, setResuming] = useState(false);
   const [chartLayout, setChartLayout] = useState<'nq' | 'split' | 'es'>('split');
   const [leftPct, setLeftPct] = useState(55);
+  const [dividerDragging, setDividerDragging] = useState(false);
   const chartsRef = useRef<HTMLDivElement>(null);
 
+  // While dragging, a fixed full-viewport shield (rendered below) sits above
+  // both charts so their canvases can never see the pointer stream; the
+  // events bubble to window where these listeners live. rAF-throttled so the
+  // two autoSize chart re-layouts run at most once per frame.
   const startDividerDrag = (e: React.PointerEvent) => {
     e.preventDefault();
-    // Capture the pointer on the divider itself: once the cursor crosses the
-    // chart canvases their handlers would otherwise swallow the moves (drag
-    // used to die crossing into the ES pane). With capture, every subsequent
-    // pointer event retargets to the divider until release.
-    const el = e.currentTarget as HTMLElement;
-    try {
-      el.setPointerCapture(e.pointerId);
-    } catch {
-      // no active pointer (synthetic events) — listeners below still work
-    }
+    setDividerDragging(true);
     const move = (ev: PointerEvent) => {
       const rect = chartsRef.current?.getBoundingClientRect();
-      if (!rect) return;
-      const pct = ((ev.clientX - rect.left) / rect.width) * 100;
-      setLeftPct(Math.min(80, Math.max(20, pct)));
+      if (!rect || rect.width === 0) return;
+      setLeftPct(Math.min(80, Math.max(20, ((ev.clientX - rect.left) / rect.width) * 100)));
     };
-    const done = (ev: PointerEvent) => {
-      if (el.hasPointerCapture(ev.pointerId)) el.releasePointerCapture(ev.pointerId);
-      el.removeEventListener('pointermove', move);
-      el.removeEventListener('pointerup', done);
-      el.removeEventListener('pointercancel', done);
+    const done = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', done);
+      window.removeEventListener('pointercancel', done);
+      setDividerDragging(false);
     };
-    el.addEventListener('pointermove', move);
-    el.addEventListener('pointerup', done);
-    el.addEventListener('pointercancel', done);
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', done);
+    window.addEventListener('pointercancel', done);
   };
 
-  const { currentTime, start, reset, loading } = useReplay();
+  const { currentTime, start, reset, loading, focused } = useReplay();
   const trading = useTrading();
   const started = currentTime !== null;
 
@@ -91,6 +86,12 @@ export default function Home() {
       setResuming(false);
     }
   };
+
+  // single-chart layouts force focus onto the visible chart
+  useEffect(() => {
+    if (chartLayout === 'nq') useReplay.getState().setFocused('NQ');
+    if (chartLayout === 'es') useReplay.getState().setFocused('ES');
+  }, [chartLayout]);
 
   // esc cancels click-to-place
   useEffect(() => {
@@ -266,13 +267,20 @@ export default function Home() {
         </div>
       </header>
 
+      {dividerDragging && (
+        <div className="fixed inset-0 z-[100] cursor-col-resize" style={{ touchAction: 'none' }} />
+      )}
+
       <div ref={chartsRef} className="flex min-h-0 flex-1">
         {chartLayout !== 'es' && (
           <div
             className="relative min-h-0"
             style={{ width: chartLayout === 'split' ? `${leftPct}%` : '100%' }}
+            onPointerDownCapture={() => useReplay.getState().setFocused('NQ')}
           >
-            <span className="pointer-events-none absolute left-2 top-2 z-10 rounded bg-slate-900/80 px-1.5 py-0.5 font-mono text-xs text-amber-300">
+            <span
+              className={`pointer-events-none absolute left-2 top-2 z-10 rounded bg-slate-900/80 px-1.5 py-0.5 font-mono text-xs text-amber-300 ${focused === 'NQ' && chartLayout === 'split' ? 'ring-1 ring-amber-400' : ''}`}
+            >
               NQ
             </span>
             <OrderPanel />
@@ -291,14 +299,22 @@ export default function Home() {
         )}
         {chartLayout === 'split' && (
           <div
-            className="z-10 w-1.5 shrink-0 cursor-col-resize bg-slate-800 hover:bg-amber-500/60"
+            className="relative z-10 w-1.5 shrink-0 cursor-col-resize bg-slate-800 hover:bg-amber-500/60"
             onPointerDown={startDividerDrag}
             title="Drag to resize"
-          />
+          >
+            {/* widened invisible hit area — 6px is a hard grab target */}
+            <div className="absolute -left-1.5 -right-1.5 bottom-0 top-0" />
+          </div>
         )}
         {chartLayout !== 'nq' && (
-          <div className="relative min-h-0 flex-1">
-            <span className="pointer-events-none absolute left-2 top-2 z-10 rounded bg-slate-900/80 px-1.5 py-0.5 font-mono text-xs text-sky-300">
+          <div
+            className="relative min-h-0 flex-1"
+            onPointerDownCapture={() => useReplay.getState().setFocused('ES')}
+          >
+            <span
+              className={`pointer-events-none absolute left-2 top-2 z-10 rounded bg-slate-900/80 px-1.5 py-0.5 font-mono text-xs text-sky-300 ${focused === 'ES' && chartLayout === 'split' ? 'ring-1 ring-sky-400' : ''}`}
+            >
               ES
             </span>
             <ReplayChart

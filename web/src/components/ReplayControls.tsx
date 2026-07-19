@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getBaseResolutionSec, getManifest, isSubMinute, secondsAvailableAt } from '@/lib/data/barSource';
+import { getBaseResolutionSec, getManifest, isSubMinute, sources } from '@/lib/data/barSource';
 import { SPEEDS, useReplay, type StepSize } from '@/lib/replay/clock';
 import { etWallToUtc, formatET, tradingDateOf } from '@/lib/time/et';
 import { TIMEFRAMES, availableTimeframes, type Timeframe } from '@/lib/types';
@@ -41,7 +41,8 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
   const {
     currentTime,
     endTs,
-    timeframe,
+    timeframes,
+    focused,
     stepSize,
     playing,
     speed,
@@ -55,6 +56,8 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
     setStepSize,
     jumpTo,
   } = useReplay();
+  // TF buttons and the typed switcher act on the focused (last-clicked) chart
+  const timeframe = timeframes[focused];
 
   const [jumpValue, setJumpValue] = useState('');
   const [tfBuffer, setTfBuffer] = useState('');
@@ -94,13 +97,13 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
         if (buffer) {
           e.preventDefault();
           const tf = parseTypedTf(buffer);
-          const now = useReplay.getState().currentTime;
+          const { currentTime: now, focused: focusedInst } = useReplay.getState();
           const ok =
             tf !== null &&
             (availableTimeframes(getBaseResolutionSec()).includes(tf) ||
-              (isSubMinute(tf) && now !== null && secondsAvailableAt(now)));
+              (isSubMinute(tf) && now !== null && sources[focusedInst].hasSecondsAt(now)));
           if (tf && ok) {
-            setTimeframe(tf);
+            setTimeframe(tf); // applies to the focused chart
             clearBuffer();
           } else {
             setTfInvalid(true);
@@ -155,19 +158,30 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
 
   const atRangeEnd = endTs !== null && currentTime !== null && currentTime >= endTs;
 
-  // 15s/30s are offered only where BOTH NQ and ES have seconds coverage.
-  const subOk = currentTime !== null && secondsAvailableAt(currentTime);
+  // 15s/30s offered per chart: the focused chart needs ITS instrument's 1s
+  // coverage. Sub-minute STEPPING consumes NQ 1s bars, so the step select is
+  // gated on NQ coverage.
+  const subOkFocused = currentTime !== null && sources[focused].hasSecondsAt(currentTime);
+  const subOkNQ = currentTime !== null && sources.NQ.hasSecondsAt(currentTime);
   const tfChoices: Timeframe[] = [
-    ...(subOk ? (['15s', '30s'] as Timeframe[]) : []),
+    ...(subOkFocused ? (['15s', '30s'] as Timeframe[]) : []),
+    ...availableTimeframes(getBaseResolutionSec()),
+  ];
+  const stepChoices: Timeframe[] = [
+    ...(subOkNQ ? (['15s', '30s'] as Timeframe[]) : []),
     ...availableTimeframes(getBaseResolutionSec()),
   ];
 
-  // walking into a period without seconds coverage falls back to 1m
+  // walking into a period without seconds coverage falls back to 1m per chart
   useEffect(() => {
     if (currentTime === null) return;
-    if (isSubMinute(timeframe) && !subOk) setTimeframe('1m');
-    if (stepSize !== 'view' && isSubMinute(stepSize) && !subOk) setStepSize('view');
-  }, [currentTime, timeframe, stepSize, subOk, setTimeframe, setStepSize]);
+    for (const inst of ['NQ', 'ES'] as const) {
+      if (isSubMinute(timeframes[inst]) && !sources[inst].hasSecondsAt(currentTime)) {
+        setTimeframe('1m', inst);
+      }
+    }
+    if (stepSize !== 'view' && isSubMinute(stepSize) && !subOkNQ) setStepSize('view');
+  }, [currentTime, timeframes, stepSize, subOkNQ, setTimeframe, setStepSize]);
 
   const btn =
     'rounded bg-slate-800 px-3 py-1.5 text-sm text-slate-200 hover:bg-slate-700 disabled:opacity-40';
@@ -186,7 +200,7 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
           >
             {tfBuffer}
             <span className="ml-3 text-base text-slate-500">
-              {tfInvalid ? 'invalid timeframe' : '↵ to switch timeframe'}
+              {tfInvalid ? 'invalid timeframe' : `↵ to switch ${focused}`}
             </span>
           </div>
         </div>
@@ -226,7 +240,7 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
             title="Step size: advance by one bar of this timeframe (independent of the chart timeframe)"
           >
             <option value="view">chart tf</option>
-            {tfChoices.map((tf) => (
+            {stepChoices.map((tf) => (
               <option key={tf} value={tf}>
                 {tf}
               </option>
@@ -247,8 +261,14 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
           </select>
         </div>
 
-        {/* timeframes */}
+        {/* timeframes — apply to the focused (last-clicked) chart */}
         <div className="flex items-center gap-1">
+          <span
+            className={`mr-1 rounded px-1.5 py-0.5 font-mono text-xs ${focused === 'NQ' ? 'bg-amber-500/15 text-amber-300' : 'bg-sky-500/15 text-sky-300'}`}
+            title="Timeframe buttons and typed switching apply to this chart (click a chart to focus it)"
+          >
+            {focused}
+          </span>
           {tfChoices.map((tf) => (
             <button
               key={tf}

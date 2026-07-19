@@ -1,9 +1,13 @@
 'use client';
 
+import { useEffect, useRef, useState } from 'react';
 import { useTrading } from '@/lib/trading/store';
 
+const POS_KEY = 'orderPanelPos';
+
 // Floating order-entry card. Market fills at NEXT bar open (stated in the
-// footer — fill assumptions live in lib/trading/fills.ts).
+// footer — fill assumptions live in lib/trading/fills.ts). Draggable by the
+// ⠿ grip; position persists across sessions.
 export default function OrderPanel() {
   const {
     qty,
@@ -19,11 +23,67 @@ export default function OrderPanel() {
     startSchema,
   } = useTrading();
 
+  // null = default docked position (top-right of the NQ pane)
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // restore after mount (avoids SSR/localStorage hydration mismatch)
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(POS_KEY);
+      if (saved) setPos(JSON.parse(saved));
+    } catch {
+      // corrupted value — stay docked
+    }
+  }, []);
+
+  const startPanelDrag = (e: React.PointerEvent) => {
+    e.preventDefault();
+    const rect = panelRef.current!.getBoundingClientRect();
+    const dx = e.clientX - rect.x;
+    const dy = e.clientY - rect.y;
+    const move = (ev: PointerEvent) => {
+      const w = rect.width;
+      const next = {
+        x: Math.min(Math.max(0, ev.clientX - dx), window.innerWidth - w),
+        y: Math.min(Math.max(0, ev.clientY - dy), window.innerHeight - 40),
+      };
+      setPos(next);
+    };
+    const done = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', done);
+      window.removeEventListener('pointercancel', done);
+      setPos((p) => {
+        try {
+          if (p) localStorage.setItem(POS_KEY, JSON.stringify(p));
+        } catch {
+          // storage full/blocked — position just won't persist
+        }
+        return p;
+      });
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', done);
+    window.addEventListener('pointercancel', done);
+  };
+
   const chip = (active: boolean) =>
     `rounded px-2 py-1 text-xs ${active ? 'bg-amber-500/25 text-amber-300 ring-1 ring-amber-400' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'}`;
 
   return (
-    <div className="absolute right-3 top-3 z-10 w-56 rounded-lg border border-slate-800 bg-[#0d1119]/95 p-3 text-sm shadow-xl">
+    <div
+      ref={panelRef}
+      className={`z-30 w-56 rounded-lg border border-slate-800 bg-[#0d1119]/95 p-3 text-sm shadow-xl ${pos ? 'fixed' : 'absolute right-3 top-3'}`}
+      style={pos ? { left: pos.x, top: pos.y } : undefined}
+    >
+      <div
+        className="-mx-3 -mt-3 mb-1 flex cursor-grab items-center justify-center rounded-t-lg py-0.5 text-slate-600 hover:bg-slate-800/60 hover:text-slate-400 active:cursor-grabbing"
+        title="Drag to move this panel"
+        onPointerDown={startPanelDrag}
+      >
+        <span className="text-[13px] leading-none">⠿</span>
+      </div>
       <div className="mb-2 flex items-center gap-2">
         <label className="text-xs uppercase tracking-wide text-slate-500">Qty</label>
         <input

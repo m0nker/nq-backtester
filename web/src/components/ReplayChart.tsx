@@ -20,11 +20,13 @@ import {
   type ISeriesApi,
   type UTCTimestamp,
 } from 'lightweight-charts';
+import DrawingLayer, { type ChartGeo } from '@/components/DrawingLayer';
 import { isSubMinute, sources, type InstrumentId } from '@/lib/data/barSource';
 import { useReplay } from '@/lib/replay/clock';
 import { fmtPts, fmtUsd, ptsToUsd, roundToTick } from '@/lib/trading/contractMath';
 import { useTrading } from '@/lib/trading/store';
 import { fromChartTime, toChartTime } from '@/lib/time/et';
+import { TF_SECONDS, TRADING_DAY_SEC, TRADING_WEEK_SEC, isSessionTf } from '@/lib/types';
 
 interface Props {
   instrument: InstrumentId;
@@ -51,13 +53,14 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
   const needsFullPaint = useRef(true); // fresh chart instance must setData once
   const prevTimeRef = useRef<number | null>(null);
   const prevTfRef = useRef<string | null>(null);
+  const geoRef = useRef<ChartGeo | null>(null); // drawing layer's time<->x basis
   const priceLineMap = useRef(new Map<string, IPriceLine>());
   const [overlayTick, setOverlayTick] = useState(0);
   const [drag, setDrag] = useState<DragState | null>(null);
   const dragRef = useRef<DragState | null>(null);
 
   const currentTime = useReplay((s) => s.currentTime);
-  const timeframe = useReplay((s) => s.timeframe);
+  const timeframe = useReplay((s) => s.timeframes[instrument]);
   const dataVersion = useReplay((s) => s.dataVersion);
   const workingOrders = useTrading((s) => s.derived.workingOrders);
   const position = useTrading((s) => s.derived.position);
@@ -130,7 +133,7 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
     chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
       bumpOverlay();
       if (!range || range.from > 20 || backfillBusy.current) return;
-      const tf = useReplay.getState().timeframe;
+      const tf = useReplay.getState().timeframes[instrument];
       if (tf === '1h' || tf === '4h' || tf === '1D' || tf === '1W' || tf === '1M') return;
       backfillBusy.current = true;
       void source.loadOlderDays(isSubMinute(tf), isSubMinute(tf) ? 2 : 20).finally(() => {
@@ -138,22 +141,54 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
       });
     });
 
+    // Price-scale drags/zooms change y-coordinates WITHOUT a logical-range
+    // change, so nothing above fires and the chip/drawing overlay went stale
+    // (chips detached from their price lines). Re-sync on any pointer drag
+    // or wheel anywhere over the chart, including the axes.
+    const onPointerDown = () => {
+      window.addEventListener('pointermove', bumpOverlay);
+      const end = () => {
+        window.removeEventListener('pointermove', bumpOverlay);
+        window.removeEventListener('pointerup', end);
+        window.removeEventListener('pointercancel', end);
+        bumpOverlay();
+      };
+      window.addEventListener('pointerup', end);
+      window.addEventListener('pointercancel', end);
+    };
+    el.addEventListener('pointerdown', onPointerDown);
+    el.addEventListener('wheel', bumpOverlay, { passive: true });
+    el.addEventListener('dblclick', bumpOverlay); // axis double-click = reset scale
+
     chartRef.current = chart;
     candlesRef.current = candles;
     needsFullPaint.current = true;
     return () => {
+      el.removeEventListener('pointerdown', onPointerDown);
+      el.removeEventListener('wheel', bumpOverlay);
+      el.removeEventListener('dblclick', bumpOverlay);
       chart.remove();
       chartRef.current = null;
       candlesRef.current = null;
       priceLineMap.current.clear();
     };
-  }, []);
+  }, [instrument]);
 
   useEffect(() => {
     if (currentTime === null || !candlesRef.current) return;
 
     const frame = source.getVisibleCandlesIncremental(currentTime, timeframe);
     const candles = frame.candles;
+    geoRef.current = {
+      candles,
+      tfSec: isSessionTf(timeframe)
+        ? timeframe === '1D'
+          ? TRADING_DAY_SEC
+          : timeframe === '1W'
+            ? TRADING_WEEK_SEC
+            : 30 * 86_400
+        : TF_SECONDS[timeframe],
+    };
     // A freshly mounted chart has rendered nothing, whatever the shared
     // candle cache thinks — force one full paint.
     const dirtyFrom = needsFullPaint.current ? 0 : frame.dirtyFrom;
@@ -185,11 +220,18 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
 
     // recenter on fresh chart, rewind, or timeframe switch (jump to recent
     // action — the preserved logical range would land in ancient history);
-    // forward motion never scrolls.
+    // forward motion never scrolls. NOTE: must be an instant jump, NOT
+    // scrollToRealTime() — that animates, and any setData from a mid-flight
+    // chunk load cancels the animation partway, stranding the viewport in
+    // random history.
     const rewound = prevTimeRef.current !== null && currentTime < prevTimeRef.current;
     const tfSwitched = prevTfRef.current !== timeframe;
     if (needsFullPaint.current || rewound || tfSwitched) {
-      chartRef.current!.timeScale().scrollToRealTime();
+      const ts = chartRef.current!.timeScale();
+      const cur = ts.getVisibleLogicalRange();
+      const width = cur && cur.to > cur.from ? Math.min(cur.to - cur.from, 3000) : 120;
+      const right = candles.length - 1 + 6; // keep the usual rightOffset
+      ts.setVisibleLogicalRange({ from: right - width, to: right });
     }
     needsFullPaint.current = false;
     prevTimeRef.current = currentTime;
@@ -430,6 +472,13 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
       <div
         ref={containerRef}
         className={`h-full w-full ${clickMode !== 'none' ? 'cursor-crosshair' : ''}`}
+      />
+      <DrawingLayer
+        instrument={instrument}
+        chartRef={chartRef}
+        seriesRef={candlesRef}
+        geoRef={geoRef}
+        overlayTick={overlayTick}
       />
       <div className="pointer-events-none absolute inset-0 z-10 select-none">
         {chips.map((c) => (

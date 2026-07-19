@@ -17,7 +17,7 @@ export interface EventPayloads {
   session_started: { startTs: number; endTs: number | null; startingBalance: number; config: Record<string, unknown> };
   time_advanced: { from: number; to: number; mode: 'step' | 'autoplay' | 'jump_forward' };
   time_rewound: { from: number; to: number };
-  timeframe_switched: { from: Timeframe; to: Timeframe };
+  timeframe_switched: { from: Timeframe; to: Timeframe; instrument?: 'NQ' | 'ES' };
   order_placed: {
     orderId: string;
     side: Side;

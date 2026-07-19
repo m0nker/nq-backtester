@@ -410,7 +410,15 @@ useReplay.subscribe((s, prev) => {
       t.onRewind(prev.currentTime, s.currentTime);
     }
   }
-  if (s.timeframe !== prev.timeframe && s.currentTime !== null) {
-    appendEvent('timeframe_switched', s.currentTime, { from: prev.timeframe, to: s.timeframe });
+  if (s.currentTime !== null) {
+    for (const inst of ['NQ', 'ES'] as const) {
+      if (s.timeframes[inst] !== prev.timeframes[inst]) {
+        appendEvent('timeframe_switched', s.currentTime, {
+          from: prev.timeframes[inst],
+          to: s.timeframes[inst],
+          instrument: inst,
+        });
+      }
+    }
   }
 });

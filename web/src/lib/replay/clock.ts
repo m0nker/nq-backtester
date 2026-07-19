@@ -12,19 +12,23 @@ import {
   nextHiddenBar,
   onBarsChanged,
   sources,
+  type InstrumentId,
 } from '../data/barSource';
 import { bucketEnd, bucketStart } from './aggregate';
 import type { Timeframe } from '../types';
 
 export const SPEEDS = [1, 2, 5, 10, 20] as const; // base bars per second
 
-export type StepSize = Timeframe | 'view'; // 'view' = follow the chart timeframe
+export type StepSize = Timeframe | 'view'; // 'view' = follow the NQ chart timeframe
 
 interface ReplayState {
   currentTime: number | null;
   startTs: number | null;
   endTs: number | null; // backtest range end; the clock never advances past it
-  timeframe: Timeframe;
+  // Per-chart display timeframes (TradingView-style): the timeframe buttons
+  // and typed switcher apply to the FOCUSED chart — the one last clicked.
+  timeframes: Record<InstrumentId, Timeframe>;
+  focused: InstrumentId;
   stepSize: StepSize;
   playing: boolean;
   speed: number;
@@ -38,7 +42,8 @@ interface ReplayState {
   play: () => void;
   pause: () => void;
   setSpeed: (s: number) => void;
-  setTimeframe: (tf: Timeframe) => void;
+  setTimeframe: (tf: Timeframe, instrument?: InstrumentId) => void; // default: focused chart
+  setFocused: (instrument: InstrumentId) => void;
   setStepSize: (s: StepSize) => void;
   reset: () => void;
 }
@@ -53,21 +58,27 @@ function clearTimer() {
 }
 
 export const useReplay = create<ReplayState>((set, get) => {
+  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+    // debug handle — stripped from production builds
+    (window as unknown as Record<string, unknown>).__replay = { get: () => get() };
+  }
   // Any newly loaded data (prefetch, backfill, hourly history) re-renders views.
   onBarsChanged(() => set((s) => ({ dataVersion: s.dataVersion + 1 })));
 
   const prefetch = (ts: number) => void ensureLoadedAround(ts, 0, 2);
 
   const stepTf = (): Timeframe => {
-    const { stepSize, timeframe } = get();
-    return stepSize === 'view' ? timeframe : stepSize;
+    const { stepSize, timeframes } = get();
+    // stepping drives the global clock via NQ (the traded instrument)
+    return stepSize === 'view' ? timeframes.NQ : stepSize;
   };
 
   return {
     currentTime: null,
     startTs: null,
     endTs: null,
-    timeframe: '5m',
+    timeframes: { NQ: '5m', ES: '5m' },
+    focused: 'NQ',
     stepSize: 'view',
     playing: false,
     speed: 5,
@@ -167,7 +178,9 @@ export const useReplay = create<ReplayState>((set, get) => {
       }
     },
 
-    setTimeframe: (tf) => set({ timeframe: tf }),
+    setTimeframe: (tf, instrument) =>
+      set((s) => ({ timeframes: { ...s.timeframes, [instrument ?? s.focused]: tf } })),
+    setFocused: (instrument) => set({ focused: instrument }),
     setStepSize: (s) => set({ stepSize: s }),
 
     reset: () => {
