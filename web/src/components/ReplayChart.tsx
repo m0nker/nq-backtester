@@ -163,6 +163,11 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
     chartRef.current = chart;
     candlesRef.current = candles;
     needsFullPaint.current = true;
+    if (process.env.NODE_ENV !== 'production') {
+      // debug handle — stripped from production builds
+      const w = window as unknown as { __charts?: Record<string, unknown> };
+      w.__charts = { ...w.__charts, [instrument]: chart };
+    }
     return () => {
       el.removeEventListener('pointerdown', onPointerDown);
       el.removeEventListener('wheel', bumpOverlay);
@@ -220,18 +225,24 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
 
     // recenter on fresh chart, rewind, or timeframe switch (jump to recent
     // action — the preserved logical range would land in ancient history);
-    // forward motion never scrolls. NOTE: must be an instant jump, NOT
-    // scrollToRealTime() — that animates, and any setData from a mid-flight
-    // chunk load cancels the animation partway, stranding the viewport in
-    // random history.
+    // forward motion never scrolls. This must be scrollToPosition(6, false):
+    // - scrollToRealTime() ANIMATES, and a setData from a mid-flight chunk
+    //   load cancels the animation partway (viewport stranded in history);
+    // - setVisibleLogicalRange() in the same batch as setData is resolved
+    //   against the OLD series' index space (data commits lazily) and lands
+    //   in the wrong place. scrollToPosition stores a base-RELATIVE offset
+    //   ("6 bars right of the last bar"), correct whenever the data commits.
     const rewound = prevTimeRef.current !== null && currentTime < prevTimeRef.current;
     const tfSwitched = prevTfRef.current !== timeframe;
     if (needsFullPaint.current || rewound || tfSwitched) {
-      const ts = chartRef.current!.timeScale();
-      const cur = ts.getVisibleLogicalRange();
-      const width = cur && cur.to > cur.from ? Math.min(cur.to - cur.from, 3000) : 120;
-      const right = candles.length - 1 + 6; // keep the usual rightOffset
-      ts.setVisibleLogicalRange({ from: right - width, to: right });
+      // scrollToPosition(_, false) queues a base-RELATIVE right-offset
+      // invalidation that LWC applies IN ORDER after the setData above —
+      // correct whatever the new dataset's index space is. Never use
+      // scrollToRealTime here: it ANIMATES rightOffset toward +6, and an
+      // interrupted animation leaves a big negative offset that strands the
+      // viewport in old history — persistently, since every later dataset
+      // swap keeps the stuck base-relative offset.
+      chartRef.current!.timeScale().scrollToPosition(6, false);
     }
     needsFullPaint.current = false;
     prevTimeRef.current = currentTime;
@@ -525,7 +536,7 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
         <button
           className="pointer-events-auto absolute bottom-16 right-20 rounded border border-slate-700 bg-slate-900/90 px-2 py-1 text-sm text-slate-300 hover:bg-slate-800"
           title="Recenter on the current candle"
-          onClick={() => chartRef.current?.timeScale().scrollToRealTime()}
+          onClick={() => chartRef.current?.timeScale().scrollToPosition(6, false)}
         >
           ⇥
         </button>

@@ -93,6 +93,7 @@ interface DrawingsState {
   add: (instrument: InstrumentId, d: Drawing) => void;
   update: (instrument: InstrumentId, id: string, patch: Partial<Drawing>) => void;
   remove: (instrument: InstrumentId, id: string) => void;
+  clear: (instrument: InstrumentId) => void;
   setSelected: (sel: { instrument: InstrumentId; id: string } | null) => void;
   setDefaults: (patch: Partial<StyleDefaults>) => void;
 }
@@ -136,6 +137,16 @@ export const useDrawings = create<DrawingsState>((set, get) => {
         return {
           drawings,
           selected: s.selected?.id === id ? null : s.selected,
+        };
+      }),
+
+    clear: (instrument) =>
+      set((s) => {
+        const drawings = { ...s.drawings, [instrument]: [] };
+        save(drawings, s.defaults);
+        return {
+          drawings,
+          selected: s.selected?.instrument === instrument ? null : s.selected,
         };
       }),
 

@@ -38,7 +38,9 @@ interface Props {
   overlayTick: number; // bumped by ReplayChart on any pan/zoom/scale/data change
 }
 
-type Handle = 'body' | { tKey: 't1' | 't2'; pKey: 'p1' | 'p2' };
+// Corner handles carry both keys; rect EDGE handles carry one (single-axis
+// resize: vertical edges move only that side's time, horizontal only price).
+type Handle = 'body' | { tKey?: 't1' | 't2'; pKey?: 'p1' | 'p2' };
 
 function timeToLogical(candles: Bar[], t: number, tfSec: number): number {
   const n = candles.length;
@@ -53,7 +55,7 @@ function timeToLogical(candles: Bar[], t: number, tfSec: number): number {
     else hi = mid - 1;
   }
   const span = candles[lo + 1].t - candles[lo].t;
-  return lo + (t - candles[lo].t) / span;
+  return lo + (t - candles[lo].t) / (span > 0 ? span : tfSec); // span guard: never NaN
 }
 
 function logicalToTime(candles: Bar[], logical: number, tfSec: number): number {
@@ -63,7 +65,7 @@ function logicalToTime(candles: Bar[], logical: number, tfSec: number): number {
   if (logical >= n - 1) return candles[n - 1].t + (logical - (n - 1)) * tfSec;
   const i = Math.floor(logical);
   const span = candles[i + 1].t - candles[i].t;
-  return candles[i].t + (logical - i) * span;
+  return candles[i].t + (logical - i) * (span > 0 ? span : tfSec);
 }
 
 export default function DrawingLayer({ instrument, chartRef, seriesRef, geoRef, overlayTick }: Props) {
@@ -78,6 +80,13 @@ export default function DrawingLayer({ instrument, chartRef, seriesRef, geoRef, 
   );
   const draftRef = useRef(draft);
   draftRef.current = draft;
+  const [clearArmed, setClearArmed] = useState(false); // two-click clear-all
+
+  useEffect(() => {
+    if (!clearArmed) return;
+    const t = setTimeout(() => setClearArmed(false), 3000);
+    return () => clearTimeout(t);
+  }, [clearArmed]);
 
   // tool switched off (Escape / other chart finished a shape) — drop drafts
   useEffect(() => {
@@ -254,7 +263,10 @@ export default function DrawingLayer({ instrument, chartRef, seriesRef, geoRef, 
         };
         const pt = secondAnchor(ev, rect, fixed, d.kind === 'line');
         if (!pt) return;
-        st.update(instrument, d.id, { [handle.tKey]: pt.t, [handle.pKey]: pt.p });
+        const patch: Partial<Drawing> = {};
+        if (handle.tKey) patch[handle.tKey] = pt.t;
+        if (handle.pKey) patch[handle.pKey] = pt.p;
+        st.update(instrument, d.id, patch);
       }
     };
     const up = () => {
@@ -283,17 +295,25 @@ export default function DrawingLayer({ instrument, chartRef, seriesRef, geoRef, 
   const selDrawing = drawings.find((d) => isSel(d)) ?? null;
 
   const handleDots = (d: Drawing, a: { x: number; y: number }, b: { x: number; y: number }) => {
-    const dots: { x: number; y: number; h: Handle }[] =
+    const midX = (a.x + b.x) / 2,
+      midY = (a.y + b.y) / 2;
+    const dots: { x: number; y: number; h: Handle; cursor: string }[] =
       d.kind === 'line'
         ? [
-            { x: a.x, y: a.y, h: { tKey: 't1', pKey: 'p1' } },
-            { x: b.x, y: b.y, h: { tKey: 't2', pKey: 'p2' } },
+            { x: a.x, y: a.y, h: { tKey: 't1', pKey: 'p1' }, cursor: 'grab' },
+            { x: b.x, y: b.y, h: { tKey: 't2', pKey: 'p2' }, cursor: 'grab' },
           ]
         : [
-            { x: a.x, y: a.y, h: { tKey: 't1', pKey: 'p1' } },
-            { x: b.x, y: b.y, h: { tKey: 't2', pKey: 'p2' } },
-            { x: a.x, y: b.y, h: { tKey: 't1', pKey: 'p2' } },
-            { x: b.x, y: a.y, h: { tKey: 't2', pKey: 'p1' } },
+            // corners: free resize
+            { x: a.x, y: a.y, h: { tKey: 't1', pKey: 'p1' }, cursor: 'grab' },
+            { x: b.x, y: b.y, h: { tKey: 't2', pKey: 'p2' }, cursor: 'grab' },
+            { x: a.x, y: b.y, h: { tKey: 't1', pKey: 'p2' }, cursor: 'grab' },
+            { x: b.x, y: a.y, h: { tKey: 't2', pKey: 'p1' }, cursor: 'grab' },
+            // edge midpoints: single-axis resize
+            { x: a.x, y: midY, h: { tKey: 't1' }, cursor: 'ew-resize' },
+            { x: b.x, y: midY, h: { tKey: 't2' }, cursor: 'ew-resize' },
+            { x: midX, y: a.y, h: { pKey: 'p1' }, cursor: 'ns-resize' },
+            { x: midX, y: b.y, h: { pKey: 'p2' }, cursor: 'ns-resize' },
           ];
     return dots.map((dot, i) => (
       <circle
@@ -305,7 +325,7 @@ export default function DrawingLayer({ instrument, chartRef, seriesRef, geoRef, 
         stroke="#f5b942"
         strokeWidth={1.5}
         pointerEvents="all"
-        style={{ cursor: 'grab' }}
+        style={{ cursor: dot.cursor }}
         onPointerDown={(e) => startShapeDrag(e, d, dot.h)}
       />
     ));
@@ -430,6 +450,26 @@ export default function DrawingLayer({ instrument, chartRef, seriesRef, geoRef, 
         >
           ▭
         </button>
+        {drawings.length > 0 && (
+          <button
+            className={`flex h-7 items-center justify-center rounded border text-xs ${
+              clearArmed
+                ? 'w-auto border-rose-500 bg-rose-950/90 px-1.5 text-rose-300'
+                : 'w-7 border-slate-700 bg-slate-900/90 text-slate-400 hover:bg-slate-800'
+            }`}
+            title={`Clear all ${instrument} drawings (click twice)`}
+            onClick={() => {
+              if (clearArmed) {
+                useDrawings.getState().clear(instrument);
+                setClearArmed(false);
+              } else {
+                setClearArmed(true);
+              }
+            }}
+          >
+            {clearArmed ? 'clear?' : '🧹'}
+          </button>
+        )}
       </div>
 
       {/* style editor for the selected drawing */}

@@ -274,7 +274,10 @@ export default function Home() {
       <div ref={chartsRef} className="flex min-h-0 flex-1">
         {chartLayout !== 'es' && (
           <div
-            className="relative min-h-0"
+            // min-w-0: flex items default to min-width:auto (min-content), and
+            // the chart canvas inside makes min-content = its CURRENT width —
+            // the pane could grow but never shrink (divider stuck rightward)
+            className="relative min-h-0 min-w-0"
             style={{ width: chartLayout === 'split' ? `${leftPct}%` : '100%' }}
             onPointerDownCapture={() => useReplay.getState().setFocused('NQ')}
           >
@@ -309,7 +312,7 @@ export default function Home() {
         )}
         {chartLayout !== 'nq' && (
           <div
-            className="relative min-h-0 flex-1"
+            className="relative min-h-0 min-w-0 flex-1"
             onPointerDownCapture={() => useReplay.getState().setFocused('ES')}
           >
             <span
