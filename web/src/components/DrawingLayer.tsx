@@ -81,6 +81,9 @@ export default function DrawingLayer({ instrument, chartRef, seriesRef, geoRef, 
   const draftRef = useRef(draft);
   draftRef.current = draft;
   const [clearArmed, setClearArmed] = useState(false); // two-click clear-all
+  // crosshair while a draw tool is armed (the capture surface hides LWC's
+  // own crosshair); follows the SNAPPED point so Ctrl/Shift visibly snap it
+  const [cross, setCross] = useState<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
     if (!clearArmed) return;
@@ -90,7 +93,10 @@ export default function DrawingLayer({ instrument, chartRef, seriesRef, geoRef, 
 
   // tool switched off (Escape / other chart finished a shape) — drop drafts
   useEffect(() => {
-    if (tool === 'none') setDraft(null);
+    if (tool === 'none') {
+      setDraft(null);
+      setCross(null);
+    }
   }, [tool]);
 
   useEffect(() => {
@@ -121,29 +127,50 @@ export default function DrawingLayer({ instrument, chartRef, seriesRef, geoRef, 
   }, [instrument]);
 
   // ---- coordinate conversion ----
+  // LWC's logicalToCoordinate returns 0 for NON-INTEGER logicals (source:
+  // `!isInteger(index) -> return 0`), which slammed any anchor that falls
+  // between the current TF's buckets (e.g. a 1m-placed 09:35 anchor on the
+  // 2m chart) to the left edge. The transform is linear, so derive it from
+  // two integer probes and interpolate fractionals ourselves.
+
+  const logicalToX = (logical: number): number | null => {
+    const chart = chartRef.current;
+    if (!chart) return null;
+    const ts = chart.timeScale();
+    const x0 = ts.logicalToCoordinate(0 as Logical);
+    const x1 = ts.logicalToCoordinate(1 as Logical);
+    if (x0 === null || x1 === null || x1 === x0) return null;
+    return (x0 as number) + ((x1 as number) - (x0 as number)) * logical;
+  };
+
+  const xToLogical = (x: number): number | null => {
+    const chart = chartRef.current;
+    if (!chart) return null;
+    const ts = chart.timeScale();
+    const x0 = ts.logicalToCoordinate(0 as Logical);
+    const x1 = ts.logicalToCoordinate(1 as Logical);
+    if (x0 === null || x1 === null || x1 === x0) return null;
+    return (x - (x0 as number)) / ((x1 as number) - (x0 as number));
+  };
 
   const toXY = (t: number, p: number): { x: number; y: number } | null => {
-    const chart = chartRef.current,
-      series = seriesRef.current,
+    const series = seriesRef.current,
       geo = geoRef.current;
-    if (!chart || !series || !geo || geo.candles.length === 0) return null;
-    const x = chart
-      .timeScale()
-      .logicalToCoordinate(timeToLogical(geo.candles, t, geo.tfSec) as Logical);
+    if (!series || !geo || geo.candles.length === 0) return null;
+    const x = logicalToX(timeToLogical(geo.candles, t, geo.tfSec));
     const y = series.priceToCoordinate(p);
     if (x === null || y === null) return null;
     return { x, y };
   };
 
   const fromXY = (x: number, y: number): { t: number; p: number } | null => {
-    const chart = chartRef.current,
-      series = seriesRef.current,
+    const series = seriesRef.current,
       geo = geoRef.current;
-    if (!chart || !series || !geo || geo.candles.length === 0) return null;
-    const logical = chart.timeScale().coordinateToLogical(x);
+    if (!series || !geo || geo.candles.length === 0) return null;
+    const logical = xToLogical(x);
     const p = series.coordinateToPrice(y);
     if (logical === null || p === null) return null;
-    return { t: logicalToTime(geo.candles, logical as number, geo.tfSec), p: p as number };
+    return { t: logicalToTime(geo.candles, logical, geo.tfSec), p: p as number };
   };
 
   // Ctrl: magnet to the nearest bar's nearest OHLC value
@@ -202,6 +229,7 @@ export default function DrawingLayer({ instrument, chartRef, seriesRef, geoRef, 
       const raw = fromXY(e.clientX - rect.left, e.clientY - rect.top);
       if (!raw) return;
       const pt = magnetSnap(raw.t, raw.p, e);
+      setCross(toXY(pt.t, pt.p));
       setDraft({ t1: pt.t, p1: pt.p, t2: pt.t, p2: pt.p });
       return;
     }
@@ -225,11 +253,17 @@ export default function DrawingLayer({ instrument, chartRef, seriesRef, geoRef, 
   };
 
   const onCaptureMove = (e: React.PointerEvent) => {
-    const cur = draftRef.current;
-    if (!cur) return;
     const rect = rootRef.current!.getBoundingClientRect();
-    const end = secondAnchor(e, rect, cur, tool === 'line');
-    if (end) setDraft({ ...cur, t2: end.t, p2: end.p });
+    const cur = draftRef.current;
+    let pt: { t: number; p: number } | null;
+    if (cur) {
+      pt = secondAnchor(e, rect, cur, tool === 'line');
+      if (pt) setDraft({ ...cur, t2: pt.t, p2: pt.p });
+    } else {
+      const raw = fromXY(e.clientX - rect.left, e.clientY - rect.top);
+      pt = raw ? magnetSnap(raw.t, raw.p, e) : null;
+    }
+    setCross(pt ? toXY(pt.t, pt.p) : null);
   };
 
   // ---- edit drags (tool inactive) ----
@@ -421,6 +455,13 @@ export default function DrawingLayer({ instrument, chartRef, seriesRef, geoRef, 
                   },
               true,
             )}
+          {tool !== 'none' && cross && (
+            <g pointerEvents="none">
+              <line x1={0} y1={cross.y} x2={paneW} y2={cross.y} stroke="rgba(255,255,255,0.55)" strokeWidth={1} strokeDasharray="3 3" />
+              <line x1={cross.x} y1={0} x2={cross.x} y2={paneH} stroke="rgba(255,255,255,0.55)" strokeWidth={1} strokeDasharray="3 3" />
+              <circle cx={cross.x} cy={cross.y} r={3} fill="#e2e8f0" />
+            </g>
+          )}
         </svg>
       )}
 
@@ -431,6 +472,7 @@ export default function DrawingLayer({ instrument, chartRef, seriesRef, geoRef, 
           style={{ width: paneW, height: paneH }}
           onPointerDown={onCaptureDown}
           onPointerMove={onCaptureMove}
+          onPointerLeave={() => setCross(null)}
         />
       )}
 
