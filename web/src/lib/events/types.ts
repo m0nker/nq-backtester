@@ -60,9 +60,9 @@ export interface EventPayloads {
     candidateId: string; // = `${ifvg.tf}:${ifvg.formedAt}:${direction}` (dedupe key)
     direction: 'long' | 'short';
     confirmTs: number; // the IFVG inversion close (rule-3 confirmation)
-    condition: { tf: Timeframe; top: number; bottom: number; formedAt: number; armedAt: number };
+    condition: { tf: Timeframe; top: number; bottom: number; formedAt: number; armedAt: number; bT: number };
     otherConditions: Timeframe[]; // additional armed condition-FVG TFs, if any
-    ifvg: { tf: Timeframe; top: number; bottom: number; formedAt: number };
+    ifvg: { tf: Timeframe; top: number; bottom: number; formedAt: number; bT: number };
     stop: number; // retracement swing low/high (absolute)
     entryEst: number; // last close at confirmation; real entry = next bar's open
     biasId: string; // the live bias entry this aligned with

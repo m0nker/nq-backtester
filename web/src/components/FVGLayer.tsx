@@ -15,6 +15,7 @@ import { useMemo } from 'react';
 import type { IChartApi, ISeriesApi, Logical } from 'lightweight-charts';
 import { timeToLogical, type ChartGeo } from '@/components/DrawingLayer';
 import { sources, type InstrumentId } from '@/lib/data/barSource';
+import { useBot } from '@/lib/concepts/botStore';
 import { computeFVGs, statusOf, type FVG } from '@/lib/concepts/fvg';
 import { FVG_TF_CHOICES, useConcepts } from '@/lib/concepts/store';
 import { useReplay } from '@/lib/replay/clock';
@@ -38,6 +39,7 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
   const showInverted = useConcepts((s) => s.showInverted);
   const showCE = useConcepts((s) => s.showCE);
   const panelOpen = useConcepts((s) => s.panelOpen);
+  const pendingCandidate = useBot((s) => s.pending);
 
   // Detection is keyed to the replay clock, not to pan/zoom: overlayTick
   // re-renders only re-map boxes to pixels.
@@ -147,6 +149,53 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
           )}
         </g>,
       );
+    }
+
+    // Pending-candidate highlight: while the prompt is up, the exact
+    // condition FVG (amber) and trigger IFVG (sky) get loud outlines —
+    // rendered regardless of which indicator TFs are toggled on.
+    if (pendingCandidate) {
+      const marks = [
+        { z: pendingCandidate.condition, color: '#f5b942', label: `COND ${pendingCandidate.condition.tf}` },
+        { z: pendingCandidate.ifvg, color: '#38bdf8', label: `IFVG ${pendingCandidate.ifvg.tf}` },
+      ];
+      for (const m of marks) {
+        const xL = toX(m.z.bT);
+        const xR = toX(currentTime);
+        if (xL === null || xR === null) continue;
+        const yTop = series.priceToCoordinate(m.z.top);
+        const yBot = series.priceToCoordinate(m.z.bottom);
+        if (yTop === null || yBot === null) continue;
+        const y = Math.min(yTop as number, yBot as number);
+        const h = Math.abs((yBot as number) - (yTop as number));
+        const x = Math.max(xL, -8);
+        const w = Math.max(Math.min(xR, paneW + 8) - x, 2);
+        boxes.push(
+          <g key={`cand-${m.label}`}>
+            <rect
+              x={x}
+              y={y}
+              width={w}
+              height={Math.max(h, 2)}
+              fill={m.color}
+              fillOpacity={0.12}
+              stroke={m.color}
+              strokeOpacity={0.95}
+              strokeWidth={2}
+            />
+            <text
+              x={x + 4}
+              y={Math.max(y - 4, 10)}
+              fill={m.color}
+              fontSize={10}
+              fontWeight={700}
+              fontFamily="monospace"
+            >
+              {m.label}
+            </text>
+          </g>,
+        );
+      }
     }
   }
 

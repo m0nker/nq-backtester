@@ -38,7 +38,7 @@ import {
   type ExecutionWindow,
   type RiskSettings,
 } from './engine';
-import { CONDITION_TFS, TRIGGER_TFS_V1, computeFVGs, type FVG } from './fvg';
+import { CONDITION_TFS, TRIGGER_TFS_ALL, computeFVGs, type FVG } from './fvg';
 
 export type CandidateAction = 'prompt-trade' | 'label-only' | 'auto';
 
@@ -69,6 +69,7 @@ export interface BotSettings {
   window: ExecutionWindow;
   risk: RiskSettings;
   hopWindows: boolean;
+  onePosition: boolean; // don't look for candidates while a trade is on
 }
 const SETTINGS_KEY = 'bot-settings-v1';
 const DEFAULT_SETTINGS: BotSettings = {
@@ -76,6 +77,7 @@ const DEFAULT_SETTINGS: BotSettings = {
   window: DEFAULT_WINDOW,
   risk: DEFAULT_RISK,
   hopWindows: false,
+  onePosition: true,
 };
 function loadSettings(): BotSettings {
   if (typeof window === 'undefined') return DEFAULT_SETTINGS;
@@ -88,6 +90,7 @@ function loadSettings(): BotSettings {
       window: { ...DEFAULT_WINDOW, ...p.window },
       risk: { ...DEFAULT_RISK, ...p.risk },
       hopWindows: p.hopWindows ?? false,
+      onePosition: p.onePosition ?? true,
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -107,9 +110,24 @@ function persistSettings(s: BotSettings) {
       windowEndSec: s.window.endSec,
       risk: s.risk,
       hopWindows: s.hopWindows,
+      onePosition: s.onePosition,
     });
   }
 }
+
+const currentSettings = (s: {
+  action: CandidateAction;
+  window: ExecutionWindow;
+  risk: RiskSettings;
+  hopWindows: boolean;
+  onePosition: boolean;
+}): BotSettings => ({
+  action: s.action,
+  window: s.window,
+  risk: s.risk,
+  hopWindows: s.hopWindows,
+  onePosition: s.onePosition,
+});
 
 // settings from a resumed session's config row, falling back to local defaults
 function settingsFromConfig(config: Record<string, unknown> | undefined): BotSettings {
@@ -123,6 +141,7 @@ function settingsFromConfig(config: Record<string, unknown> | undefined): BotSet
       typeof ws === 'number' && typeof we === 'number' ? { startSec: ws, endSec: we } : local.window,
     risk: { ...local.risk, ...(config.risk as Partial<RiskSettings> | undefined) },
     hopWindows: typeof config.hopWindows === 'boolean' ? config.hopWindows : local.hopWindows,
+    onePosition: typeof config.onePosition === 'boolean' ? config.onePosition : local.onePosition,
   };
 }
 
@@ -140,6 +159,7 @@ interface BotState {
   window: ExecutionWindow; // execution window (bot setting)
   risk: RiskSettings; // bot position sizing (bot setting)
   hopWindows: boolean; // auto-jump between active windows when idle
+  onePosition: boolean; // one trade at a time: dormant until the book is clean
 
   begin: () => void; // settings come from localStorage defaults
   resume: (events: SessionEvent[], upTo: number, config?: Record<string, unknown>) => void;
@@ -148,6 +168,7 @@ interface BotState {
   setWindow: (w: ExecutionWindow) => void;
   setRisk: (r: RiskSettings) => void;
   setHopWindows: (v: boolean) => void;
+  setOnePosition: (v: boolean) => void;
   addBias: (direction: BiasDirection, until: number) => void;
   removeBias: (biasId: string) => void;
   submitDecision: (decision: 'take' | 'marginal' | 'skip', notes: string) => void;
@@ -364,6 +385,7 @@ export const useBot = create<BotState>((set, get) => {
     window: DEFAULT_WINDOW,
     risk: DEFAULT_RISK,
     hopWindows: false,
+    onePosition: true,
 
     begin: () => {
       pendingEntries = [];
@@ -378,6 +400,7 @@ export const useBot = create<BotState>((set, get) => {
         window: settings.window,
         risk: settings.risk,
         hopWindows: settings.hopWindows,
+        onePosition: settings.onePosition,
         biases: [],
         armed,
         watermarks,
@@ -401,6 +424,7 @@ export const useBot = create<BotState>((set, get) => {
         window: settings.window,
         risk: settings.risk,
         hopWindows: settings.hopWindows,
+        onePosition: settings.onePosition,
         biases,
         armed,
         watermarks,
@@ -418,24 +442,24 @@ export const useBot = create<BotState>((set, get) => {
 
     setAction: (a) => {
       set({ action: a });
-      const s = get();
-      persistSettings({ action: a, window: s.window, risk: s.risk, hopWindows: s.hopWindows });
+      persistSettings(currentSettings(get()));
     },
     setWindow: (w) => {
       if (w.endSec <= w.startSec) return; // ignore degenerate windows
       set({ window: w });
-      const s = get();
-      persistSettings({ action: s.action, window: w, risk: s.risk, hopWindows: s.hopWindows });
+      persistSettings(currentSettings(get()));
     },
     setRisk: (r) => {
       set({ risk: r });
-      const s = get();
-      persistSettings({ action: s.action, window: s.window, risk: r, hopWindows: s.hopWindows });
+      persistSettings(currentSettings(get()));
     },
     setHopWindows: (v) => {
       set({ hopWindows: v });
-      const s = get();
-      persistSettings({ action: s.action, window: s.window, risk: s.risk, hopWindows: v });
+      persistSettings(currentSettings(get()));
+    },
+    setOnePosition: (v) => {
+      set({ onePosition: v });
+      persistSettings(currentSettings(get()));
     },
 
     addBias: (direction, until) => {
@@ -532,24 +556,39 @@ export const useBot = create<BotState>((set, get) => {
         if (at !== undefined) conditions.push({ gap: g, armedAt: at });
       }
 
-      // 3. rule-3 triggers: trigger-TF gaps whose inversion landed in (from, to]
-      const triggers: FVG[] = [];
-      for (const tf of TRIGGER_TFS_V1) {
-        for (const g of computeFVGs(sources.NQ.getVisibleCandles(to, tf), tf, to, {
-          lookbackCandles: TRIGGER_LOOKBACK,
-        })) {
-          if (g.invertedAt !== null && g.invertedAt > from && g.invertedAt <= to) triggers.push(g);
-        }
-      }
+      // one-position gate (locked 2026-07-30): while a trade is on — open
+      // position, ANY working order, or an entry awaiting its fill — the bot
+      // doesn't look for candidates at all. Also prevents the cancel-out
+      // glitch (opposite entries netting flat and orphaning every leg).
+      const book = useTrading.getState().derived;
+      const busy =
+        book.position.qty !== 0 || book.workingOrders.length > 0 || pendingEntries.length > 0;
 
-      const drafts = matchTriggers({
-        triggers,
-        conditions,
-        biases,
-        bars1m: sources.NQ.getVisibleBars(to),
-        fired: new Set(Object.keys(s.fired)),
-        window: s.window,
-      }).sort((a, b) => a.confirmTs - b.confirmTs);
+      // 3. rule-3 triggers across ALL trigger TFs (15s–5m), with the overlap
+      // hierarchy: the full pool is passed as blockers so a lower-TF
+      // inversion defers to any overlapping same-or-higher filled gap.
+      let drafts: CandidateDraft[] = [];
+      if (!(s.onePosition && busy)) {
+        const triggers: FVG[] = [];
+        const pool: FVG[] = [];
+        for (const tf of TRIGGER_TFS_ALL) {
+          for (const g of computeFVGs(sources.NQ.getVisibleCandles(to, tf), tf, to, {
+            lookbackCandles: TRIGGER_LOOKBACK,
+          })) {
+            pool.push(g);
+            if (g.invertedAt !== null && g.invertedAt > from && g.invertedAt <= to) triggers.push(g);
+          }
+        }
+        drafts = matchTriggers({
+          triggers,
+          conditions,
+          biases,
+          bars1m: sources.NQ.getVisibleBars(to),
+          fired: new Set(Object.keys(s.fired)),
+          window: s.window,
+          blockers: pool,
+        }).sort((a, b) => a.confirmTs - b.confirmTs);
+      }
 
       const armedCount = conditions.filter(
         ({ gap }) => gap.invertedAt === null && gap.expiredAt === null,

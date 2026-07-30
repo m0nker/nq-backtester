@@ -156,8 +156,20 @@ While armed: a **bearish** FVG on a trigger timeframe becomes a **bullish IFVG**
 own timeframe **closes above the gap's top** — with the confirmation close occurring **at or after
 the tap** and while the condition FVG is still alive.
 
-- **V1: trigger scan = 1m only** (locked 2026-07-30). Full set later: 15s–5m with
-  **highest-timeframe-IFVG selection** (engine keeps the TF list as config for this).
+- **Trigger scan = all seven TFs, 15s–5m** (upgraded from the 1m-only v1, locked 2026-07-30),
+  governed by the **overlap hierarchy** below. (15s/30s participate only where 1s data exists.)
+- **Overlap hierarchy (locked 2026-07-30):** the execution belongs to the *highest timeframe* of
+  an overlapping cluster. An inversion on TF X is **suppressed** when an overlapping (price zones
+  intersect), same-direction, active gap on a **same-or-higher** trigger TF is in **filled**
+  status (tapped, not yet inverted) at the confirmation — wait for the bigger gap to close
+  through and take the trade off that one instead. Details:
+  - only *filled* gaps block — an untapped overlapping higher gap is not yet in play;
+  - *lower* TFs never block (a still-filled 4m can't veto a 5m close — bucket close-time
+    differences make this the normal case);
+  - same-TF overlapping filled gaps DO block (locked by user answer);
+  - a suppressed inversion is consumed — if the higher gap never inverts, no trade comes from
+    that cluster. True "leg" detection (highest-TF IFVG *of the leg*) is future discretionary
+    work; the overlap check is its mechanical stand-in.
 - Eligible bearish trigger FVGs are the **active** ones — not inverted and within their 25-candle
   life. **[v1 default]** no further location filter (where the gap formed relative to the
   condition zone is a future confluence).
@@ -214,6 +226,14 @@ minimum 0.1 — for manual and bot trades alike. The bot sizes each trade by its
 For %/$ the ideal size = risk-dollars ÷ (stop-distance-points × $20/pt), rounded to the
 **nearest 0.1**. Worked example (locked): $50k account, 1% risk, 20-pt stop → $500 ÷ $400 = 1.25
 → **1.3** contracts.
+
+**One position at a time (default ON, locked 2026-07-30):** while a trade is on — open position,
+any working order, or an entry awaiting its fill — the bot does not look for candidates at all;
+it resumes only when the book is completely clean. (Also prevents the cancel-out failure mode:
+two opposite entries netting flat, orphaning every reduce-only leg.)
+
+**Prompt chart marks:** while the candidate prompt is up, the exact condition FVG (amber) and
+trigger IFVG (sky) are outlined on the chart, independent of the FVG indicator's toggles.
 
 **Window hopping (opt-in):** when enabled, any time the clock sits outside the active window with
 nothing running (flat, no working orders, no pending fill or prompt), the bot jumps to **one

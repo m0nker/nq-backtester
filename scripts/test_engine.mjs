@@ -228,6 +228,34 @@ check('size-min-floor', sizeContracts(R('usd', 10), 100, 50_000), 0.1); // 0.005
 check('size-constant-rounds', sizeContracts(R('contracts', 1.25), 999, 0), 1.3);
 check('size-zero-stop-guard', sizeContracts(R('usd', 500), 0, 50_000), 0.1);
 
+// ---- overlap hierarchy: a filled same-or-higher overlapping gap suppresses
+// a lower-TF inversion; lower/unfilled/inverted/expired/non-overlapping never block ----
+// base trigger: bear 1m [21925..21935] inverting at 9:46
+const blockGap = (tf: '15s' | '30s' | '1m' | '2m' | '5m', patch: Partial<FVG> = {}) =>
+  mkGap({ tf, dir: 'bear', top: 21940, bottom: 21920, formedAt: w(9, 20), tappedAt: w(9, 40), ...patch });
+check('overlap-higher-filled-blocks', matchTriggers({ ...base, blockers: [blockGap('5m')] }).length, 0);
+check('overlap-same-tf-blocks', matchTriggers({ ...base, blockers: [blockGap('1m')] }).length, 0);
+check('overlap-unfilled-no-block', matchTriggers({ ...base, blockers: [blockGap('5m', { tappedAt: null })] }).length, 1);
+check('overlap-tapped-late-no-block', matchTriggers({ ...base, blockers: [blockGap('5m', { tappedAt: w(9, 50) })] }).length, 1);
+check('overlap-already-inverted-no-block', matchTriggers({ ...base, blockers: [blockGap('5m', { invertedAt: w(9, 40) })] }).length, 1);
+check('overlap-expired-no-block', matchTriggers({ ...base, blockers: [blockGap('5m', { expiredAt: w(9, 40) })] }).length, 1);
+check('no-overlap-no-block', matchTriggers({ ...base, blockers: [blockGap('5m', { top: 21990, bottom: 21960 })] }).length, 1);
+check('edge-touch-not-overlap', matchTriggers({ ...base, blockers: [blockGap('5m', { top: 21960, bottom: 21935 })] }).length, 1);
+check('wrong-dir-no-block', matchTriggers({ ...base, blockers: [blockGap('5m', { dir: 'bull' as const })] }).length, 1);
+check('trigger-not-self-blocked', matchTriggers({ ...base, blockers: [trigger] }).length, 1);
+// lower TF never blocks: a 5m trigger fires through a filled overlapping 1m
+{
+  const trig5 = mkGap({ tf: '5m', dir: 'bear', top: 21935, bottom: 21925, formedAt: w(9, 30), invertedAt: w(9, 46) });
+  const c = matchTriggers({ ...base, triggers: [trig5], blockers: [blockGap('1m')] });
+  check('lower-filled-never-blocks', c.length, 1);
+}
+// 15s trigger obeys the same rule: blocked by a filled overlapping 1m
+{
+  const trig15s = mkGap({ tf: '15s', dir: 'bear', top: 21933, bottom: 21928, formedAt: w(9, 43), invertedAt: w(9, 46) });
+  check('15s-blocked-by-1m', matchTriggers({ ...base, triggers: [trig15s], blockers: [blockGap('1m')] }).length, 0);
+  check('15s-fires-alone', matchTriggers({ ...base, triggers: [trig15s] }).length, 1);
+}
+
 if (failures) { console.log(failures + ' FAILURES'); process.exit(1); }
 console.log('ALL ENGINE TESTS PASS');
 `;

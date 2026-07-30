@@ -30,6 +30,7 @@ export default function BotPanel() {
   const win = useBot((s) => s.window); // named `win`: don't shadow globalThis.window
   const risk = useBot((s) => s.risk);
   const hopWindows = useBot((s) => s.hopWindows);
+  const onePosition = useBot((s) => s.onePosition);
   const biases = useBot((s) => s.biases);
   const armedCount = useBot((s) => s.armedCount);
   const addBias = useBot((s) => s.addBias);
@@ -226,6 +227,15 @@ export default function BotPanel() {
             distance; % uses the current balance.
           </p>
 
+          <label className="mb-1.5 flex cursor-pointer items-center gap-2 text-slate-300">
+            <input
+              type="checkbox"
+              checked={onePosition}
+              onChange={(e) => useBot.getState().setOnePosition(e.target.checked)}
+            />
+            1 position at a time
+            <span className="text-slate-600">(dormant until flat with no working orders)</span>
+          </label>
           <label className="flex cursor-pointer items-center gap-2 text-slate-300">
             <input
               type="checkbox"

@@ -131,6 +131,10 @@ export function sessionOpenOf(ts: number): number {
 
 export const gapKey = (g: FVG): string => `${g.tf}:${g.formedAt}`;
 
+// Price-zone overlap (strict: touching edges is not overlap).
+export const overlaps = (a: { top: number; bottom: number }, b: { top: number; bottom: number }): boolean =>
+  a.bottom < b.top && b.bottom < a.top;
+
 // ---- bot position sizing (locked 2026-07-30) ----
 // Contracts trade in 0.1 steps (MNQ simulation), minimum 0.1. Three modes:
 // - contracts: a constant size;
@@ -171,9 +175,9 @@ export interface CandidateDraft {
   candidateId: string;
   direction: BiasDirection;
   confirmTs: number;
-  condition: { tf: Timeframe; top: number; bottom: number; formedAt: number; armedAt: number };
+  condition: { tf: Timeframe; top: number; bottom: number; formedAt: number; armedAt: number; bT: number };
   otherConditions: Timeframe[];
-  ifvg: { tf: Timeframe; top: number; bottom: number; formedAt: number };
+  ifvg: { tf: Timeframe; top: number; bottom: number; formedAt: number; bT: number };
   stop: number;
   entryEst: number;
   biasId: string;
@@ -193,6 +197,14 @@ export function matchTriggers(opts: {
   bars1m: Bar[]; // visible 1m bars (for the swing-extreme stop + entry estimate)
   fired: ReadonlySet<string>;
   window?: ExecutionWindow; // defaults to 09:30–11:00 ET
+  // Overlap hierarchy (locked 2026-07-30): the full trigger-TF gap pool (any
+  // status). An inversion on TF X is SUPPRESSED when an overlapping,
+  // same-direction, active gap on a SAME-OR-HIGHER trigger TF is in 'filled'
+  // status (tapped, not yet inverted) at the confirmation — the execution
+  // belongs to the highest timeframe of the overlap, so wait for it. Lower
+  // TFs never block (a still-filled 4m can't veto a 5m close, which lands
+  // first by bucket timing).
+  blockers?: FVG[];
 }): CandidateDraft[] {
   const out: CandidateDraft[] = [];
   for (const trig of opts.triggers) {
@@ -203,6 +215,23 @@ export function matchTriggers(opts: {
     const candidateId = `${trig.tf}:${trig.formedAt}:${direction}`;
     if (opts.fired.has(candidateId)) continue;
     if (!inExecutionWindow(confirmTs, opts.window)) continue;
+
+    if (
+      opts.blockers?.some(
+        (b) =>
+          !(b.tf === trig.tf && b.formedAt === trig.formedAt) && // not the trigger itself
+          b.dir === trig.dir &&
+          tfSec(b.tf) >= tfSec(trig.tf) && // same-or-higher TF (locked: same TF blocks too)
+          overlaps(b, trig) &&
+          b.formedAt <= confirmTs &&
+          b.tappedAt !== null &&
+          b.tappedAt <= confirmTs && // 'filled' at confirmation (unfilled never blocks)
+          (b.invertedAt === null || b.invertedAt > confirmTs) &&
+          (b.expiredAt === null || b.expiredAt > confirmTs),
+      )
+    ) {
+      continue;
+    }
 
     const bias = opts.biases.find((b) => b.direction === direction && biasAliveAt(b, confirmTs));
     if (!bias) continue;
@@ -245,9 +274,10 @@ export function matchTriggers(opts: {
         bottom: primary.gap.bottom,
         formedAt: primary.gap.formedAt,
         armedAt: primary.armedAt,
+        bT: primary.gap.bT,
       },
       otherConditions: matched.filter((m) => m !== primary).map((m) => m.gap.tf),
-      ifvg: { tf: trig.tf, top: trig.top, bottom: trig.bottom, formedAt: trig.formedAt },
+      ifvg: { tf: trig.tf, top: trig.top, bottom: trig.bottom, formedAt: trig.formedAt, bT: trig.bT },
       stop,
       entryEst,
       biasId: bias.id,
