@@ -172,18 +172,20 @@ the tap** and while the condition FVG is still alive.
   governed by the **overlap hierarchy** below. (15s/30s participate only where 1s data exists.)
   Each TF is individually toggleable in the bot settings; a disabled TF is not considered at
   all — neither as a trigger nor as an overlap blocker. At least one stays enabled.
-- **Overlap hierarchy (locked 2026-07-30):** the execution belongs to the *highest timeframe* of
-  an overlapping cluster. An inversion on TF X is **suppressed** when an overlapping (price zones
-  intersect), same-direction, active gap on a **same-or-higher** trigger TF is in **filled**
-  status (tapped, not yet inverted) at the confirmation — wait for the bigger gap to close
-  through and take the trade off that one instead. Details:
-  - only *filled* gaps block — an untapped overlapping higher gap is not yet in play;
+- **Filled-gap veto (locked 2026-07-30; tightened same day — overlap NOT required):** the
+  execution belongs to the *highest timeframe* still in play. An inversion on TF X is
+  **suppressed** when **any** same-direction, active gap on a **same-or-higher** trigger TF is
+  in **filled** status (tapped, not yet inverted) at the confirmation — regardless of whether the
+  zones overlap (an adjacent-but-not-intersecting filled 2m above a 1m trigger vetoes it, per the
+  observed failure case). Details:
+  - only *filled* gaps block — an untapped higher gap is not yet in play;
   - *lower* TFs never block (a still-filled 4m can't veto a 5m close — bucket close-time
     differences make this the normal case);
-  - same-TF overlapping filled gaps DO block (locked by user answer);
-  - a suppressed inversion is consumed — if the higher gap never inverts, no trade comes from
-    that cluster. True "leg" detection (highest-TF IFVG *of the leg*) is future discretionary
-    work; the overlap check is its mechanical stand-in.
+  - same-TF filled gaps DO block (two consecutive 1m gaps: one filled vetoes the other's
+    inversion);
+  - a suppressed inversion is consumed — if the bigger gap never inverts, no trade comes from it.
+    True "leg" detection (highest-TF IFVG *of the leg*) is future discretionary work; this veto
+    is its mechanical stand-in.
 - Eligible bearish trigger FVGs are the **active** ones — not inverted and within their 25-candle
   life. **[v1 default]** no further location filter (where the gap formed relative to the
   condition zone is a future confluence).
@@ -265,10 +267,11 @@ is known the engine places an OCO pair — stop at the **absolute** swing-extrem
 **fill + 1R** (1R measured fill→stop). If price gapped through the stop before the fill, no legs
 are placed (flagged for manual handling).
 
-**Fill resolution (locked 2026-07-30):** wherever the day has 1-second coverage, fills simulate
+**Fill resolution (locked 2026-07-30):** fill granularity follows the **step size**. When
+stepping a sub-minute size (**1s / 15s / 30s**) and the day has 1-second coverage, fills simulate
 on **1s bars** — a market order fills at the *next second's* open and limit/stop touches resolve
-at 1s precision, so 15s/30s-timeframe trades fill like 15s/30s trades. Days (or unloaded chunks)
-without seconds keep the 1-minute fill model with its 1s same-bar SL/TP sequencing. A **1s step
+at 1s precision. Minute-or-larger stepping and autoplay keep the fast 1-minute fill model with
+its 1s same-bar SL/TP sequencing (the seconds walk made minute stepping laggy). A **1s step
 size** exists in the replay controls (one raw second bar per step; no 1s chart timeframe).
 
 **Fast-forward fidelity:** detection scans the full range of every clock advance, so no candidate

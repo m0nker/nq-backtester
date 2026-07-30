@@ -6,7 +6,7 @@
 'use client';
 
 import { create } from 'zustand';
-import { getBarsInWindow, getSecondsBarsIn, lastVisibleBar } from '../data/barSource';
+import { getBarsInWindow, getSecondsBarsIn, isSubMinute, lastVisibleBar } from '../data/barSource';
 import { appendEvent, endSession, getEvents, resumeSession, startSession } from '../events/eventLog';
 import type { BracketSpec, OrderType, Side } from '../events/types';
 import { useReplay } from '../replay/clock';
@@ -397,39 +397,50 @@ export const useTrading = create<TradingState>((set, get) => {
         }
       };
 
-      // Fills run at 1-SECOND resolution wherever the day has 1s coverage:
-      // seconds bars closed in (from, to] are simulated individually (market
-      // fills at the next second's open, touches at 1s precision — a
-      // 15s-timeframe trade fills like one). The closed-minute loop stays the
-      // skeleton so days/chunks without seconds keep the 1m fill model, and a
-      // trailing partial-minute segment covers sub-minute advances (1s
-      // stepping) — clipping to (from, to] also means an order never
-      // evaluates against seconds from before it was placed.
-      let edge = from; // everything closing at/before this is already simulated
-      for (const bar of newBars) {
-        const segFrom = Math.max(edge, bar.t);
-        if (state.workingOrders.length > 0) {
-          const secs = getSecondsBarsIn(segFrom, bar.t + 60);
-          if (secs && secs.length > 0) {
+      // Fill resolution follows the STEP granularity (user request — the
+      // seconds walk made minute stepping laggy): only when stepping a
+      // sub-minute size ('1s'/'15s'/'30s') do fills simulate on individual
+      // 1s bars (market fills at the next second's open, touches at 1s
+      // precision, and an order never evaluates against seconds from before
+      // it was placed). Minute-or-larger stepping and autoplay keep the fast
+      // 1m fill model with its 1s same-bar SL/TP sequencing.
+      const { stepSize, timeframes } = useReplay.getState();
+      const stepEff = stepSize === 'view' ? timeframes.NQ : stepSize;
+      const secondFills = stepEff === '1s' || isSubMinute(stepEff);
+
+      if (secondFills) {
+        let edge = from; // everything closing at/before this is already simulated
+        for (const bar of newBars) {
+          const segFrom = Math.max(edge, bar.t);
+          if (state.workingOrders.length > 0) {
+            const secs = getSecondsBarsIn(segFrom, bar.t + 60);
+            if (secs && secs.length > 0) {
+              for (const sb of secs) {
+                if (state.workingOrders.length === 0) break;
+                processBar(sb);
+              }
+            } else {
+              processBar(bar, getSecondsBarsIn);
+            }
+          }
+          edge = bar.t + 60;
+        }
+        // trailing partial minute: only reachable with 1s data (no minute bar
+        // has closed there yet); without coverage fills wait for the close
+        if (state.workingOrders.length > 0 && edge < to) {
+          const secs = getSecondsBarsIn(Math.max(edge, from), to);
+          if (secs) {
             for (const sb of secs) {
               if (state.workingOrders.length === 0) break;
               processBar(sb);
             }
-          } else {
-            processBar(bar, getSecondsBarsIn);
           }
         }
-        edge = bar.t + 60;
-      }
-      // trailing partial minute: only reachable with 1s data (no minute bar
-      // has closed there yet); without coverage fills simply wait for the close
-      if (state.workingOrders.length > 0 && edge < to) {
-        const secs = getSecondsBarsIn(Math.max(edge, from), to);
-        if (secs) {
-          for (const sb of secs) {
-            if (state.workingOrders.length === 0) break;
-            processBar(sb);
-          }
+      } else {
+        for (const bar of newBars) {
+          if (state.workingOrders.length === 0) continue;
+          // 1s data (when covered) sequences same-bar SL/TP conflicts
+          processBar(bar, getSecondsBarsIn);
         }
       }
       refresh();

@@ -206,13 +206,14 @@ export function matchTriggers(opts: {
   bars1m: Bar[]; // visible 1m bars (for the swing-extreme stop + entry estimate)
   fired: ReadonlySet<string>;
   window?: ExecutionWindow; // defaults to 09:30–11:00 ET
-  // Overlap hierarchy (locked 2026-07-30): the full trigger-TF gap pool (any
-  // status). An inversion on TF X is SUPPRESSED when an overlapping,
-  // same-direction, active gap on a SAME-OR-HIGHER trigger TF is in 'filled'
-  // status (tapped, not yet inverted) at the confirmation — the execution
-  // belongs to the highest timeframe of the overlap, so wait for it. Lower
-  // TFs never block (a still-filled 4m can't veto a 5m close, which lands
-  // first by bucket timing).
+  // Filled-gap veto (locked 2026-07-30, tightened same day: NO overlap
+  // required): the full trigger-TF gap pool (any status). An inversion on
+  // TF X is SUPPRESSED when ANY same-direction, active gap on a
+  // SAME-OR-HIGHER trigger TF is in 'filled' status (tapped, not yet
+  // inverted) at the confirmation — the execution belongs to the highest
+  // timeframe still in play, so wait for it. Lower TFs never block (a
+  // still-filled 4m can't veto a 5m close, which lands first by bucket
+  // timing).
   blockers?: FVG[];
 }): CandidateDraft[] {
   const out: CandidateDraft[] = [];
@@ -231,7 +232,6 @@ export function matchTriggers(opts: {
           !(b.tf === trig.tf && b.formedAt === trig.formedAt) && // not the trigger itself
           b.dir === trig.dir &&
           tfSec(b.tf) >= tfSec(trig.tf) && // same-or-higher TF (locked: same TF blocks too)
-          overlaps(b, trig) &&
           b.formedAt <= confirmTs &&
           b.tappedAt !== null &&
           b.tappedAt <= confirmTs && // 'filled' at confirmation (unfilled never blocks)
