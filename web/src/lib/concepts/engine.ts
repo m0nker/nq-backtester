@@ -71,6 +71,13 @@ export interface TapScan {
   armedBar: Bar | null;
   watermark: number;
 }
+// Fully mitigated (locked 2026-07-30): price has traded through the ENTIRE
+// gap (watermark at the far edge). Terminal for condition use — it can never
+// arm or re-arm, even without an inversion. (Triggers are unaffected: a full
+// sweep before the inversion close is the normal IFVG sequence.)
+export function isFullyMitigated(dir: FVGDir, watermark: number, top: number, bottom: number): boolean {
+  return dir === 'bear' ? watermark >= top : watermark <= bottom;
+}
 export function scanForTap(opts: {
   bars: Bar[];
   dir: FVGDir;
@@ -88,15 +95,17 @@ export function scanForTap(opts: {
     if (bar.t < opts.fromTs) continue;
     if (dir === 'bear') {
       // remainder is (w, top); a qualifying print exceeds w while trading
-      // below top (a bar entirely above the gap never printed inside it)
+      // below top (a bar entirely above the gap never printed inside it).
+      // A bar that traverses the FAR edge (bar.h >= top) FULLY MITIGATES the
+      // gap (locked 2026-07-30) — it never arms, not even on its way through.
       const penetrates = w < top && bar.h > w && bar.l < top;
-      if (penetrates && !opts.alreadyArmed && armedBar === null && bar.t >= opts.armFromTs) {
+      if (penetrates && bar.h < top && !opts.alreadyArmed && armedBar === null && bar.t >= opts.armFromTs) {
         armedBar = bar;
       }
       if (bar.h > w && bar.l < top) w = Math.min(bar.h, top);
     } else {
       const penetrates = w > bottom && bar.l < w && bar.h > bottom;
-      if (penetrates && !opts.alreadyArmed && armedBar === null && bar.t >= opts.armFromTs) {
+      if (penetrates && bar.l > bottom && !opts.alreadyArmed && armedBar === null && bar.t >= opts.armFromTs) {
         armedBar = bar;
       }
       if (bar.l < w && bar.h > bottom) w = Math.max(bar.l, bottom);

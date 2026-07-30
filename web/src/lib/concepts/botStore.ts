@@ -16,6 +16,7 @@ import { getBarsInWindow, sources } from '../data/barSource';
 import { updateSessionConfig } from '../data/sessions';
 import { appendEvent, getEvents, getSessionId } from '../events/eventLog';
 import type { SessionEvent } from '../events/types';
+import type { Timeframe } from '../types';
 import { useReplay } from '../replay/clock';
 import { etWallToUtc, tradingDateOf } from '../time/et';
 import { deriveState } from '../trading/engine';
@@ -26,6 +27,7 @@ import {
   DEFAULT_RISK,
   DEFAULT_WINDOW,
   gapKey,
+  isFullyMitigated,
   matchTriggers,
   scanForTap,
   sessionOpenOf,
@@ -70,6 +72,7 @@ export interface BotSettings {
   risk: RiskSettings;
   hopWindows: boolean;
   onePosition: boolean; // don't look for candidates while a trade is on
+  triggerTfs: Timeframe[]; // which IFVG timeframes the trigger scan considers
 }
 const SETTINGS_KEY = 'bot-settings-v1';
 const DEFAULT_SETTINGS: BotSettings = {
@@ -78,6 +81,11 @@ const DEFAULT_SETTINGS: BotSettings = {
   risk: DEFAULT_RISK,
   hopWindows: false,
   onePosition: true,
+  triggerTfs: [...TRIGGER_TFS_ALL],
+};
+const validTriggerTfs = (v: unknown): Timeframe[] => {
+  const list = Array.isArray(v) ? v.filter((tf): tf is Timeframe => TRIGGER_TFS_ALL.includes(tf as Timeframe)) : [];
+  return list.length > 0 ? list : [...TRIGGER_TFS_ALL];
 };
 function loadSettings(): BotSettings {
   if (typeof window === 'undefined') return DEFAULT_SETTINGS;
@@ -91,6 +99,7 @@ function loadSettings(): BotSettings {
       risk: { ...DEFAULT_RISK, ...p.risk },
       hopWindows: p.hopWindows ?? false,
       onePosition: p.onePosition ?? true,
+      triggerTfs: validTriggerTfs(p.triggerTfs),
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -111,6 +120,7 @@ function persistSettings(s: BotSettings) {
       risk: s.risk,
       hopWindows: s.hopWindows,
       onePosition: s.onePosition,
+      triggerTfs: s.triggerTfs,
     });
   }
 }
@@ -121,12 +131,14 @@ const currentSettings = (s: {
   risk: RiskSettings;
   hopWindows: boolean;
   onePosition: boolean;
+  triggerTfs: Timeframe[];
 }): BotSettings => ({
   action: s.action,
   window: s.window,
   risk: s.risk,
   hopWindows: s.hopWindows,
   onePosition: s.onePosition,
+  triggerTfs: s.triggerTfs,
 });
 
 // settings from a resumed session's config row, falling back to local defaults
@@ -142,6 +154,7 @@ function settingsFromConfig(config: Record<string, unknown> | undefined): BotSet
     risk: { ...local.risk, ...(config.risk as Partial<RiskSettings> | undefined) },
     hopWindows: typeof config.hopWindows === 'boolean' ? config.hopWindows : local.hopWindows,
     onePosition: typeof config.onePosition === 'boolean' ? config.onePosition : local.onePosition,
+    triggerTfs: config.triggerTfs !== undefined ? validTriggerTfs(config.triggerTfs) : local.triggerTfs,
   };
 }
 
@@ -160,6 +173,7 @@ interface BotState {
   risk: RiskSettings; // bot position sizing (bot setting)
   hopWindows: boolean; // auto-jump between active windows when idle
   onePosition: boolean; // one trade at a time: dormant until the book is clean
+  triggerTfs: Timeframe[]; // which IFVG timeframes the trigger scan considers
 
   begin: () => void; // settings come from localStorage defaults
   resume: (events: SessionEvent[], upTo: number, config?: Record<string, unknown>) => void;
@@ -169,6 +183,7 @@ interface BotState {
   setRisk: (r: RiskSettings) => void;
   setHopWindows: (v: boolean) => void;
   setOnePosition: (v: boolean) => void;
+  toggleTriggerTf: (tf: Timeframe) => void;
   addBias: (direction: BiasDirection, until: number) => void;
   removeBias: (biasId: string) => void;
   submitDecision: (decision: 'take' | 'marginal' | 'skip', notes: string) => void;
@@ -211,6 +226,8 @@ const rebuildArming = (upTo: number): { armed: Record<string, number>; watermark
       alreadyArmed: g.invertedAt !== null || g.expiredAt !== null, // dead gaps: watermark only
     });
     watermarks[gapKey(g)] = scan.watermark;
+    // fully mitigated (price traded through the whole zone) = never a condition
+    if (isFullyMitigated(g.dir, scan.watermark, g.top, g.bottom)) continue;
     if (scan.armedBar) armed[gapKey(g)] = scan.armedBar.t;
   }
   return { armed, watermarks };
@@ -386,6 +403,7 @@ export const useBot = create<BotState>((set, get) => {
     risk: DEFAULT_RISK,
     hopWindows: false,
     onePosition: true,
+    triggerTfs: [...TRIGGER_TFS_ALL],
 
     begin: () => {
       pendingEntries = [];
@@ -401,6 +419,7 @@ export const useBot = create<BotState>((set, get) => {
         risk: settings.risk,
         hopWindows: settings.hopWindows,
         onePosition: settings.onePosition,
+        triggerTfs: settings.triggerTfs,
         biases: [],
         armed,
         watermarks,
@@ -425,6 +444,7 @@ export const useBot = create<BotState>((set, get) => {
         risk: settings.risk,
         hopWindows: settings.hopWindows,
         onePosition: settings.onePosition,
+        triggerTfs: settings.triggerTfs,
         biases,
         armed,
         watermarks,
@@ -459,6 +479,13 @@ export const useBot = create<BotState>((set, get) => {
     },
     setOnePosition: (v) => {
       set({ onePosition: v });
+      persistSettings(currentSettings(get()));
+    },
+    toggleTriggerTf: (tf) => {
+      const cur = get().triggerTfs;
+      const next = cur.includes(tf) ? cur.filter((t) => t !== tf) : [...cur, tf];
+      if (next.length === 0) return; // at least one trigger TF stays on
+      set({ triggerTfs: next });
       persistSettings(currentSettings(get()));
     },
 
@@ -547,6 +574,9 @@ export const useBot = create<BotState>((set, get) => {
           alreadyArmed: stillArmed || g.invertedAt !== null || g.expiredAt !== null,
         });
         watermarks[key] = scan.watermark;
+        // full mitigation is terminal for condition use: it DISARMS an armed
+        // gap and blocks any future re-arm (locked 2026-07-30)
+        if (isFullyMitigated(g.dir, scan.watermark, g.top, g.bottom)) continue;
         if (stillArmed) armed[key] = prevArm;
         else if (scan.armedBar) armed[key] = scan.armedBar.t;
       }
@@ -571,7 +601,9 @@ export const useBot = create<BotState>((set, get) => {
       if (!(s.onePosition && busy)) {
         const triggers: FVG[] = [];
         const pool: FVG[] = [];
-        for (const tf of TRIGGER_TFS_ALL) {
+        // only the enabled trigger TFs participate — as triggers AND as
+        // overlap blockers (a disabled TF is not considered at all)
+        for (const tf of s.triggerTfs) {
           for (const g of computeFVGs(sources.NQ.getVisibleCandles(to, tf), tf, to, {
             lookbackCandles: TRIGGER_LOOKBACK,
           })) {

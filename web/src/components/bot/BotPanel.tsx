@@ -9,6 +9,7 @@
 import { useState } from 'react';
 import { useBot, type CandidateAction } from '@/lib/concepts/botStore';
 import type { RiskMode } from '@/lib/concepts/engine';
+import { TRIGGER_TFS_ALL } from '@/lib/concepts/fvg';
 import { useReplay } from '@/lib/replay/clock';
 
 const fmtDaySec = (sec: number) =>
@@ -31,6 +32,7 @@ export default function BotPanel() {
   const risk = useBot((s) => s.risk);
   const hopWindows = useBot((s) => s.hopWindows);
   const onePosition = useBot((s) => s.onePosition);
+  const triggerTfs = useBot((s) => s.triggerTfs);
   const biases = useBot((s) => s.biases);
   const armedCount = useBot((s) => s.armedCount);
   const addBias = useBot((s) => s.addBias);
@@ -196,6 +198,26 @@ export default function BotPanel() {
                 />
                 {ACTION_LABELS[a]}
               </label>
+            ))}
+          </div>
+
+          <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
+            IFVG trigger timeframes
+          </div>
+          <div className="mb-3 flex flex-wrap gap-1">
+            {TRIGGER_TFS_ALL.map((tf) => (
+              <button
+                key={tf}
+                className={`rounded border px-1.5 py-0.5 font-mono ${
+                  triggerTfs.includes(tf)
+                    ? 'border-teal-500 bg-teal-900/60 text-teal-200'
+                    : 'border-slate-700 bg-slate-900 text-slate-500 hover:bg-slate-800'
+                }`}
+                title="Toggle this timeframe in the trigger scan (also removes it from the overlap hierarchy)"
+                onClick={() => useBot.getState().toggleTriggerTf(tf)}
+              >
+                {tf}
+              </button>
             ))}
           </div>
 

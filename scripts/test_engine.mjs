@@ -8,7 +8,7 @@ import { writeFileSync } from 'node:fs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const test = `
 import {
-  biasAliveAt, firstInsidePrint, inExecutionWindow, matchTriggers, scanForTap, sessionOpenOf, sizeContracts, updateBiasDeaths,
+  biasAliveAt, firstInsidePrint, inExecutionWindow, isFullyMitigated, matchTriggers, scanForTap, sessionOpenOf, sizeContracts, updateBiasDeaths,
   type BiasEntry,
 } from './src/lib/concepts/engine';
 import type { FVG } from './src/lib/concepts/fvg';
@@ -215,6 +215,34 @@ const wmBase = { dir: 'bear' as const, top: 26000, bottom: 25500, fromTs: w(5, 0
 {
   const scan = scanForTap({ ...wmBase, alreadyArmed: true, bars: [bar(w(9, 40), 25550, 25710, 25500, 25650)] });
   check('already-armed-watermark-only', [scan.armedBar, scan.watermark], [null, 25710]);
+}
+
+// ---- fully mitigated (the user's motivating case, 2026-07-30) ----
+// bullish 1h gap 25800-26000; next candle OHLC 26100/26200/25700/26100 trades
+// through the WHOLE zone -> fully mitigated; the traversing bar never arms.
+{
+  const bull = { dir: 'bull' as const, top: 26000, bottom: 25800, fromTs: w(5, 0), armFromTs: w(9, 30) };
+  const scan = scanForTap({ ...bull, bars: [bar(w(9, 35), 26100, 26200, 25700, 26100)] });
+  check('traverse-bar-never-arms', [scan.armedBar, scan.watermark], [null, 25800]);
+  check('traverse-is-mitigated', isFullyMitigated('bull', scan.watermark, 26000, 25800), true);
+  // a bar landing exactly ON the far edge also mitigates (fill = low <= bottom)
+  const edge = scanForTap({ ...bull, bars: [bar(w(9, 35), 26100, 26200, 25800, 26100)] });
+  check('edge-traverse-no-arm', [edge.armedBar, isFullyMitigated('bull', edge.watermark, 26000, 25800)], [null, true]);
+  // partial tap arms, LATER traverse mitigates — scan reports both; the store drops the arm
+  const seq = scanForTap({ ...bull, bars: [
+    bar(w(9, 35), 26050, 26100, 25900, 26050), // arms (stays inside)
+    bar(w(9, 40), 26050, 26100, 25700, 26000), // traverses -> mitigated
+  ] });
+  check('arm-then-traverse', [seq.armedBar?.t, isFullyMitigated('bull', seq.watermark, 26000, 25800)], [w(9, 35), true]);
+  // partial print still arms normally and is NOT mitigated
+  const part = scanForTap({ ...bull, bars: [bar(w(9, 35), 26050, 26100, 25900, 26050)] });
+  check('partial-still-arms', [part.armedBar?.t, isFullyMitigated('bull', part.watermark, 26000, 25800)], [w(9, 35), false]);
+}
+// bear mirror: gap 25500-25700 (bear fills upward toward top); full up-traverse never arms
+{
+  const bearM = { dir: 'bear' as const, top: 25700, bottom: 25500, fromTs: w(5, 0), armFromTs: w(9, 30) };
+  const scan = scanForTap({ ...bearM, bars: [bar(w(9, 35), 25400, 25800, 25350, 25450)] });
+  check('bear-traverse-never-arms', [scan.armedBar, isFullyMitigated('bear', scan.watermark, 25700, 25500)], [null, true]);
 }
 
 // ---- risk sizing (0.1-contract steps, min 0.1; % uses CURRENT balance) ----

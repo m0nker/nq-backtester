@@ -94,6 +94,16 @@ expires (below):
 | **Filled** | Tapped at least once: some bar traded strictly inside (`bar.low < top AND bar.high > bottom`), at any depth. Depth is tracked as **fill %** — deepest penetration, `(top − minLowSinceFormed) / (top − bottom)` for bullish (mirror for bearish), clamped 0–100% — but even a full wick-through does **NOT** kill the gap (locked: "alive until inverted"). |
 | **Inverted** | A candle **on the FVG's own timeframe** closes **strictly beyond the far edge**: bullish FVG → `close < bottom`; bearish FVG → `close > top`. Terminal state for the original direction. |
 
+**Fully mitigated (locked 2026-07-30):** when price has traded through the **entire** gap —
+the fill watermark reaches the far edge — the gap is *fully mitigated*. Example: bullish 1h gap
+25800–26000; the next candle prints OHLC 26100 / 26200 / **25700** / 26100 → its low traded
+through the whole zone → fully mitigated. A fully mitigated gap **can never arm or re-arm as a
+condition FVG**, even though it is not inverted — and the traversing candle itself does NOT count
+as an arming tap (it spent the gap on its way through). If the gap was armed, full mitigation
+**disarms** it. This refines the earlier "alive until inverted": a mitigated gap stays alive for
+*inversion* purposes (rule-3 triggers routinely sweep fully through before closing through, and
+it still blocks lower-TF triggers in the overlap hierarchy) but is dead as a condition.
+
 **Expiry (locked 2026-07-30):** a gap is only considered for **25 candles of its own timeframe**
 after formation. Age = series positions since candle `C` (the forming partial candle counts as a
 position); the gap is valid while age ≤ 25 and expires when a 26th candle exists. Expiry is
@@ -141,8 +151,10 @@ Price **trades strictly inside** an **active** (never-inverted, not expired) **b
   1. the condition FVG **inverts** (own-TF close through it) — "stop looking when the condition
      FVG is inversed",
   2. the condition FVG **expires** (25 own-TF candles — expiry disarms, locked 2026-07-30),
-  3. the trading day ends (the session-tap rule above — armed never survives to the next day),
-  4. **a trade is taken in its direction** (locked 2026-07-30): a long execution unarms **every**
+  3. the condition FVG becomes **fully mitigated** (price traded through the whole zone — disarms
+     and blocks re-arming forever, locked 2026-07-30),
+  4. the trading day ends (the session-tap rule above — armed never survives to the next day),
+  5. **a trade is taken in its direction** (locked 2026-07-30): a long execution unarms **every**
      bullish armed gap, a short unarms every bearish one — including in-batch and queued
      candidates of that direction. Watermarks are untouched, so any of them can **re-arm** on a
      fresh in-session print beyond its watermark (user-confirmed). A label-only "take" counts as
@@ -158,6 +170,8 @@ the tap** and while the condition FVG is still alive.
 
 - **Trigger scan = all seven TFs, 15s–5m** (upgraded from the 1m-only v1, locked 2026-07-30),
   governed by the **overlap hierarchy** below. (15s/30s participate only where 1s data exists.)
+  Each TF is individually toggleable in the bot settings; a disabled TF is not considered at
+  all — neither as a trigger nor as an overlap blocker. At least one stays enabled.
 - **Overlap hierarchy (locked 2026-07-30):** the execution belongs to the *highest timeframe* of
   an overlapping cluster. An inversion on TF X is **suppressed** when an overlapping (price zones
   intersect), same-direction, active gap on a **same-or-higher** trigger TF is in **filled**
