@@ -111,6 +111,9 @@ clock and simulates each revealed bar.
 between them).
 
 **Fill rules:**
+- Wherever the day has 1-second coverage, each closed minute expands into its **1s bars** and the
+  rules below apply per second (market fills at the next second's open, touches at 1s precision).
+  The minute model below is the fallback for days/chunks without seconds.
 - Market → fills at the **next base bar's open**.
 - Limit → fills when price trades through the level (at `min/max(open, level)`).
 - Stop → fills on touch.

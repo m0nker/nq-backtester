@@ -167,8 +167,9 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
     ...(subOkFocused ? (['15s', '30s'] as Timeframe[]) : []),
     ...availableTimeframes(getBaseResolutionSec()),
   ];
-  const stepChoices: Timeframe[] = [
-    ...(subOkNQ ? (['15s', '30s'] as Timeframe[]) : []),
+  // '1s' is a STEP size only (one raw second bar) — there is no 1s chart TF
+  const stepChoices: StepSize[] = [
+    ...(subOkNQ ? (['1s', '15s', '30s'] as StepSize[]) : []),
     ...availableTimeframes(getBaseResolutionSec()),
   ];
 
@@ -180,7 +181,7 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
         setTimeframe('1m', inst);
       }
     }
-    if (stepSize !== 'view' && isSubMinute(stepSize) && !subOkNQ) setStepSize('view');
+    if (stepSize !== 'view' && (stepSize === '1s' || isSubMinute(stepSize)) && !subOkNQ) setStepSize('view');
   }, [currentTime, timeframes, stepSize, subOkNQ, setTimeframe, setStepSize]);
 
   const btn =

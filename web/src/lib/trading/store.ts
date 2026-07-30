@@ -361,12 +361,13 @@ export const useTrading = create<TradingState>((set, get) => {
       appendEvent('time_advanced', to, { from, to, mode });
       const newBars = getBarsInWindow(from, to);
       let state = deriveState(getEvents());
-      for (const bar of newBars) {
-        if (state.workingOrders.length === 0) continue;
-        // 1s data (when NQ has coverage for this minute) sequences same-bar
-        // SL/TP conflicts; bars here are closed, so the read is clock-safe.
-        const intents = simulateBar(state.workingOrders, bar, getSecondsBarsIn);
-        if (intents.length === 0) continue;
+
+      // Evaluate the working orders against one revealed bar (any duration).
+      // `resolver` only matters for MINUTE bars (same-bar SL/TP sequencing);
+      // 1s bars need no disambiguation below their own duration.
+      const processBar = (bar: (typeof newBars)[number], resolver?: typeof getSecondsBarsIn) => {
+        const intents = simulateBar(state.workingOrders, bar, resolver);
+        if (intents.length === 0) return;
         let changed = false;
         for (const intent of intents) {
           const order = state.workingOrders.find((o) => o.id === intent.orderId);
@@ -392,6 +393,42 @@ export const useTrading = create<TradingState>((set, get) => {
               pnlPts: lastTrade.pnlPts,
               pnlUsd: lastTrade.pnlUsd,
             });
+          }
+        }
+      };
+
+      // Fills run at 1-SECOND resolution wherever the day has 1s coverage:
+      // seconds bars closed in (from, to] are simulated individually (market
+      // fills at the next second's open, touches at 1s precision — a
+      // 15s-timeframe trade fills like one). The closed-minute loop stays the
+      // skeleton so days/chunks without seconds keep the 1m fill model, and a
+      // trailing partial-minute segment covers sub-minute advances (1s
+      // stepping) — clipping to (from, to] also means an order never
+      // evaluates against seconds from before it was placed.
+      let edge = from; // everything closing at/before this is already simulated
+      for (const bar of newBars) {
+        const segFrom = Math.max(edge, bar.t);
+        if (state.workingOrders.length > 0) {
+          const secs = getSecondsBarsIn(segFrom, bar.t + 60);
+          if (secs && secs.length > 0) {
+            for (const sb of secs) {
+              if (state.workingOrders.length === 0) break;
+              processBar(sb);
+            }
+          } else {
+            processBar(bar, getSecondsBarsIn);
+          }
+        }
+        edge = bar.t + 60;
+      }
+      // trailing partial minute: only reachable with 1s data (no minute bar
+      // has closed there yet); without coverage fills simply wait for the close
+      if (state.workingOrders.length > 0 && edge < to) {
+        const secs = getSecondsBarsIn(Math.max(edge, from), to);
+        if (secs) {
+          for (const sb of secs) {
+            if (state.workingOrders.length === 0) break;
+            processBar(sb);
           }
         }
       }

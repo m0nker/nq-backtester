@@ -24,7 +24,10 @@ import type { Timeframe } from '../types';
 // bot entries only at the advance end).
 export const SPEEDS = [1, 2, 5, 10, 20, 50, 100, 200, 500] as const;
 
-export type StepSize = Timeframe | 'view'; // 'view' = follow the NQ chart timeframe
+// 'view' = follow the NQ chart timeframe; '1s' = advance one raw 1-second
+// bar (no 1s chart timeframe exists — this is a step size only, available
+// where the day has 1s coverage; falls back to one 1m bar elsewhere).
+export type StepSize = Timeframe | 'view' | '1s';
 
 interface ReplayState {
   currentTime: number | null;
@@ -72,7 +75,7 @@ export const useReplay = create<ReplayState>((set, get) => {
 
   const prefetch = (ts: number) => void ensureLoadedAround(ts, 0, 2);
 
-  const stepTf = (): Timeframe => {
+  const stepTf = (): Timeframe | '1s' => {
     const { stepSize, timeframes } = get();
     // stepping drives the global clock via NQ (the traded instrument)
     return stepSize === 'view' ? timeframes.NQ : stepSize;
@@ -113,19 +116,28 @@ export const useReplay = create<ReplayState>((set, get) => {
       const { currentTime, endTs } = get();
       if (currentTime === null || (endTs !== null && currentTime >= endTs)) return;
       const tf = stepTf();
+      // '1s' has no bucket — it reveals exactly one base bar of the seconds
+      // dataset (or one 1m bar where coverage is missing). probeTf picks the
+      // right dataset via the existing sub-minute machinery.
+      const probeTf: Timeframe = tf === '1s' ? '15s' : tf;
       // sub-minute steps consume the NQ seconds dataset where it exists
-      let next = sources.NQ.nextHiddenBarFor(currentTime, tf);
+      let next = sources.NQ.nextHiddenBarFor(currentTime, probeTf);
       if (!next && hasDataAfter(currentTime)) {
         set({ loading: true });
         await ensureLoadedAround(currentTime, 0, 3);
         set({ loading: false });
-        next = sources.NQ.nextHiddenBarFor(currentTime, tf);
+        next = sources.NQ.nextHiddenBarFor(currentTime, probeTf);
       }
       if (!next) return; // end of dataset
-      let target = bucketEnd(next.t, tf);
-      // Always make progress: old-era sessions have bars past the nominal
-      // bucket end (17:00-17:59 ET), which would otherwise pin the clock.
-      target = Math.max(target, next.t + sources.NQ.stepDurFor(tf, currentTime));
+      let target: number;
+      if (tf === '1s') {
+        target = next.t + sources.NQ.stepDurFor(probeTf, currentTime);
+      } else {
+        target = bucketEnd(next.t, tf);
+        // Always make progress: old-era sessions have bars past the nominal
+        // bucket end (17:00-17:59 ET), which would otherwise pin the clock.
+        target = Math.max(target, next.t + sources.NQ.stepDurFor(tf, currentTime));
+      }
       if (endTs !== null) target = Math.min(target, endTs);
       set({ currentTime: target });
       prefetch(target);
@@ -136,9 +148,10 @@ export const useReplay = create<ReplayState>((set, get) => {
       const { currentTime } = get();
       if (currentTime === null) return;
       const tf = stepTf();
-      const lastVis = sources.NQ.lastVisibleBarFor(currentTime, tf);
+      const probeTf: Timeframe = tf === '1s' ? '15s' : tf;
+      const lastVis = sources.NQ.lastVisibleBarFor(currentTime, probeTf);
       if (!lastVis) return;
-      set({ currentTime: bucketStart(lastVis.t, tf) });
+      set({ currentTime: tf === '1s' ? lastVis.t : bucketStart(lastVis.t, tf) });
     },
 
     play: () => {

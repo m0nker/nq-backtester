@@ -260,10 +260,16 @@ bucket stepping.
 free-text notes field. The 5–8 anchored attribute sliders from the project brief come later, once
 the workflow has been felt; same form will apply to takes AND skips.
 
-**Execution mechanics:** entry is a market order at the confirmation close (fills next 1m open,
-per the fill model); once the fill price is known the engine places an OCO pair — stop at the
-**absolute** swing-extreme level, limit at **fill + 1R** (1R measured fill→stop). If price gapped
-through the stop before the fill, no legs are placed (flagged for manual handling).
+**Execution mechanics:** entry is a market order at the confirmation close; once the fill price
+is known the engine places an OCO pair — stop at the **absolute** swing-extreme level, limit at
+**fill + 1R** (1R measured fill→stop). If price gapped through the stop before the fill, no legs
+are placed (flagged for manual handling).
+
+**Fill resolution (locked 2026-07-30):** wherever the day has 1-second coverage, fills simulate
+on **1s bars** — a market order fills at the *next second's* open and limit/stop touches resolve
+at 1s precision, so 15s/30s-timeframe trades fill like 15s/30s trades. Days (or unloaded chunks)
+without seconds keep the 1-minute fill model with its 1s same-bar SL/TP sequencing. A **1s step
+size** exists in the replay controls (one raw second bar per step; no 1s chart timeframe).
 
 **Fast-forward fidelity:** detection scans the full range of every clock advance, so no candidate
 is ever *missed* — but entry orders are placed at the advance's **end**. Under 1m autoplay (any
