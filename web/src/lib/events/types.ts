@@ -51,6 +51,27 @@ export interface EventPayloads {
     pnlPts: number;
     pnlUsd: number;
   };
+  // ---- bot-mode (strategy engine) events — see STRATEGY_DEFINITIONS.md ----
+  // A bias entry's DEATH (price touching `until`) is derived from bars in the
+  // engine, like rewind voiding — only set/remove are recorded.
+  bias_set: { biasId: string; direction: 'long' | 'short'; until: number };
+  bias_removed: { biasId: string };
+  candidate_shown: {
+    candidateId: string; // = `${ifvg.tf}:${ifvg.formedAt}:${direction}` (dedupe key)
+    direction: 'long' | 'short';
+    confirmTs: number; // the IFVG inversion close (rule-3 confirmation)
+    condition: { tf: Timeframe; top: number; bottom: number; formedAt: number; armedAt: number };
+    otherConditions: Timeframe[]; // additional armed condition-FVG TFs, if any
+    ifvg: { tf: Timeframe; top: number; bottom: number; formedAt: number };
+    stop: number; // retracement swing low/high (absolute)
+    entryEst: number; // last close at confirmation; real entry = next bar's open
+    biasId: string; // the live bias entry this aligned with
+  };
+  decision_made: {
+    candidateId: string;
+    decision: 'take' | 'marginal' | 'skip' | 'auto'; // 'auto' = bot-takes-everything mode
+    notes?: string;
+  };
 }
 
 export type EventType = keyof EventPayloads;

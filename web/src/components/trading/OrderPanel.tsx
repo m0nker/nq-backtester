@@ -88,7 +88,9 @@ export default function OrderPanel() {
         <label className="text-xs uppercase tracking-wide text-slate-500">Qty</label>
         <input
           type="number"
-          min={1}
+          min={0.1}
+          step={0.1}
+          title="Contracts in 0.1 steps (0.1 NQ ≈ 1 MNQ)"
           value={qty}
           onChange={(e) => setQty(+e.target.value)}
           className="w-16 rounded bg-slate-800 px-2 py-1"

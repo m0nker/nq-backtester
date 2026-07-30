@@ -42,7 +42,7 @@ interface Props {
 // resize: vertical edges move only that side's time, horizontal only price).
 type Handle = 'body' | { tKey?: 't1' | 't2'; pKey?: 'p1' | 'p2' };
 
-function timeToLogical(candles: Bar[], t: number, tfSec: number): number {
+export function timeToLogical(candles: Bar[], t: number, tfSec: number): number {
   const n = candles.length;
   if (n === 0) return 0;
   if (n === 1 || t <= candles[0].t) return (t - candles[0].t) / tfSec;

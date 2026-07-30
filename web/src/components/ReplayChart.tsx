@@ -21,6 +21,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts';
 import DrawingLayer, { type ChartGeo } from '@/components/DrawingLayer';
+import FVGLayer from '@/components/FVGLayer';
 import { isSubMinute, sources, type InstrumentId } from '@/lib/data/barSource';
 import { useReplay } from '@/lib/replay/clock';
 import { fmtPts, fmtUsd, ptsToUsd, roundToTick } from '@/lib/trading/contractMath';
@@ -484,6 +485,15 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
         ref={containerRef}
         className={`h-full w-full ${clickMode !== 'none' ? 'cursor-crosshair' : ''}`}
       />
+      {instrument === 'NQ' && (
+        <FVGLayer
+          instrument={instrument}
+          chartRef={chartRef}
+          seriesRef={candlesRef}
+          geoRef={geoRef}
+          overlayTick={overlayTick}
+        />
+      )}
       <DrawingLayer
         instrument={instrument}
         chartRef={chartRef}

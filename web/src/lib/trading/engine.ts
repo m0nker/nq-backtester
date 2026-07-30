@@ -6,7 +6,7 @@
 // treated as void. Nothing in the log is mutated — replaying the fold always
 // reproduces the same state, and the voided timeline stays auditable.
 
-import { ptsToUsd } from './contractMath';
+import { ptsToUsd, quantizeQty } from './contractMath';
 import type { WorkingOrder } from './fills';
 import type { EventPayloads, SessionEvent, Side } from '../events/types';
 
@@ -146,7 +146,7 @@ export function deriveState(events: SessionEvent[]): EngineState {
             open.ambiguous ||= p.ambiguousBar;
           }
           pos.avgPrice = (pos.avgPrice * Math.abs(pos.qty) + p.price * p.qty) / (Math.abs(pos.qty) + p.qty);
-          pos.qty += signed;
+          pos.qty = quantizeQty(pos.qty + signed);
         } else {
           // reducing / closing / reversing
           const closeQty = Math.min(Math.abs(pos.qty), p.qty);
@@ -159,7 +159,7 @@ export function deriveState(events: SessionEvent[]): EngineState {
             open.exitQty += closeQty;
             open.ambiguous ||= p.ambiguousBar;
           }
-          pos.qty += signed;
+          pos.qty = quantizeQty(pos.qty + signed);
 
           if (Math.sign(pos.qty) !== dir) {
             // flat (or reversed): close the round trip

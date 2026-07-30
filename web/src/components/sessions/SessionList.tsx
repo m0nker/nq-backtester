@@ -48,8 +48,13 @@ export default function SessionList({ sessions, onResume, onChanged }: Props) {
               className={`flex items-center gap-2 rounded border border-slate-800 px-3 py-2 text-sm ${s.status === 'archived' ? 'opacity-50' : ''}`}
             >
               <div className="min-w-0 flex-1">
-                <div className="font-mono text-slate-200">
+                <div className="flex items-center gap-1.5 font-mono text-slate-200">
                   {formatET(new Date(s.start_ts).getTime() / 1000)}
+                  {s.config?.mode === 'bot' && (
+                    <span className="rounded border border-teal-700 bg-teal-950/70 px-1 text-[10px] uppercase text-teal-300">
+                      bot
+                    </span>
+                  )}
                 </div>
                 <div className="text-xs text-slate-500">
                   ${Number(s.starting_balance).toLocaleString()} · created{' '}

@@ -31,6 +31,21 @@ export async function setSessionStatus(id: string, status: 'active' | 'archived'
   if (error) throw new Error(`session update failed: ${error.message}`);
 }
 
+// Merge a patch into the session's config JSONB (bot settings changed
+// mid-session). Best-effort: a failure only means the setting won't survive
+// resume — never blocks the session.
+export async function updateSessionConfig(id: string, patch: Record<string, unknown>): Promise<void> {
+  try {
+    const { data, error } = await supabase.from('sessions').select('config').eq('id', id).single();
+    if (error) throw error;
+    const config = { ...((data?.config as Record<string, unknown>) ?? {}), ...patch };
+    const { error: e2 } = await supabase.from('sessions').update({ config }).eq('id', id);
+    if (e2) throw e2;
+  } catch (e) {
+    console.warn('session config update failed (settings won\'t survive resume):', e);
+  }
+}
+
 export async function loadSessionEvents(sessionId: string): Promise<SessionEvent[]> {
   const out: SessionEvent[] = [];
   const page = 1000;

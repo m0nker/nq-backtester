@@ -2,12 +2,15 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Dashboard from '@/components/dashboard/Dashboard';
+import BotPanel from '@/components/bot/BotPanel';
+import CandidateModal from '@/components/bot/CandidateModal';
 import ReplayChart from '@/components/ReplayChart';
 import ReplayControls from '@/components/ReplayControls';
 import SessionList from '@/components/sessions/SessionList';
 import OrderPanel from '@/components/trading/OrderPanel';
 import PositionBar from '@/components/trading/PositionBar';
 import TradeLog from '@/components/trades/TradeLog';
+import { useBot } from '@/lib/concepts/botStore';
 import { initBarSource } from '@/lib/data/barSource';
 import { listSessions, loadSessionEvents, resumeTimeOf, type SessionRow } from '@/lib/data/sessions';
 import { useReplay } from '@/lib/replay/clock';
@@ -22,6 +25,7 @@ export default function Home() {
   const [time, setTime] = useState('09:25');
   const [endDate, setEndDate] = useState('');
   const [balance, setBalance] = useState(50000);
+  const [botEnabled, setBotEnabled] = useState(false);
   const [rewindMode, setRewindMode] = useState(false);
   const [showTrades, setShowTrades] = useState(false);
   const [showDashboard, setShowDashboard] = useState(false);
@@ -79,7 +83,13 @@ export default function Home() {
       const events = await loadSessionEvents(s.id);
       await trading.resume(s.id, events);
       const startTs = new Date(s.start_ts).getTime() / 1000;
-      await start(resumeTimeOf(events, startTs), s.config?.endTs ?? null);
+      const resumeTs = resumeTimeOf(events, startTs);
+      await start(resumeTs, s.config?.endTs ?? null);
+      if (s.config?.mode === 'bot') {
+        useBot.getState().resume(events, resumeTs, s.config);
+      } else {
+        useBot.getState().deactivate();
+      }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -106,7 +116,7 @@ export default function Home() {
   const dateKnown = availableDates.has(date);
   const endBeforeStart = endDate !== '' && endDate < date;
 
-  const begin = () => {
+  const begin = async () => {
     if (!date || !time || endBeforeStart) return;
     const [y, mo, d] = date.split('-').map(Number);
     const [h, mi] = time.split(':').map(Number);
@@ -116,11 +126,21 @@ export default function Home() {
       endTs = etWallToUtc(ey, emo, ed, 17);
     }
     const startTs = etWallToUtc(y, mo, d, h, mi);
-    void trading.begin({ startTs, endTs, startingBalance: balance });
-    void start(startTs, endTs);
+    // bot settings (action/window/risk/hop) live in the in-session BOT panel;
+    // begin() seeds them from the last-used values and stamps the config
+    await trading.begin({
+      startTs,
+      endTs,
+      startingBalance: balance,
+      config: { mode: botEnabled ? 'bot' : 'manual' },
+    });
+    await start(startTs, endTs);
+    if (botEnabled) useBot.getState().begin();
+    else useBot.getState().deactivate();
   };
 
   const endSession = () => {
+    useBot.getState().deactivate();
     void trading.end();
     reset();
     refreshSessions();
@@ -204,15 +224,27 @@ export default function Home() {
             type="number"
             min={0}
             step={1000}
-            className="mb-5 w-full rounded bg-slate-800 px-3 py-2"
+            className="mb-3 w-full rounded bg-slate-800 px-3 py-2"
             value={balance}
             onChange={(e) => setBalance(+e.target.value)}
           />
 
+          <label
+            className="mb-3 flex cursor-pointer items-center gap-2 text-sm text-slate-300"
+            title="Strategy engine: enter bias, play, get prompted at setup candidates. All bot settings live in the in-session Bot panel."
+          >
+            <input
+              type="checkbox"
+              checked={botEnabled}
+              onChange={(e) => setBotEnabled(e.target.checked)}
+            />
+            Bot <span className="text-xs text-slate-500">(strategy engine — configure in-session)</span>
+          </label>
+
           <button
-            className="w-full rounded bg-amber-500 py-2 font-medium text-slate-950 hover:bg-amber-400 disabled:opacity-40"
+            className="mt-2 w-full rounded bg-amber-500 py-2 font-medium text-slate-950 hover:bg-amber-400 disabled:opacity-40"
             disabled={!manifest || !dateKnown || loading || endBeforeStart || resuming}
-            onClick={begin}
+            onClick={() => void begin()}
           >
             {loading || resuming ? 'Loading data…' : 'Start session'}
           </button>
@@ -280,6 +312,8 @@ export default function Home() {
           </button>
         </div>
       </header>
+
+      <BotPanel />
 
       {dividerDragging && (
         <div className="fixed inset-0 z-[100] cursor-col-resize" style={{ touchAction: 'none' }} />
@@ -352,6 +386,7 @@ export default function Home() {
       {showTrades && <TradeLog onClose={() => setShowTrades(false)} />}
       <PositionBar />
       <ReplayControls rewindMode={rewindMode} setRewindMode={setRewindMode} />
+      <CandidateModal />
     </main>
   );
 }

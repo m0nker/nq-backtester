@@ -17,7 +17,12 @@ import {
 import { bucketEnd, bucketStart } from './aggregate';
 import type { Timeframe } from '../types';
 
-export const SPEEDS = [1, 2, 5, 10, 20] as const; // base bars per second
+// Base bars per second. The top speeds are best-effort: the interval floors
+// at ~4-10ms and heavy handlers (fills + bot engine) just run back-to-back,
+// so 100 means "as fast as this machine can" — advances stay one base bar
+// each, keeping fill timing exact (unlike big-bucket stepping, which places
+// bot entries only at the advance end).
+export const SPEEDS = [1, 2, 5, 10, 20, 50, 100, 200, 500] as const;
 
 export type StepSize = Timeframe | 'view'; // 'view' = follow the NQ chart timeframe
 
@@ -157,9 +162,18 @@ export const useReplay = create<ReplayState>((set, get) => {
           return;
         }
         let target = next.t + getBaseResolutionSec();
+        // speeds past ~100 outrun the browser's timer floor — advance several
+        // bars per tick instead. Caveat: an advance spanning N bars can fill
+        // bot entries up to N bars late (same as bucket stepping).
+        const batch = Math.max(1, Math.round(get().speed / 100));
+        for (let i = 1; i < batch; i++) {
+          const nb = nextHiddenBar(target);
+          if (!nb) break;
+          target = nb.t + getBaseResolutionSec();
+        }
         if (endTs !== null) target = Math.min(target, endTs);
         set({ currentTime: target });
-        prefetch(next.t);
+        prefetch(target);
       };
       playTimer = setInterval(tick, 1000 / get().speed);
     },

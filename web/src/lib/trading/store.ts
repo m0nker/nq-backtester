@@ -10,7 +10,7 @@ import { getBarsInWindow, getSecondsBarsIn, lastVisibleBar } from '../data/barSo
 import { appendEvent, endSession, getEvents, resumeSession, startSession } from '../events/eventLog';
 import type { BracketSpec, OrderType, Side } from '../events/types';
 import { useReplay } from '../replay/clock';
-import { roundToTick } from './contractMath';
+import { quantizeQty, roundQty, roundToTick } from './contractMath';
 import { deriveState, type EngineState } from './engine';
 import { simulateBar, type FillIntent, type WorkingOrder } from './fills';
 
@@ -40,7 +40,12 @@ interface TradingState {
   pendingClick: PendingClick;
   schema: SchemaDraft | null;
 
-  begin: (opts: { startTs: number; endTs: number | null; startingBalance: number }) => Promise<void>;
+  begin: (opts: {
+    startTs: number;
+    endTs: number | null;
+    startingBalance: number;
+    config?: Record<string, unknown>; // session mode etc. — stored in sessions.config
+  }) => Promise<void>;
   resume: (sessionId: string, events: import('../events/types').SessionEvent[]) => Promise<void>;
   end: () => Promise<void>;
   setQty: (n: number) => void;
@@ -122,7 +127,7 @@ export const useTrading = create<TradingState>((set, get) => {
         appendEvent('order_cancelled', barTs, { orderId: intent.orderId, reason: 'reduce_only_noop' });
         return false;
       }
-      qty = Math.min(qty, Math.abs(pre));
+      qty = quantizeQty(Math.min(qty, Math.abs(pre)));
     }
     appendEvent('order_filled', barTs, {
       orderId: intent.orderId,
@@ -143,9 +148,9 @@ export const useTrading = create<TradingState>((set, get) => {
     // closes a position must not spawn legs for a flat book.
     if (order.bracket) {
       const signed = intent.side === 'buy' ? qty : -qty;
-      const post = pre + signed;
+      const post = quantizeQty(pre + signed);
       const reversed = pre !== 0 && post !== 0 && Math.sign(post) !== Math.sign(pre);
-      const increase = reversed ? Math.abs(post) : Math.max(0, Math.abs(post) - Math.abs(pre));
+      const increase = reversed ? Math.abs(post) : quantizeQty(Math.max(0, Math.abs(post) - Math.abs(pre)));
       if (increase > 0) {
         spawnBracket(post > 0 ? 'buy' : 'sell', increase, intent.price, order.bracket, barTs);
       }
@@ -180,7 +185,7 @@ export const useTrading = create<TradingState>((set, get) => {
     schema: null,
 
     begin: async (opts) => {
-      await startSession({ ...opts, config: {} });
+      await startSession({ ...opts, config: opts.config ?? {} });
       nextId = 1;
       set({ active: true, pendingClick: null, schema: null });
       refresh();
@@ -199,7 +204,8 @@ export const useTrading = create<TradingState>((set, get) => {
       refresh();
     },
 
-    setQty: (n) => set({ qty: Math.max(1, Math.floor(n) || 1) }),
+    // contracts trade in 0.1 steps (MNQ simulation), minimum 0.1
+    setQty: (n) => set({ qty: roundQty(n || 0.1) }),
     setBracket: (enabled, slPts, tpPts) =>
       set((s) => ({ bracketEnabled: enabled, slPts: slPts ?? s.slPts, tpPts: tpPts ?? s.tpPts })),
     setPendingClick: (p) => set({ pendingClick: p }),
