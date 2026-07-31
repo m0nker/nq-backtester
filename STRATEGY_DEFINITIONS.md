@@ -153,8 +153,17 @@ Price **trades strictly inside** an **active** (never-inverted, not expired) **b
   2. the condition FVG **expires** (25 own-TF candles — expiry disarms, locked 2026-07-30),
   3. the condition FVG becomes **fully mitigated** (price traded through the whole zone — disarms
      and blocks re-arming forever, locked 2026-07-30),
-  4. the trading day ends (the session-tap rule above — armed never survives to the next day),
-  5. **a trade is taken in its direction** (locked 2026-07-30): a long execution unarms **every**
+  4. **the leg extreme is taken** (locked 2026-07-30, from the user's illustrations): at arming,
+     the setup records its invalidation reference — for a bear condition the **lowest low printed
+     from the gap's candle A through the arming tap** (the low the retrace departed from; mirror:
+     highest high for bull). ANY print strictly beyond it — **a wick counts**, no close needed —
+     disarms: the move the setup was hunting already ran without a trigger. Unlike full
+     mitigation this is NOT terminal: a later fresh in-session beyond-watermark tap **re-arms
+     with a new reference** (arm → low taken → unarm → deeper re-tap → re-arm → new low taken →
+     unarm, per the two-cycle drawing). This kills the far-away-condition failure (a 5m bear gap
+     tapped at 09:56 lending its arm to a 1m trigger 290 points lower at 10:50),
+  5. the trading day ends (the session-tap rule above — armed never survives to the next day),
+  6. **a trade is taken in its direction** (locked 2026-07-30): a long execution unarms **every**
      bullish armed gap, a short unarms every bearish one — including in-batch and queued
      candidates of that direction. Watermarks are untouched, so any of them can **re-arm** on a
      fresh in-session print beyond its watermark (user-confirmed). A label-only "take" counts as

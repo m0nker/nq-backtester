@@ -23,12 +23,14 @@ import { deriveState } from '../trading/engine';
 import { roundToTick } from '../trading/contractMath';
 import { useTrading } from '../trading/store';
 import {
+  armingRef,
   biasAliveAt,
   DEFAULT_RISK,
   DEFAULT_WINDOW,
   gapKey,
   isFullyMitigated,
   matchTriggers,
+  refBreached,
   scanForTap,
   sessionOpenOf,
   sizeContracts,
@@ -162,7 +164,9 @@ interface BotState {
   active: boolean;
   action: CandidateAction;
   biases: BiasEntry[];
-  armed: Record<string, number>; // gapKey -> armedAt (1m bar open time)
+  // gapKey -> armed state: t = arming 1m bar open time; ref = the leg
+  // extreme whose breach ("taking the low") invalidates the arm
+  armed: Record<string, { t: number; ref: number }>;
   watermarks: Record<string, number>; // gapKey -> deepest fill price since formation
   fired: Record<string, number>; // candidateId -> confirmTs (already shown)
   pending: CandidateDraft | null; // prompt currently on screen
@@ -205,30 +209,65 @@ const conditionGapsAt = (upTo: number): FVG[] => {
 };
 
 // Arm from scratch (used at begin/resume/rewind; steps arm incrementally
-// from new bars). Two locked rules apply (2026-07-30):
+// from new bars). Locked rules (2026-07-30):
 // - session-tap: arming needs a bar at/after 09:30 ET of the current trading
 //   day — at 09:29 nothing is armed;
 // - fill-watermark: the arming print must penetrate deeper than the gap's
-//   deepest prior fill (scanned over the gap's WHOLE life, so a premarket
-//   push sets the level an in-session tap must beat).
-const rebuildArming = (upTo: number): { armed: Record<string, number>; watermarks: Record<string, number> } => {
-  const armed: Record<string, number> = {};
+//   deepest prior fill (a premarket push sets the level to beat);
+// - fully mitigated (whole zone traded through) = never a condition;
+// - arming invalidation: taking the leg extreme (the pre-tap low for bear,
+//   high for bull) disarms; a later fresh beyond-watermark tap re-arms with
+//   a NEW reference (the user's two-cycle illustration). The rebuild walks
+//   arm -> breach -> re-arm sequences historically.
+const rebuildArming = (
+  upTo: number,
+): { armed: Record<string, { t: number; ref: number }>; watermarks: Record<string, number> } => {
+  const armed: Record<string, { t: number; ref: number }> = {};
   const watermarks: Record<string, number> = {};
   const sessionOpen = sessionOpenOf(upTo);
   for (const g of conditionGapsAt(upTo)) {
-    const scan = scanForTap({
+    const zone = { dir: g.dir, top: g.top, bottom: g.bottom };
+    // life-wide watermark (also decides full mitigation, which is terminal)
+    const fullWm = scanForTap({
+      ...zone,
       bars: getBarsInWindow(g.formedAt - 60, upTo),
-      dir: g.dir,
-      top: g.top,
-      bottom: g.bottom,
       fromTs: g.formedAt,
       armFromTs: sessionOpen,
-      alreadyArmed: g.invertedAt !== null || g.expiredAt !== null, // dead gaps: watermark only
-    });
-    watermarks[gapKey(g)] = scan.watermark;
-    // fully mitigated (price traded through the whole zone) = never a condition
-    if (isFullyMitigated(g.dir, scan.watermark, g.top, g.bottom)) continue;
-    if (scan.armedBar) armed[gapKey(g)] = scan.armedBar.t;
+      alreadyArmed: true,
+    }).watermark;
+    watermarks[gapKey(g)] = fullWm;
+    if (g.invertedAt !== null || g.expiredAt !== null) continue;
+    if (isFullyMitigated(g.dir, fullWm, g.top, g.bottom)) continue;
+
+    let cursor = g.formedAt;
+    let wm: number | undefined;
+    for (;;) {
+      const scan = scanForTap({
+        ...zone,
+        bars: getBarsInWindow(cursor - 60, upTo),
+        fromTs: cursor,
+        armFromTs: sessionOpen,
+        watermark: wm,
+      });
+      if (!scan.armedBar) break;
+      const t = scan.armedBar.t;
+      const ref = armingRef(getBarsInWindow(g.aT - 60, t + 60), g.dir, g.aT, t);
+      const breachBar = getBarsInWindow(t, upTo).find((b) => b.t > t && refBreached(g.dir, ref, b));
+      if (!breachBar) {
+        armed[gapKey(g)] = { t, ref };
+        break;
+      }
+      // invalidated: resume the hunt after the breach, with the watermark as
+      // of the breach (NOT life-wide — that would self-block the re-tap)
+      cursor = breachBar.t + 60;
+      wm = scanForTap({
+        ...zone,
+        bars: getBarsInWindow(g.formedAt - 60, breachBar.t + 60),
+        fromTs: g.formedAt,
+        armFromTs: sessionOpen,
+        alreadyArmed: true,
+      }).watermark;
+    }
   }
   return { armed, watermarks };
 };
@@ -557,12 +596,12 @@ export const useBot = create<BotState>((set, get) => {
       // prior tap, and a stale gap re-arms only on a fresh qualifying print.
       const sessionOpen = sessionOpenOf(to);
       const condGaps = conditionGapsAt(to);
-      const armed: Record<string, number> = {};
+      const armed: Record<string, { t: number; ref: number }> = {};
       const watermarks: Record<string, number> = {};
       for (const g of condGaps) {
         const key = gapKey(g);
-        const prevArm = s.armed[key];
-        const stillArmed = prevArm !== undefined && prevArm >= sessionOpen;
+        const prev = s.armed[key];
+        const stillArmed = prev !== undefined && prev.t >= sessionOpen;
         const scan = scanForTap({
           bars: newBars,
           dir: g.dir,
@@ -577,13 +616,22 @@ export const useBot = create<BotState>((set, get) => {
         // full mitigation is terminal for condition use: it DISARMS an armed
         // gap and blocks any future re-arm (locked 2026-07-30)
         if (isFullyMitigated(g.dir, scan.watermark, g.top, g.bottom)) continue;
-        if (stillArmed) armed[key] = prevArm;
-        else if (scan.armedBar) armed[key] = scan.armedBar.t;
+        if (stillArmed) {
+          // arming invalidation: ANY print (a wick counts) strictly beyond
+          // the leg extreme the retrace departed from disarms — the move the
+          // setup was hunting already ran without a trigger
+          if (!newBars.some((b) => refBreached(g.dir, prev.ref, b))) armed[key] = prev;
+        } else if (scan.armedBar) {
+          const t = scan.armedBar.t;
+          const ref = armingRef(getBarsInWindow(g.aT - 60, t + 60), g.dir, g.aT, t);
+          // arm unless this same advance already took the reference extreme
+          if (!newBars.some((b) => b.t > t && refBreached(g.dir, ref, b))) armed[key] = { t, ref };
+        }
       }
       const conditions: ArmedCondition[] = [];
       for (const g of condGaps) {
         const at = armed[gapKey(g)];
-        if (at !== undefined) conditions.push({ gap: g, armedAt: at });
+        if (at !== undefined) conditions.push({ gap: g, armedAt: at.t });
       }
 
       // one-position gate (locked 2026-07-30): while a trade is on — open

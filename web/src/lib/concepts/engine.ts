@@ -71,6 +71,26 @@ export interface TapScan {
   armedBar: Bar | null;
   watermark: number;
 }
+// Arming invalidation reference (locked 2026-07-30, from the user's
+// illustration): the leg extreme the retrace departed from — for a bear
+// condition, the LOWEST LOW printed from the gap's candle A through the
+// arming tap (mirror: highest high for bull). Price trading STRICTLY beyond
+// it ("taking the low") invalidates the armed state: the move the setup was
+// meant to catch has already run without a trigger. A later fresh tap
+// re-arms with a new reference.
+export function armingRef(bars: Bar[], dir: FVGDir, fromTs: number, toTs: number): number {
+  let ref = dir === 'bear' ? Infinity : -Infinity;
+  for (const b of bars) {
+    if (b.t < fromTs || b.t > toTs) continue;
+    ref = dir === 'bear' ? Math.min(ref, b.l) : Math.max(ref, b.h);
+  }
+  if (!Number.isFinite(ref)) return dir === 'bear' ? -Infinity : Infinity; // no data: unbreachable
+  return ref;
+}
+export function refBreached(dir: FVGDir, ref: number, bar: Bar): boolean {
+  return dir === 'bear' ? bar.l < ref : bar.h > ref;
+}
+
 // Fully mitigated (locked 2026-07-30): price has traded through the ENTIRE
 // gap (watermark at the far edge). Terminal for condition use — it can never
 // arm or re-arm, even without an inversion. (Triggers are unaffected: a full

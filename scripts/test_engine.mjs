@@ -8,7 +8,7 @@ import { writeFileSync } from 'node:fs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const test = `
 import {
-  biasAliveAt, firstInsidePrint, inExecutionWindow, isFullyMitigated, matchTriggers, scanForTap, sessionOpenOf, sizeContracts, updateBiasDeaths,
+  armingRef, biasAliveAt, firstInsidePrint, inExecutionWindow, isFullyMitigated, matchTriggers, refBreached, scanForTap, sessionOpenOf, sizeContracts, updateBiasDeaths,
   type BiasEntry,
 } from './src/lib/concepts/engine';
 import type { FVG } from './src/lib/concepts/fvg';
@@ -243,6 +243,27 @@ const wmBase = { dir: 'bear' as const, top: 26000, bottom: 25500, fromTs: w(5, 0
   const bearM = { dir: 'bear' as const, top: 25700, bottom: 25500, fromTs: w(5, 0), armFromTs: w(9, 30) };
   const scan = scanForTap({ ...bearM, bars: [bar(w(9, 35), 25400, 25800, 25350, 25450)] });
   check('bear-traverse-never-arms', [scan.armedBar, isFullyMitigated('bear', scan.watermark, 25700, 25500)], [null, true]);
+}
+
+// ---- arming invalidation reference (the user's leg-low illustrations) ----
+{
+  // bear condition: leg falls to 7260.25 (the low), rallies into the gap;
+  // ref = lowest low from candle A through the arming tap
+  const legBars = [
+    bar(w(9, 30), 7350, 7355, 7300, 7305), // candle A area
+    bar(w(9, 35), 7305, 7310, 7260.25, 7270), // THE low
+    bar(w(9, 40), 7270, 7317.25, 7268, 7315), // rally into the gap (the tap)
+  ];
+  check('ref-is-leg-low', armingRef(legBars, 'bear', w(9, 30), w(9, 40)), 7260.25);
+  check('ref-window-respected', armingRef(legBars, 'bear', w(9, 40), w(9, 40)), 7268);
+  // ANY print strictly below — a wick counts; an exact touch does not
+  check('wick-below-breaches', refBreached('bear', 7260.25, bar(w(9, 45), 7270, 7272, 7260, 7271)), true);
+  check('exact-touch-no-breach', refBreached('bear', 7260.25, bar(w(9, 45), 7270, 7272, 7260.25, 7271)), false);
+  // bull mirror: taking the pre-tap HIGH invalidates
+  check('bull-ref-is-leg-high', armingRef(legBars, 'bull', w(9, 30), w(9, 40)), 7355);
+  check('bull-wick-above-breaches', refBreached('bull', 7355, bar(w(9, 45), 7350, 7355.25, 7340, 7350)), true);
+  // empty window -> unbreachable sentinel
+  check('empty-ref-unbreachable', refBreached('bear', armingRef([], 'bear', 0, 0), bar(w(9, 45), 1, 2, 0.5, 1)), false);
 }
 
 // ---- risk sizing (0.1-contract steps, min 0.1; % uses CURRENT balance) ----
