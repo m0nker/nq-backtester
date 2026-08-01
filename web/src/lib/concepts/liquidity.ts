@@ -1,38 +1,68 @@
 // Mechanical draws on liquidity (DOL) — the condition side of the MECH MODEL
 // bot, and a chart overlay concept. Pure module: callers feed bars/candles.
 //
-// Level catalog at any time:
+// Level catalog at any time (9 toggleable categories):
 //  - session H/L pairs from fixed ET windows, most recent COMPLETED window
 //    per kind (may be yesterday's if today's hasn't closed yet):
 //      asia 20:00–24:00 · london 02:00–05:00 · NY AM 09:30–11:00 · NY PM 13:00–16:00
-//  - previous trading day H/L (full 18:00→17:00 day, from 1D candles)
-//  - previous trading week H/L (from 1W candles)
-//  - higher-timeframe swing H/L (5-bar fractals on 1h/4h) that aren't
-//    already the previous day/week H/L
+//  - previous trading day H/L (pd) and previous trading week H/L (pw)
+//  - swing H/L on 1h / 4h / 1D that aren't already one of the above
 // A high is BUYSIDE liquidity, a low is SELLSIDE.
 //
-// Sweep logic (locked 2026-07-31): a print strictly beyond a level SWEEPS it
+// Sweep logic (locked 2026-08-01): a print strictly beyond a level SWEEPS it
 // — sweeping sellside (a low) arms LONGS, sweeping buyside (a high) arms
-// SHORTS. Each level carries a watermark (deepest print beyond it, ever) so
-// a re-arm needs a FRESH extreme beyond every prior raid. The armed state
-// INVALIDATES when price trades farther than `invalidationPts` from the
-// level in EITHER direction: beyond = the raid became a breakout; away = the
-// reversal already ran without a trigger. Invalidation is not terminal — a
-// deeper raid re-arms.
+// SHORTS. A level arms AT MOST ONCE and invalidation is TERMINAL: it can
+// never re-arm. (The leg that swept it can of course become a NEW level once
+// it confirms as a swing — that's a different level with its own identity.)
+// Three ways an armed sweep dies:
+//  - TIMER, per trigger timeframe: the inversion must land within
+//    `maxCandles` candles OF THAT TIMEFRAME after the sweep (6 candles = 90s
+//    on 15s, 6m on 1m, 30m on 5m);
+//  - MINUTE CAP: an absolute ceiling from the sweep that overrides the
+//    per-TF timer wherever it is shorter (20 min cap + 6 candles => 5m gets
+//    4 candles, while 3m is untouched since 6×3 < 20);
+//  - DISTANCE: price trading farther than `invalidationPts` from the level
+//    in either direction — beyond it (the raid became a breakout) or away
+//    from it (the reversal ran without a trigger).
+// The level itself dies once even the SLOWEST enabled trigger TF is out of
+// time; the precise per-TF deadline is enforced at match time.
 
 import { bucketEnd } from '../replay/aggregate';
-import { etOffsetSec, etWallToUtc, tradingDayStartSec } from '../time/et';
+import { etOffsetSec, etWallToUtc } from '../time/et';
 import { TF_SECONDS, isSessionTf, type Bar, type Timeframe } from '../types';
-import type { FVG } from './fvg';
 import {
   inExecutionWindow,
   type BiasDirection,
   type CandidateDraft,
   type ExecutionWindow,
 } from './engine';
+import type { FVG } from './fvg';
 
 export type DOLSide = 'buyside' | 'sellside';
-export type DOLKind = 'asia' | 'london' | 'nyam' | 'nypm' | 'pd' | 'pw' | 'swing';
+export type DOLKind =
+  | 'pd'
+  | 'pw'
+  | 'asia'
+  | 'london'
+  | 'nyam'
+  | 'nypm'
+  | 'swing1h'
+  | 'swing4h'
+  | 'swing1d';
+
+export const DOL_KINDS: readonly { kind: DOLKind; label: string }[] = [
+  { kind: 'pd', label: 'PDH/PDL' },
+  { kind: 'pw', label: 'PWH/PWL' },
+  { kind: 'asia', label: 'Asia' },
+  { kind: 'london', label: 'London' },
+  { kind: 'nyam', label: 'NY AM' },
+  { kind: 'nypm', label: 'NY PM' },
+  { kind: 'swing1h', label: '1h swing' },
+  { kind: 'swing4h', label: '4h swing' },
+  { kind: 'swing1d', label: '1D swing' },
+];
+export const ALL_DOL_KINDS: DOLKind[] = DOL_KINDS.map((k) => k.kind);
+export const isDOLKind = (v: unknown): v is DOLKind => ALL_DOL_KINDS.includes(v as DOLKind);
 
 export interface DOLLevel {
   id: string; // stable identity across recomputes
@@ -41,15 +71,34 @@ export interface DOLLevel {
   price: number;
   formedAt: number; // when the level became knowable (window end / swing confirmation)
   label: string; // 'ASIA H', 'PDL', '1h SWG H', ...
-  swingTf?: Timeframe;
 }
 
 export interface SweepState {
   wm: number; // deepest print beyond the level (== price while unswept)
-  sweptAt: number | null; // 1m bar t of the arming sweep (null = not armed)
+  sweptAt: number | null; // 1m bar t of the arming sweep (null = never armed)
+  deadAt: number | null; // invalidation time; non-null is TERMINAL
+}
+
+// How long an armed sweep stays tradeable, per the two timer rules.
+export interface SweepRules {
+  invalidationPts: number;
+  maxCandles: number; // candles of the trigger TF allowed to produce the inversion
+  maxMinutes: number; // absolute cap from the sweep; overrides the above
+  slowestTriggerSec: number; // largest ENABLED trigger TF, for whole-level death
 }
 
 export const DEFAULT_DOL_INVALIDATION_PTS = 40;
+export const DEFAULT_SWEEP_MAX_CANDLES = 6;
+export const DEFAULT_SWEEP_MAX_MINUTES = 20;
+
+// Seconds a trigger on `tf` has after the sweep (candle rule ∧ minute cap).
+export function triggerWindowSec(rules: SweepRules, tfSec: number): number {
+  return Math.min(rules.maxCandles * tfSec, rules.maxMinutes * 60);
+}
+// Seconds before the LEVEL itself is out of time for every enabled TF.
+export function levelLifespanSec(rules: SweepRules): number {
+  return triggerWindowSec(rules, rules.slowestTriggerSec);
+}
 
 // ET wall-clock session windows [start, end) in seconds-of-day.
 const SESSION_WINDOWS: Record<'asia' | 'london' | 'nyam' | 'nypm', { start: number; end: number; label: string }> = {
@@ -59,9 +108,14 @@ const SESSION_WINDOWS: Record<'asia' | 'london' | 'nyam' | 'nypm', { start: numb
   nypm: { start: 13 * 3600, end: 16 * 3600, label: 'NYPM' },
 };
 
-const SWING_TFS: readonly Timeframe[] = ['1h', '4h'];
+// highest TF first: a level shared by two TFs keeps the higher-TF identity
+const SWING_TFS: readonly { tf: Timeframe; kind: DOLKind }[] = [
+  { tf: '1D', kind: 'swing1d' },
+  { tf: '4h', kind: 'swing4h' },
+  { tf: '1h', kind: 'swing1h' },
+];
 const SWING_LOOKBACK = 60; // candles per TF
-const DEDUPE_EPS = 0.25; // one tick — swing equal to PDH/PWH is that level, not a new one
+const DEDUPE_EPS = 0.25; // one tick — a swing equal to PDH/PWH IS that level
 
 // Callers hand data access in, keeping this module pure and testable.
 export interface LevelDataSource {
@@ -124,7 +178,7 @@ function prevBucketLevels(
   const candles = src.candles(upTo, tf);
   if (candles.length < 2) return [];
   const prev = candles[candles.length - 2];
-  const formedAt = Math.min(bucketEnd(prev.t, tf), upTo);
+  const formedAt = bucketEnd(prev.t, tf); // always <= upTo (a later bucket is open)
   return [
     { id: `${kind}:buyside:${prev.t}`, kind, side: 'buyside', price: prev.h, formedAt, label: `${labelPrefix}H` },
     { id: `${kind}:sellside:${prev.t}`, kind, side: 'sellside', price: prev.l, formedAt, label: `${labelPrefix}L` },
@@ -139,7 +193,7 @@ function swingLevels(src: LevelDataSource, upTo: number, exclude: DOLLevel[]): D
   const isDupe = (price: number) =>
     exclude.some((l) => Math.abs(l.price - price) <= DEDUPE_EPS) ||
     out.some((l) => Math.abs(l.price - price) <= DEDUPE_EPS);
-  for (const tf of SWING_TFS) {
+  for (const { tf, kind } of SWING_TFS) {
     const candles = src.candles(upTo, tf).filter((c) => bucketEnd(c.t, tf) <= upTo);
     const from = Math.max(2, candles.length - SWING_LOOKBACK);
     for (let i = from; i < candles.length - 2; i++) {
@@ -151,13 +205,12 @@ function swingLevels(src: LevelDataSource, upTo: number, exclude: DOLLevel[]): D
         !isDupe(c.h)
       ) {
         out.push({
-          id: `swing:${tf}:buyside:${c.t}`,
-          kind: 'swing',
+          id: `${kind}:buyside:${c.t}`,
+          kind,
           side: 'buyside',
           price: c.h,
           formedAt,
           label: `${tf} SWG H`,
-          swingTf: tf,
         });
       }
       if (
@@ -166,13 +219,12 @@ function swingLevels(src: LevelDataSource, upTo: number, exclude: DOLLevel[]): D
         !isDupe(c.l)
       ) {
         out.push({
-          id: `swing:${tf}:sellside:${c.t}`,
-          kind: 'swing',
+          id: `${kind}:sellside:${c.t}`,
+          kind,
           side: 'sellside',
           price: c.l,
           formedAt,
           label: `${tf} SWG L`,
-          swingTf: tf,
         });
       }
     }
@@ -180,9 +232,19 @@ function swingLevels(src: LevelDataSource, upTo: number, exclude: DOLLevel[]): D
   return out;
 }
 
-// The full DOL catalog at `upTo`. 4h swings are scanned before 1h so a level
-// shared by both TFs keeps the higher-TF identity (dedupe keeps the first).
-export function levelsAt(src: LevelDataSource, upTo: number): DOLLevel[] {
+// The full DOL catalog at `upTo`.
+//
+// CACHED PER REPLAY HOUR (perf — this runs on every clock advance and every
+// overlay render, and each uncached call aggregates the full visible history
+// four times over). Every level's formedAt is a session-window end or an
+// 1h/4h/1D/1W bucket end, and all of those land on whole ET hours — so the
+// catalog is genuinely constant within an hour bucket. `gen` is the data
+// source's generation: new/trimmed chunks change what's visible.
+let levelCache: { hour: number; gen: number; levels: DOLLevel[] } | null = null;
+
+export function levelsAt(src: LevelDataSource, upTo: number, gen = 0): DOLLevel[] {
+  const hour = Math.floor(upTo / 3600);
+  if (levelCache && levelCache.hour === hour && levelCache.gen === gen) return levelCache.levels;
   const out: DOLLevel[] = [
     ...prevBucketLevels(src, upTo, '1W', 'pw', 'PW'),
     ...prevBucketLevels(src, upTo, '1D', 'pd', 'PD'),
@@ -192,46 +254,103 @@ export function levelsAt(src: LevelDataSource, upTo: number): DOLLevel[] {
     ...sessionLevels(src, upTo, 'nypm'),
   ];
   out.push(...swingLevels(src, upTo, out));
+  levelCache = { hour, gen, levels: out };
   return out;
 }
 
-// Fold bars into a level's sweep state. A bar disarms BEFORE it can arm: a
-// print outside the ±invalidationPts band around the level both kills an
-// armed state and disqualifies that bar's own raid (it's already a breakout
-// or the move ran). Watermark advances on every beyond-print regardless.
+// Fold bars into a level's sweep state. A level arms at most once, and
+// invalidation (timer, minute cap, or distance) is terminal — `deadAt`
+// records WHEN so a trigger that confirmed before it still counts.
 export function foldSweep(
   level: DOLLevel,
   state: SweepState,
   bars: Bar[],
-  invalidationPts: number,
+  rules: SweepRules,
+  now: number,
 ): SweepState {
-  let { wm, sweptAt } = state;
+  let { wm, sweptAt, deadAt } = state;
   const buy = level.side === 'buyside';
+  const lifespan = levelLifespanSec(rules);
   for (const bar of bars) {
     if (bar.t < level.formedAt) continue;
-    const withinBand = bar.h <= level.price + invalidationPts && bar.l >= level.price - invalidationPts;
-    const depth = buy ? bar.h : bar.l;
+    const depth = buy ? bar.h : bar.l; // how far this bar raided past the level
     const beyondWm = buy ? depth > wm : depth < wm;
-    if (sweptAt !== null && !withinBand) sweptAt = null;
-    if (sweptAt === null && beyondWm && withinBand) sweptAt = bar.t;
+    // The raid must be a SWEEP, not a breakout: judged on the raid extreme
+    // alone. (Judging the bar's whole range would let a wide reversal candle
+    // — exactly the shape this setup wants — invalidate its own sweep.)
+    const raidIsSweep = Math.abs(depth - level.price) <= rules.invalidationPts;
+    // Straying is measured only on bars AFTER the arming one, so the sweep
+    // candle's own excursion can't kill the state it just created.
+    if (sweptAt !== null && deadAt === null && bar.t > sweptAt) {
+      if (bar.t + 60 > sweptAt + lifespan) deadAt = sweptAt + lifespan; // out of time
+      else if (bar.h > level.price + rules.invalidationPts || bar.l < level.price - rules.invalidationPts) {
+        deadAt = bar.t; // ran away from the level, or blew through it
+      }
+    }
+    // arms only on the FIRST qualifying raid, and never after any death
+    if (sweptAt === null && deadAt === null && beyondWm && raidIsSweep) sweptAt = bar.t;
     if (beyondWm) wm = depth;
   }
-  return { wm, sweptAt };
+  if (sweptAt !== null && deadAt === null && now > sweptAt + lifespan) deadAt = sweptAt + lifespan;
+  return { wm, sweptAt, deadAt };
 }
 
-export const freshSweepState = (level: DOLLevel): SweepState => ({ wm: level.price, sweptAt: null });
+export const freshSweepState = (level: DOLLevel): SweepState => ({
+  wm: level.price,
+  sweptAt: null,
+  deadAt: null,
+});
 
-// Rebuild all sweep states from loaded history (begin/resume/rewind).
+export const isArmed = (s: SweepState): boolean => s.sweptAt !== null && s.deadAt === null;
+
+// Rebuild all sweep states from loaded history (begin/resume/rewind). One
+// bar slice is shared by every level — foldSweep skips pre-formation bars.
 export function rebuildSweeps(
   src: LevelDataSource,
   levels: DOLLevel[],
   upTo: number,
-  invalidationPts: number,
+  rules: SweepRules,
 ): Record<string, SweepState> {
   const out: Record<string, SweepState> = {};
+  if (levels.length === 0) return out;
+  let earliest = Infinity;
+  for (const l of levels) earliest = Math.min(earliest, l.formedAt);
+  const bars = src.barsInWindow(earliest - 60, upTo);
   for (const level of levels) {
-    const bars = src.barsInWindow(level.formedAt - 60, upTo);
-    out[level.id] = foldSweep(level, freshSweepState(level), bars, invalidationPts);
+    out[level.id] = foldSweep(level, freshSweepState(level), bars, rules, upTo);
+  }
+  return out;
+}
+
+// Display-only: which levels price has traded beyond since they formed.
+// ONE pass over the shared bar slice (suffix extremes + a binary search per
+// level) — the per-level scan this replaces cost ~30 slices per render.
+export function sweptSet(levels: DOLLevel[], src: LevelDataSource, upTo: number): Set<string> {
+  const out = new Set<string>();
+  if (levels.length === 0) return out;
+  let earliest = Infinity;
+  for (const l of levels) earliest = Math.min(earliest, l.formedAt);
+  const bars = src.barsInWindow(earliest - 60, upTo);
+  const n = bars.length;
+  if (n === 0) return out;
+  const sufHigh = new Float64Array(n + 1);
+  const sufLow = new Float64Array(n + 1);
+  sufHigh[n] = -Infinity;
+  sufLow[n] = Infinity;
+  for (let i = n - 1; i >= 0; i--) {
+    sufHigh[i] = Math.max(bars[i].h, sufHigh[i + 1]);
+    sufLow[i] = Math.min(bars[i].l, sufLow[i + 1]);
+  }
+  for (const l of levels) {
+    let lo = 0,
+      hi = n;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (bars[mid].t < l.formedAt) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo >= n) continue;
+    if (l.side === 'buyside' ? sufHigh[lo] > l.price : sufLow[lo] < l.price) out.add(l.id);
   }
   return out;
 }
@@ -239,7 +358,11 @@ export function rebuildSweeps(
 export interface ArmedSweep {
   level: DOLLevel;
   sweptAt: number;
+  deadAt: number | null;
 }
+
+// trigger-TF ordering for the veto (session TFs never appear as triggers)
+const tfRank = (tf: Timeframe): number => (isSessionTf(tf) ? 0 : TF_SECONDS[tf]);
 
 // Rule-3 assembly for the mech model: an IFVG inversion confirms against an
 // armed sweep of the ALIGNED side — sweeping sellside (a low) hunts longs,
@@ -249,6 +372,7 @@ export interface ArmedSweep {
 export function matchSweepTriggers(opts: {
   triggers: FVG[];
   sweeps: ArmedSweep[];
+  rules: SweepRules;
   bars1m: Bar[];
   fired: ReadonlySet<string>;
   window?: ExecutionWindow;
@@ -279,8 +403,18 @@ export function matchSweepTriggers(opts: {
       continue;
     }
 
+    // This TF's own deadline: `maxCandles` of ITS candles, capped by the
+    // absolute minute ceiling. A sweep that died earlier still counts for an
+    // inversion that confirmed before the death.
+    const deadlineSec = triggerWindowSec(opts.rules, tfRank(trig.tf));
     const wantSide: DOLSide = direction === 'long' ? 'sellside' : 'buyside';
-    const matched = opts.sweeps.filter((s) => s.level.side === wantSide && s.sweptAt <= confirmTs);
+    const matched = opts.sweeps.filter(
+      (s) =>
+        s.level.side === wantSide &&
+        s.sweptAt <= confirmTs &&
+        confirmTs <= s.sweptAt + deadlineSec &&
+        (s.deadAt === null || confirmTs <= s.deadAt),
+    );
     if (matched.length === 0) continue;
     // primary = the most recent raid — the sweep this reversal is answering
     const primary = matched.reduce((a, b) => (b.sweptAt > a.sweptAt ? b : a));
@@ -315,16 +449,4 @@ export function matchSweepTriggers(opts: {
     });
   }
   return out;
-}
-
-// trigger-TF ordering for the veto (session TFs never appear as triggers)
-const tfRank = (tf: Timeframe): number => (isSessionTf(tf) ? 0 : TF_SECONDS[tf]);
-
-// Overlay helper: has the level been swept since formation (any loaded bar
-// printing beyond it)? Cheap current-day check for display styling only.
-export function sweptForDisplay(level: DOLLevel, src: LevelDataSource, upTo: number): boolean {
-  const from = Math.max(level.formedAt, tradingDayStartSec(upTo));
-  return src
-    .barsInWindow(from - 60, upTo)
-    .some((b) => (level.side === 'buyside' ? b.h > level.price : b.l < level.price));
 }

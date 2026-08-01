@@ -17,12 +17,7 @@ import { timeToLogical, type ChartGeo } from '@/components/DrawingLayer';
 import { sources, type InstrumentId } from '@/lib/data/barSource';
 import { useBot } from '@/lib/concepts/botStore';
 import { computeFVGs, statusOf, type FVG } from '@/lib/concepts/fvg';
-import {
-  levelsAt,
-  sweptForDisplay,
-  type DOLLevel,
-  type LevelDataSource,
-} from '@/lib/concepts/liquidity';
+import { levelsAt, sweptSet, type DOLLevel, type LevelDataSource } from '@/lib/concepts/liquidity';
 import { FVG_TF_CHOICES, useConcepts } from '@/lib/concepts/store';
 import { useReplay } from '@/lib/replay/clock';
 
@@ -36,6 +31,7 @@ interface Props {
 
 const BULL = '#26a69a';
 const BEAR = '#ef5350';
+const OVERLAY_LOOKBACK = 1500; // matches the detector's own default bound
 
 export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, overlayTick }: Props) {
   void overlayTick; // re-render trigger; coordinates read fresh below
@@ -47,6 +43,7 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
   const showLiquidity = useConcepts((s) => s.showLiquidity);
   const panelOpen = useConcepts((s) => s.panelOpen);
   const pendingCandidate = useBot((s) => s.pending);
+  const dolKinds = useBot((s) => s.dolKinds);
 
   // Detection is keyed to the replay clock, not to pan/zoom: overlayTick
   // re-renders only re-map boxes to pixels.
@@ -56,13 +53,19 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
     const src = sources[instrument];
     const out: FVG[] = [];
     for (const tf of enabled) {
-      out.push(...computeFVGs(src.getVisibleCandles(currentTime, tf), tf, currentTime));
+      // windowed: the detector's own default lookback is the real bound, so
+      // folding the whole visible series (250k 1s bars on 15s/30s) is waste
+      out.push(...computeFVGs(src.getRecentCandles(currentTime, tf, OVERLAY_LOOKBACK + 5), tf, currentTime, {
+        lookbackCandles: OVERLAY_LOOKBACK,
+      }));
     }
     return out;
   }, [currentTime, dataVersion, enabled, instrument]);
 
-  // Draw-on-liquidity levels (mech concepts): recomputed on the clock like
-  // gaps; `swept` is display styling only (bot arming state lives elsewhere).
+  // Draw-on-liquidity levels (mech concepts). Only the categories the bot is
+  // set to trade are drawn. levelsAt is cached per replay hour and the swept
+  // flags come from ONE pass over the bars — both matter here because this
+  // recomputes on every clock tick, autoplay included.
   const dolLevels = useMemo<{ level: DOLLevel; swept: boolean }[]>(() => {
     void dataVersion;
     if (currentTime === null || !showLiquidity) return [];
@@ -70,11 +73,12 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
       barsInWindow: (a, b) => sources[instrument].getBarsInWindow(a, b),
       candles: (upTo, tf) => sources[instrument].getVisibleCandles(upTo, tf),
     };
-    return levelsAt(src, currentTime).map((level) => ({
-      level,
-      swept: sweptForDisplay(level, src, currentTime),
-    }));
-  }, [currentTime, dataVersion, showLiquidity, instrument]);
+    const levels = levelsAt(src, currentTime, sources[instrument].generation()).filter((l) =>
+      dolKinds.includes(l.kind),
+    );
+    const swept = sweptSet(levels, src, currentTime);
+    return levels.map((level) => ({ level, swept: swept.has(level.id) }));
+  }, [currentTime, dataVersion, showLiquidity, instrument, dolKinds]);
 
   let paneW = 0,
     paneH = 0;

@@ -10,6 +10,8 @@ import { useState } from 'react';
 import { useBot, type CandidateAction } from '@/lib/concepts/botStore';
 import type { RiskMode } from '@/lib/concepts/engine';
 import { TRIGGER_TFS_ALL } from '@/lib/concepts/fvg';
+import { DOL_KINDS } from '@/lib/concepts/liquidity';
+import { TF_SECONDS, isSessionTf } from '@/lib/types';
 import { useReplay } from '@/lib/replay/clock';
 
 const fmtDaySec = (sec: number) =>
@@ -17,6 +19,13 @@ const fmtDaySec = (sec: number) =>
 const toDaySec = (hhmm: string) => {
   const [h, m] = hhmm.split(':').map(Number);
   return (h || 0) * 3600 + (m || 0) * 60;
+};
+
+// 90 -> "1m30s", 360 -> "6m", 45 -> "45s"
+const fmtDur = (sec: number) => {
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return m === 0 ? `${s}s` : s === 0 ? `${m}m` : `${m}m${s}s`;
 };
 
 const ACTION_LABELS: Record<CandidateAction, string> = {
@@ -29,6 +38,9 @@ export default function BotPanel() {
   const active = useBot((s) => s.active);
   const botId = useBot((s) => s.botId);
   const dolInvalidationPts = useBot((s) => s.dolInvalidationPts);
+  const sweepMaxCandles = useBot((s) => s.sweepMaxCandles);
+  const sweepMaxMinutes = useBot((s) => s.sweepMaxMinutes);
+  const dolKinds = useBot((s) => s.dolKinds);
   const action = useBot((s) => s.action);
   const win = useBot((s) => s.window); // named `win`: don't shadow globalThis.window
   const risk = useBot((s) => s.risk);
@@ -136,7 +148,72 @@ export default function BotPanel() {
           {mech && (
             <>
               <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
-                Draw-on-liquidity invalidation
+                Draws on liquidity — tradeable
+              </div>
+              <div className="mb-3 flex flex-wrap gap-1">
+                {DOL_KINDS.map(({ kind, label }) => (
+                  <button
+                    key={kind}
+                    className={`rounded border px-1.5 py-0.5 ${
+                      dolKinds.includes(kind)
+                        ? 'border-teal-500 bg-teal-900/60 text-teal-200'
+                        : 'border-slate-700 bg-slate-900 text-slate-500 hover:bg-slate-800'
+                    }`}
+                    title="Toggle this category — the bot only sweeps/trades enabled ones, and the chart only draws them"
+                    onClick={() => useBot.getState().toggleDolKind(kind)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
+                Sweep → inversion deadline
+              </div>
+              <div className="mb-1 flex items-center gap-2">
+                <input
+                  type="number"
+                  min={1}
+                  step={1}
+                  className="w-16 rounded bg-slate-800 px-2 py-1 font-mono"
+                  value={sweepMaxCandles}
+                  onChange={(e) => useBot.getState().setSweepMaxCandles(+e.target.value)}
+                />
+                <span className="text-slate-500">candles, max</span>
+                <input
+                  type="number"
+                  min={1}
+                  step={1}
+                  className="w-16 rounded bg-slate-800 px-2 py-1 font-mono"
+                  value={sweepMaxMinutes}
+                  onChange={(e) => useBot.getState().setSweepMaxMinutes(+e.target.value)}
+                />
+                <span className="text-slate-500">min</span>
+              </div>
+              <div className="mb-1 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[10px]">
+                {triggerTfs
+                  .filter((tf) => !isSessionTf(tf))
+                  .sort((a, b) => TF_SECONDS[a] - TF_SECONDS[b])
+                  .map((tf) => {
+                    const raw = sweepMaxCandles * TF_SECONDS[tf];
+                    const capped = raw > sweepMaxMinutes * 60;
+                    return (
+                      <span key={tf} className={capped ? 'text-amber-500/80' : 'text-slate-500'}>
+                        {tf} {fmtDur(Math.min(raw, sweepMaxMinutes * 60))}
+                        {capped ? '*' : ''}
+                      </span>
+                    );
+                  })}
+              </div>
+              <p className="mb-3 text-[11px] leading-snug text-slate-600">
+                After a sweep, the IFVG must invert within that many candles{' '}
+                <em>of the trigger&apos;s own timeframe</em>; the minute ceiling overrides it
+                wherever it lands first (*). Miss the deadline and the level is dead for good —
+                no re-arming, though the leg that swept it can become a new swing level.
+              </p>
+
+              <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
+                Distance invalidation
               </div>
               <div className="mb-1 flex items-center gap-2">
                 <input
@@ -150,7 +227,7 @@ export default function BotPanel() {
                 <span className="text-slate-500">pts from the level</span>
               </div>
               <p className="mb-3 text-[11px] leading-snug text-slate-600">
-                An armed sweep dies once price trades farther than this from the swept level —
+                Also kills an armed sweep when price strays farther than this from the level —
                 beyond it (breakout) or away from it (the reversal ran without a trigger).
                 Direction comes from the sweep: sellside → longs, buyside → shorts (no bias
                 needed).

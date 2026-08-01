@@ -18,7 +18,7 @@ import { getBarsInWindow, lastVisibleBar, sources } from '../data/barSource';
 import { updateSessionConfig } from '../data/sessions';
 import { appendEvent, getEvents, getSessionId } from '../events/eventLog';
 import type { SessionEvent } from '../events/types';
-import type { Timeframe } from '../types';
+import { TF_SECONDS, isSessionTf, type Timeframe } from '../types';
 import { useReplay } from '../replay/clock';
 import { etWallToUtc, tradingDateOf } from '../time/et';
 import { deriveState } from '../trading/engine';
@@ -45,14 +45,22 @@ import {
 } from './engine';
 import { CONDITION_TFS, TRIGGER_TFS_ALL, computeFVGs, type FVG } from './fvg';
 import {
+  ALL_DOL_KINDS,
   DEFAULT_DOL_INVALIDATION_PTS,
+  DEFAULT_SWEEP_MAX_CANDLES,
+  DEFAULT_SWEEP_MAX_MINUTES,
   foldSweep,
   freshSweepState,
+  isArmed,
+  isDOLKind,
   levelsAt,
   matchSweepTriggers,
   rebuildSweeps,
   type ArmedSweep,
+  type DOLKind,
+  type DOLLevel,
   type LevelDataSource,
+  type SweepRules,
   type SweepState,
 } from './liquidity';
 
@@ -61,6 +69,25 @@ const dolSrc: LevelDataSource = {
   barsInWindow: (afterTs, upTo) => getBarsInWindow(afterTs, upTo),
   candles: (upTo, tf) => sources.NQ.getVisibleCandles(upTo, tf),
 };
+
+const tfSecOf = (tf: Timeframe): number => (isSessionTf(tf) ? 0 : TF_SECONDS[tf]);
+
+// The enabled DOL categories at `upTo` (level catalog is cached per hour).
+const dolLevelsFor = (upTo: number, kinds: DOLKind[]): DOLLevel[] =>
+  levelsAt(dolSrc, upTo, sources.NQ.generation()).filter((l) => kinds.includes(l.kind));
+
+const rulesOf = (s: {
+  dolInvalidationPts: number;
+  sweepMaxCandles: number;
+  sweepMaxMinutes: number;
+  triggerTfs: Timeframe[];
+}): SweepRules => ({
+  invalidationPts: s.dolInvalidationPts,
+  maxCandles: s.sweepMaxCandles,
+  maxMinutes: s.sweepMaxMinutes,
+  // whole-level death waits for the slowest enabled trigger TF
+  slowestTriggerSec: s.triggerTfs.reduce((m, tf) => Math.max(m, tfSecOf(tf)), 0),
+});
 
 export type CandidateAction = 'prompt-trade' | 'label-only' | 'auto';
 
@@ -84,7 +111,11 @@ export interface BotSettings {
   hopWindows: boolean;
   onePosition: boolean; // don't look for candidates while a trade is on
   triggerTfs: Timeframe[]; // which IFVG timeframes the trigger scan considers
-  dolInvalidationPts: number; // mech model: armed sweep dies past this distance from the level
+  // ---- mech model ----
+  dolInvalidationPts: number; // armed sweep dies past this distance from the level
+  sweepMaxCandles: number; // candles (of each trigger TF) allowed to invert
+  sweepMaxMinutes: number; // absolute ceiling from the sweep; overrides the above
+  dolKinds: DOLKind[]; // which draw-on-liquidity categories can be traded
 }
 const SETTINGS_KEY = 'bot-settings-v1';
 const DEFAULT_SETTINGS: BotSettings = {
@@ -95,7 +126,16 @@ const DEFAULT_SETTINGS: BotSettings = {
   onePosition: true,
   triggerTfs: [...TRIGGER_TFS_ALL],
   dolInvalidationPts: DEFAULT_DOL_INVALIDATION_PTS,
+  sweepMaxCandles: DEFAULT_SWEEP_MAX_CANDLES,
+  sweepMaxMinutes: DEFAULT_SWEEP_MAX_MINUTES,
+  dolKinds: [...ALL_DOL_KINDS],
 };
+const validDolKinds = (v: unknown): DOLKind[] => {
+  const list = Array.isArray(v) ? v.filter(isDOLKind) : [];
+  return list.length > 0 ? list : [...ALL_DOL_KINDS];
+};
+const posNum = (v: unknown, fallback: number): number =>
+  typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : fallback;
 const validTriggerTfs = (v: unknown): Timeframe[] => {
   const list = Array.isArray(v) ? v.filter((tf): tf is Timeframe => TRIGGER_TFS_ALL.includes(tf as Timeframe)) : [];
   return list.length > 0 ? list : [...TRIGGER_TFS_ALL];
@@ -113,10 +153,10 @@ function loadSettings(): BotSettings {
       hopWindows: p.hopWindows ?? false,
       onePosition: p.onePosition ?? true,
       triggerTfs: validTriggerTfs(p.triggerTfs),
-      dolInvalidationPts:
-        typeof p.dolInvalidationPts === 'number' && p.dolInvalidationPts > 0
-          ? p.dolInvalidationPts
-          : DEFAULT_DOL_INVALIDATION_PTS,
+      dolInvalidationPts: posNum(p.dolInvalidationPts, DEFAULT_DOL_INVALIDATION_PTS),
+      sweepMaxCandles: posNum(p.sweepMaxCandles, DEFAULT_SWEEP_MAX_CANDLES),
+      sweepMaxMinutes: posNum(p.sweepMaxMinutes, DEFAULT_SWEEP_MAX_MINUTES),
+      dolKinds: validDolKinds(p.dolKinds),
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -139,6 +179,9 @@ function persistSettings(s: BotSettings) {
       onePosition: s.onePosition,
       triggerTfs: s.triggerTfs,
       dolInvalidationPts: s.dolInvalidationPts,
+      sweepMaxCandles: s.sweepMaxCandles,
+      sweepMaxMinutes: s.sweepMaxMinutes,
+      dolKinds: s.dolKinds,
     });
   }
 }
@@ -151,6 +194,9 @@ const currentSettings = (s: {
   onePosition: boolean;
   triggerTfs: Timeframe[];
   dolInvalidationPts: number;
+  sweepMaxCandles: number;
+  sweepMaxMinutes: number;
+  dolKinds: DOLKind[];
 }): BotSettings => ({
   action: s.action,
   window: s.window,
@@ -159,6 +205,9 @@ const currentSettings = (s: {
   onePosition: s.onePosition,
   triggerTfs: s.triggerTfs,
   dolInvalidationPts: s.dolInvalidationPts,
+  sweepMaxCandles: s.sweepMaxCandles,
+  sweepMaxMinutes: s.sweepMaxMinutes,
+  dolKinds: s.dolKinds,
 });
 
 // settings from a resumed session's config row, falling back to local defaults
@@ -175,10 +224,10 @@ function settingsFromConfig(config: Record<string, unknown> | undefined): BotSet
     hopWindows: typeof config.hopWindows === 'boolean' ? config.hopWindows : local.hopWindows,
     onePosition: typeof config.onePosition === 'boolean' ? config.onePosition : local.onePosition,
     triggerTfs: config.triggerTfs !== undefined ? validTriggerTfs(config.triggerTfs) : local.triggerTfs,
-    dolInvalidationPts:
-      typeof config.dolInvalidationPts === 'number' && config.dolInvalidationPts > 0
-        ? config.dolInvalidationPts
-        : local.dolInvalidationPts,
+    dolInvalidationPts: posNum(config.dolInvalidationPts, local.dolInvalidationPts),
+    sweepMaxCandles: posNum(config.sweepMaxCandles, local.sweepMaxCandles),
+    sweepMaxMinutes: posNum(config.sweepMaxMinutes, local.sweepMaxMinutes),
+    dolKinds: config.dolKinds !== undefined ? validDolKinds(config.dolKinds) : local.dolKinds,
   };
 }
 
@@ -203,6 +252,9 @@ interface BotState {
   onePosition: boolean; // one trade at a time: dormant until the book is clean
   triggerTfs: Timeframe[]; // which IFVG timeframes the trigger scan considers
   dolInvalidationPts: number; // mech model: sweep invalidation distance
+  sweepMaxCandles: number; // mech model: candles per trigger TF to invert
+  sweepMaxMinutes: number; // mech model: absolute minute ceiling from the sweep
+  dolKinds: DOLKind[]; // mech model: tradeable draw-on-liquidity categories
 
   begin: (botId?: string) => void; // settings come from localStorage defaults
   resume: (events: SessionEvent[], upTo: number, config?: Record<string, unknown>) => void;
@@ -214,6 +266,9 @@ interface BotState {
   setOnePosition: (v: boolean) => void;
   toggleTriggerTf: (tf: Timeframe) => void;
   setDolInvalidationPts: (v: number) => void;
+  setSweepMaxCandles: (v: number) => void;
+  setSweepMaxMinutes: (v: number) => void;
+  toggleDolKind: (k: DOLKind) => void;
   addBias: (direction: BiasDirection, until: number) => void;
   removeBias: (biasId: string) => void;
   submitDecision: (decision: 'take' | 'marginal' | 'skip', notes: string) => void;
@@ -226,7 +281,7 @@ const conditionGapsAt = (upTo: number): FVG[] => {
   const out: FVG[] = [];
   for (const tf of CONDITION_TFS) {
     out.push(
-      ...computeFVGs(sources.NQ.getVisibleCandles(upTo, tf), tf, upTo, {
+      ...computeFVGs(sources.NQ.getRecentCandles(upTo, tf, CONDITION_LOOKBACK + 5), tf, upTo, {
         lookbackCandles: CONDITION_LOOKBACK,
       }),
     );
@@ -361,11 +416,15 @@ export const useBot = create<BotState>((set, get) => {
   // are untouched, so re-arming needs a fresh print beyond the prior extreme.
   const unarmAligned = (direction: BiasDirection) => {
     if (get().botId === 'mech-model') {
+      // the raid has been traded — retire every armed sweep of that side.
+      // Terminal, like any other invalidation: the level is spent, and only
+      // a NEW level (e.g. the swing this leg leaves behind) can arm again.
       const wantSide = direction === 'long' ? 'sellside' : 'buyside';
+      const t = now();
       set((st) => ({
         sweeps: Object.fromEntries(
           Object.entries(st.sweeps).map(([id, sw]) =>
-            id.includes(`:${wantSide}:`) ? [id, { ...sw, sweptAt: null }] : [id, sw],
+            id.includes(`:${wantSide}:`) && isArmed(sw) ? [id, { ...sw, deadAt: t }] : [id, sw],
           ),
         ),
       }));
@@ -406,6 +465,23 @@ export const useBot = create<BotState>((set, get) => {
     unarmAligned(draft.direction);
   };
 
+  // Mech-model rule change: persist it, then re-derive every sweep state
+  // from history under the new rules (arming/death both depend on them).
+  const applyMechSetting = (
+    patch: Partial<Pick<BotState, 'dolInvalidationPts' | 'sweepMaxCandles' | 'sweepMaxMinutes' | 'dolKinds'>>,
+  ) => {
+    for (const v of Object.values(patch)) {
+      if (typeof v === 'number' && (!Number.isFinite(v) || v <= 0)) return;
+    }
+    set(patch);
+    persistSettings(currentSettings(get()));
+    const t = now();
+    const s = get();
+    if (t && s.active && s.botId === 'mech-model') {
+      set({ sweeps: rebuildSweeps(dolSrc, dolLevelsFor(t, s.dolKinds), t, rulesOf(s)) });
+    }
+  };
+
   const promote = (drafts: CandidateDraft[]) => {
     // first draft becomes the on-screen prompt; the rest queue behind it
     const s = get();
@@ -441,6 +517,9 @@ export const useBot = create<BotState>((set, get) => {
     onePosition: true,
     triggerTfs: [...TRIGGER_TFS_ALL],
     dolInvalidationPts: DEFAULT_DOL_INVALIDATION_PTS,
+    sweepMaxCandles: DEFAULT_SWEEP_MAX_CANDLES,
+    sweepMaxMinutes: DEFAULT_SWEEP_MAX_MINUTES,
+    dolKinds: [...ALL_DOL_KINDS],
 
     begin: (botId = 'fvg-strategy') => {
       nextBotId = 1;
@@ -450,7 +529,10 @@ export const useBot = create<BotState>((set, get) => {
       const mech = botId === 'mech-model';
       const { armed, watermarks } =
         !mech && t ? rebuildArming(t) : { armed: {}, watermarks: {} };
-      const sweeps = mech && t ? rebuildSweeps(dolSrc, levelsAt(dolSrc, t), t, settings.dolInvalidationPts) : {};
+      const sweeps =
+        mech && t
+          ? rebuildSweeps(dolSrc, dolLevelsFor(t, settings.dolKinds), t, rulesOf(settings))
+          : {};
       set({
         active: true,
         botId,
@@ -461,6 +543,9 @@ export const useBot = create<BotState>((set, get) => {
         onePosition: settings.onePosition,
         triggerTfs: settings.triggerTfs,
         dolInvalidationPts: settings.dolInvalidationPts,
+        sweepMaxCandles: settings.sweepMaxCandles,
+        sweepMaxMinutes: settings.sweepMaxMinutes,
+        dolKinds: settings.dolKinds,
         biases: [],
         armed,
         watermarks,
@@ -480,7 +565,9 @@ export const useBot = create<BotState>((set, get) => {
       const biases = biasesFromEvents(events);
       updateBiasDeaths(biases, sources.NQ.getVisibleBars(upTo));
       const { armed, watermarks } = mech ? { armed: {}, watermarks: {} } : rebuildArming(upTo);
-      const sweeps = mech ? rebuildSweeps(dolSrc, levelsAt(dolSrc, upTo), upTo, settings.dolInvalidationPts) : {};
+      const sweeps = mech
+        ? rebuildSweeps(dolSrc, dolLevelsFor(upTo, settings.dolKinds), upTo, rulesOf(settings))
+        : {};
       set({
         active: true,
         botId,
@@ -491,6 +578,9 @@ export const useBot = create<BotState>((set, get) => {
         onePosition: settings.onePosition,
         triggerTfs: settings.triggerTfs,
         dolInvalidationPts: settings.dolInvalidationPts,
+        sweepMaxCandles: settings.sweepMaxCandles,
+        sweepMaxMinutes: settings.sweepMaxMinutes,
+        dolKinds: settings.dolKinds,
         biases,
         armed,
         watermarks,
@@ -534,15 +624,17 @@ export const useBot = create<BotState>((set, get) => {
       set({ triggerTfs: next });
       persistSettings(currentSettings(get()));
     },
-    setDolInvalidationPts: (v) => {
-      if (!Number.isFinite(v) || v <= 0) return;
-      set({ dolInvalidationPts: v });
-      persistSettings(currentSettings(get()));
-      // the band changed — re-derive every sweep state under the new width
-      const t = now();
-      if (t && get().botId === 'mech-model') {
-        set({ sweeps: rebuildSweeps(dolSrc, levelsAt(dolSrc, t), t, v) });
-      }
+    // Any rule change re-derives every sweep state from history: the arming
+    // and death decisions all depend on these numbers, so the stored states
+    // would otherwise describe rules that are no longer in force.
+    setDolInvalidationPts: (v) => applyMechSetting({ dolInvalidationPts: v }),
+    setSweepMaxCandles: (v) => applyMechSetting({ sweepMaxCandles: Math.round(v) }),
+    setSweepMaxMinutes: (v) => applyMechSetting({ sweepMaxMinutes: v }),
+    toggleDolKind: (k) => {
+      const cur = get().dolKinds;
+      const next = cur.includes(k) ? cur.filter((x) => x !== k) : [...cur, k];
+      if (next.length === 0) return; // at least one category stays on
+      applyMechSetting({ dolKinds: next });
     },
 
     addBias: (direction, until) => {
@@ -623,18 +715,21 @@ export const useBot = create<BotState>((set, get) => {
       const conditions: ArmedCondition[] = [];
       const armedSweeps: ArmedSweep[] = [];
       if (mech) {
-        for (const level of levelsAt(dolSrc, to)) {
+        const rules = rulesOf(s);
+        for (const level of dolLevelsFor(to, s.dolKinds)) {
           const prev = s.sweeps[level.id];
           const state = prev
-            ? foldSweep(level, prev, newBars, s.dolInvalidationPts)
-            : foldSweep(
-                level,
-                freshSweepState(level),
-                getBarsInWindow(level.formedAt - 60, to),
-                s.dolInvalidationPts,
-              );
+            ? foldSweep(level, prev, newBars, rules, to)
+            : // first sight (session start, day roll, a window just closed):
+              // scan the level's whole life rather than just this advance
+              foldSweep(level, freshSweepState(level), getBarsInWindow(level.formedAt - 60, to), rules, to);
           sweeps[level.id] = state;
-          if (state.sweptAt !== null) armedSweeps.push({ level, sweptAt: state.sweptAt });
+          // A sweep that DIED inside this advance still counts for an
+          // inversion that confirmed before the death, so it goes into the
+          // pool too — matchSweepTriggers does the precise timing.
+          if (state.sweptAt !== null) {
+            armedSweeps.push({ level, sweptAt: state.sweptAt, deadAt: state.deadAt });
+          }
         }
       } else {
         const condGaps = conditionGapsAt(to);
@@ -691,7 +786,7 @@ export const useBot = create<BotState>((set, get) => {
         // only the enabled trigger TFs participate — as triggers AND as
         // overlap blockers (a disabled TF is not considered at all)
         for (const tf of s.triggerTfs) {
-          for (const g of computeFVGs(sources.NQ.getVisibleCandles(to, tf), tf, to, {
+          for (const g of computeFVGs(sources.NQ.getRecentCandles(to, tf, TRIGGER_LOOKBACK + 5), tf, to, {
             lookbackCandles: TRIGGER_LOOKBACK,
           })) {
             pool.push(g);
@@ -707,13 +802,13 @@ export const useBot = create<BotState>((set, get) => {
         };
         drafts = (
           mech
-            ? matchSweepTriggers({ ...common, sweeps: armedSweeps })
+            ? matchSweepTriggers({ ...common, sweeps: armedSweeps, rules: rulesOf(s) })
             : matchTriggers({ ...common, conditions, biases })
         ).sort((a, b) => a.confirmTs - b.confirmTs);
       }
 
       const armedCount = mech
-        ? armedSweeps.length
+        ? Object.values(sweeps).filter(isArmed).length
         : conditions.filter(({ gap }) => gap.invertedAt === null && gap.expiredAt === null).length;
       set({ biases, armed, watermarks, sweeps, armedCount });
 
@@ -794,7 +889,7 @@ export const useBot = create<BotState>((set, get) => {
         .filter((b) => b.setTs <= to)
         .map((b) => ({ ...b, deadAt: b.deadAt !== null && b.deadAt > to ? null : b.deadAt }));
       const { armed, watermarks } = mech ? { armed: {}, watermarks: {} } : rebuildArming(to);
-      const sweeps = mech ? rebuildSweeps(dolSrc, levelsAt(dolSrc, to), to, s.dolInvalidationPts) : {};
+      const sweeps = mech ? rebuildSweeps(dolSrc, dolLevelsFor(to, s.dolKinds), to, rulesOf(s)) : {};
       set({
         biases,
         armed,

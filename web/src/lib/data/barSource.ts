@@ -303,6 +303,30 @@ export class InstrumentSource {
     return out.concat(live.slice(liveFrom));
   }
 
+  // Candles for roughly the last `maxCandles` buckets only.
+  //
+  // The FVG scans are lookback-bounded (60 trigger candles, 40 condition
+  // candles) but getVisibleCandles aggregates the ENTIRE visible series —
+  // for a sub-minute timeframe that is a quarter-million 1s bars re-folded
+  // on every clock advance, which is what made multi-timeframe trigger scans
+  // choppy. Slicing starts at a bucket BOUNDARY so the first candle is never
+  // a partial merge. Hourly-backed timeframes keep the full path: their deep
+  // history comes from a separate series.
+  getRecentCandles(upTo: number, tf: Timeframe, maxCandles: number): Bar[] {
+    if (isSessionTf(tf) || HOURLY_BACKED.has(tf)) return this.getVisibleCandles(upTo, tf);
+    const ds = this.dataFor(tf);
+    const end = this.firstHiddenIndex(ds, upTo);
+    const fromTs = bucketStart(upTo - maxCandles * TF_SECONDS[tf], tf);
+    let lo = 0,
+      hi = end;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (ds.bars[mid].t < fromTs) lo = mid + 1;
+      else hi = mid;
+    }
+    return aggregate(ds.bars.slice(lo, end), tf, ds.durSec);
+  }
+
   getVisibleCandlesIncremental(upTo: number, tf: Timeframe): CandleFrame {
     const ds = this.dataFor(tf);
     const firstHidden = this.firstHiddenIndex(ds, upTo);
