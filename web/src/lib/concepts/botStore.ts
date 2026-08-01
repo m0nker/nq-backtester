@@ -4,15 +4,17 @@
 // replay clock, exactly like the trading store drives fills. Owns: the bias
 // list (bias_set/bias_removed events; deaths DERIVED from bars), condition
 // arming, candidate prompting/queueing, and — depending on the session's
-// candidate action — order placement (market entry, then absolute SL at the
-// swing extreme + 1R TP as an OCO pair once the entry fill is known).
+// candidate action — order placement (market entry carrying an absolute-stop
+// bracket: SL at the swing extreme, TP at 1R from the actual fill; the fill
+// pipeline spawns the OCO legs the moment the entry fills).
 //
 // Subscription order matters: this module imports the trading store, so the
 // trading store's clock subscription registers FIRST and fills are already
 // simulated for an advance by the time onAdvance here reads events.
 
 import { create } from 'zustand';
-import { getBarsInWindow, sources } from '../data/barSource';
+import { botOfConfig } from '../bots/registry';
+import { getBarsInWindow, lastVisibleBar, sources } from '../data/barSource';
 import { updateSessionConfig } from '../data/sessions';
 import { appendEvent, getEvents, getSessionId } from '../events/eventLog';
 import type { SessionEvent } from '../events/types';
@@ -24,7 +26,6 @@ import { roundToTick } from '../trading/contractMath';
 import { useTrading } from '../trading/store';
 import {
   armingRef,
-  biasAliveAt,
   DEFAULT_RISK,
   DEFAULT_WINDOW,
   gapKey,
@@ -43,6 +44,23 @@ import {
   type RiskSettings,
 } from './engine';
 import { CONDITION_TFS, TRIGGER_TFS_ALL, computeFVGs, type FVG } from './fvg';
+import {
+  DEFAULT_DOL_INVALIDATION_PTS,
+  foldSweep,
+  freshSweepState,
+  levelsAt,
+  matchSweepTriggers,
+  rebuildSweeps,
+  type ArmedSweep,
+  type LevelDataSource,
+  type SweepState,
+} from './liquidity';
+
+// Data adapter for the DOL level/sweep computations (NQ is the traded chart).
+const dolSrc: LevelDataSource = {
+  barsInWindow: (afterTs, upTo) => getBarsInWindow(afterTs, upTo),
+  candles: (upTo, tf) => sources.NQ.getVisibleCandles(upTo, tf),
+};
 
 export type CandidateAction = 'prompt-trade' | 'label-only' | 'auto';
 
@@ -52,15 +70,6 @@ const TRIGGER_LOOKBACK = 60;
 let nextBotId = 1;
 const bid = () => `b${nextBotId++}-${Date.now().toString(36)}`;
 
-// entry orders awaiting their fill so the absolute-price OCO legs can go on
-interface PendingEntry {
-  orderId: string;
-  direction: BiasDirection;
-  stop: number;
-  qty: number;
-  placedTs: number;
-}
-let pendingEntries: PendingEntry[] = [];
 let hopBusy = false; // a window-hop jump is in flight
 
 const refreshTrading = () => useTrading.setState({ derived: deriveState(getEvents()) });
@@ -75,6 +84,7 @@ export interface BotSettings {
   hopWindows: boolean;
   onePosition: boolean; // don't look for candidates while a trade is on
   triggerTfs: Timeframe[]; // which IFVG timeframes the trigger scan considers
+  dolInvalidationPts: number; // mech model: armed sweep dies past this distance from the level
 }
 const SETTINGS_KEY = 'bot-settings-v1';
 const DEFAULT_SETTINGS: BotSettings = {
@@ -84,6 +94,7 @@ const DEFAULT_SETTINGS: BotSettings = {
   hopWindows: false,
   onePosition: true,
   triggerTfs: [...TRIGGER_TFS_ALL],
+  dolInvalidationPts: DEFAULT_DOL_INVALIDATION_PTS,
 };
 const validTriggerTfs = (v: unknown): Timeframe[] => {
   const list = Array.isArray(v) ? v.filter((tf): tf is Timeframe => TRIGGER_TFS_ALL.includes(tf as Timeframe)) : [];
@@ -102,6 +113,10 @@ function loadSettings(): BotSettings {
       hopWindows: p.hopWindows ?? false,
       onePosition: p.onePosition ?? true,
       triggerTfs: validTriggerTfs(p.triggerTfs),
+      dolInvalidationPts:
+        typeof p.dolInvalidationPts === 'number' && p.dolInvalidationPts > 0
+          ? p.dolInvalidationPts
+          : DEFAULT_DOL_INVALIDATION_PTS,
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -123,6 +138,7 @@ function persistSettings(s: BotSettings) {
       hopWindows: s.hopWindows,
       onePosition: s.onePosition,
       triggerTfs: s.triggerTfs,
+      dolInvalidationPts: s.dolInvalidationPts,
     });
   }
 }
@@ -134,6 +150,7 @@ const currentSettings = (s: {
   hopWindows: boolean;
   onePosition: boolean;
   triggerTfs: Timeframe[];
+  dolInvalidationPts: number;
 }): BotSettings => ({
   action: s.action,
   window: s.window,
@@ -141,6 +158,7 @@ const currentSettings = (s: {
   hopWindows: s.hopWindows,
   onePosition: s.onePosition,
   triggerTfs: s.triggerTfs,
+  dolInvalidationPts: s.dolInvalidationPts,
 });
 
 // settings from a resumed session's config row, falling back to local defaults
@@ -157,29 +175,36 @@ function settingsFromConfig(config: Record<string, unknown> | undefined): BotSet
     hopWindows: typeof config.hopWindows === 'boolean' ? config.hopWindows : local.hopWindows,
     onePosition: typeof config.onePosition === 'boolean' ? config.onePosition : local.onePosition,
     triggerTfs: config.triggerTfs !== undefined ? validTriggerTfs(config.triggerTfs) : local.triggerTfs,
+    dolInvalidationPts:
+      typeof config.dolInvalidationPts === 'number' && config.dolInvalidationPts > 0
+        ? config.dolInvalidationPts
+        : local.dolInvalidationPts,
   };
 }
 
 interface BotState {
   active: boolean;
+  botId: string; // which bot runs this session ('fvg-strategy' | 'mech-model')
   action: CandidateAction;
   biases: BiasEntry[];
   // gapKey -> armed state: t = arming 1m bar open time; ref = the leg
   // extreme whose breach ("taking the low") invalidates the arm
   armed: Record<string, { t: number; ref: number }>;
   watermarks: Record<string, number>; // gapKey -> deepest fill price since formation
+  sweeps: Record<string, SweepState>; // mech model: DOL levelId -> sweep state
   fired: Record<string, number>; // candidateId -> confirmTs (already shown)
   pending: CandidateDraft | null; // prompt currently on screen
   queue: CandidateDraft[];
   wasPlaying: boolean;
-  armedCount: number; // HUD
+  armedCount: number; // HUD (armed condition FVGs / armed sweeps)
   window: ExecutionWindow; // execution window (bot setting)
   risk: RiskSettings; // bot position sizing (bot setting)
   hopWindows: boolean; // auto-jump between active windows when idle
   onePosition: boolean; // one trade at a time: dormant until the book is clean
   triggerTfs: Timeframe[]; // which IFVG timeframes the trigger scan considers
+  dolInvalidationPts: number; // mech model: sweep invalidation distance
 
-  begin: () => void; // settings come from localStorage defaults
+  begin: (botId?: string) => void; // settings come from localStorage defaults
   resume: (events: SessionEvent[], upTo: number, config?: Record<string, unknown>) => void;
   deactivate: () => void;
   setAction: (a: CandidateAction) => void;
@@ -188,6 +213,7 @@ interface BotState {
   setHopWindows: (v: boolean) => void;
   setOnePosition: (v: boolean) => void;
   toggleTriggerTf: (tf: Timeframe) => void;
+  setDolInvalidationPts: (v: number) => void;
   addBias: (direction: BiasDirection, until: number) => void;
   removeBias: (biasId: string) => void;
   submitDecision: (decision: 'take' | 'marginal' | 'skip', notes: string) => void;
@@ -320,6 +346,7 @@ export const useBot = create<BotState>((set, get) => {
       confirmTs: draft.confirmTs,
       condition: draft.condition,
       otherConditions: draft.otherConditions,
+      dol: draft.dol,
       ifvg: draft.ifvg,
       stop: draft.stop,
       entryEst: draft.entryEst,
@@ -328,11 +355,22 @@ export const useBot = create<BotState>((set, get) => {
     set((s) => ({ fired: { ...s.fired, [draft.candidateId]: draft.confirmTs } }));
   };
 
-  // Taking a trade UNARMS every same-direction armed condition gap (locked
-  // 2026-07-30): a long execution clears all bullish armed states, mirror
-  // for shorts. Watermarks are untouched, so a gap can re-arm — but only on
-  // a fresh in-session print BEYOND its watermark (user-confirmed).
+  // Taking a trade UNARMS every same-direction armed condition (locked
+  // 2026-07-30): a long execution clears all bullish armed FVGs — for the
+  // mech model, all armed SELLSIDE sweeps (mirror for shorts). Watermarks
+  // are untouched, so re-arming needs a fresh print beyond the prior extreme.
   const unarmAligned = (direction: BiasDirection) => {
+    if (get().botId === 'mech-model') {
+      const wantSide = direction === 'long' ? 'sellside' : 'buyside';
+      set((st) => ({
+        sweeps: Object.fromEntries(
+          Object.entries(st.sweeps).map(([id, sw]) =>
+            id.includes(`:${wantSide}:`) ? [id, { ...sw, sweptAt: null }] : [id, sw],
+          ),
+        ),
+      }));
+      return;
+    }
     const wantDir = direction === 'long' ? 'bull' : 'bear';
     const drop = new Set(
       conditionGapsAt(now())
@@ -345,70 +383,27 @@ export const useBot = create<BotState>((set, get) => {
   };
 
   const placeTrade = (draft: CandidateDraft) => {
-    // size per the bot's risk setting; % risk uses CURRENT balance
+    // size per the bot's risk setting; % risk uses CURRENT balance. Sizing
+    // uses the freshest visible price (≈ the next-open fill), not the
+    // candidate's 1m-close estimate — % / $ risk tracks the actual fill.
     const derived = useTrading.getState().derived;
     const balance = derived.startingBalance + derived.realizedUsd;
-    const stopPts = Math.abs(draft.entryEst - draft.stop);
+    const entryRef = lastVisibleBar(now())?.c ?? draft.entryEst;
+    const stopPts = Math.abs(entryRef - draft.stop);
     const qty = sizeContracts(get().risk, stopPts, balance);
-    const orderId = bid();
+    // absolute-stop bracket: the fill pipeline spawns the SL (swing extreme)
+    // + 1R-TP OCO legs at the entry fill itself, so they're live for every
+    // bar after it — the old post-advance leg placement left the stop blind
+    // for a whole advance (the oversized-loss bug).
     appendEvent('order_placed', now(), {
-      orderId,
+      orderId: bid(),
       side: draft.direction === 'long' ? 'buy' : 'sell',
       type: 'market',
       qty,
-    });
-    pendingEntries.push({
-      orderId,
-      direction: draft.direction,
-      stop: roundToTick(draft.stop),
-      qty,
-      placedTs: now(),
+      bracket: { stopPrice: roundToTick(draft.stop), rr: 1 },
     });
     refreshTrading();
     unarmAligned(draft.direction);
-  };
-
-  // Once a tracked entry fill exists, wrap it: SL at the absolute swing
-  // extreme, TP at fill + 1R (locked), OCO pair, reduce-only.
-  const placeLegsForFills = () => {
-    if (pendingEntries.length === 0) return;
-    const events = getEvents();
-    const remaining: PendingEntry[] = [];
-    for (const pe of pendingEntries) {
-      const fill = events.find(
-        (ev) => ev.type === 'order_filled' && (ev.payload as { orderId: string }).orderId === pe.orderId,
-      );
-      if (!fill) {
-        remaining.push(pe);
-        continue;
-      }
-      const price = (fill.payload as { price: number }).price;
-      const dir = pe.direction === 'long' ? 1 : -1;
-      const risk = (price - pe.stop) * dir;
-      if (risk <= 0) continue; // gapped through the stop — leave unprotected? no: flat stop at 1 tick is nonsense; skip legs, user manages
-      const legSide = pe.direction === 'long' ? 'sell' : 'buy';
-      const ocoId = `oco-${bid()}`;
-      appendEvent('order_placed', fill.tsMarket, {
-        orderId: bid(),
-        side: legSide,
-        type: 'stop',
-        qty: pe.qty,
-        stopPrice: pe.stop,
-        ocoId,
-        reduceOnly: true,
-      });
-      appendEvent('order_placed', fill.tsMarket, {
-        orderId: bid(),
-        side: legSide,
-        type: 'limit',
-        qty: pe.qty,
-        limitPrice: roundToTick(price + dir * risk), // 1R
-        ocoId,
-        reduceOnly: true,
-      });
-      refreshTrading();
-    }
-    pendingEntries = remaining;
   };
 
   const promote = (drafts: CandidateDraft[]) => {
@@ -429,10 +424,12 @@ export const useBot = create<BotState>((set, get) => {
 
   return {
     active: false,
+    botId: 'fvg-strategy',
     action: 'prompt-trade',
     biases: [],
     armed: {},
     watermarks: {},
+    sweeps: {},
     fired: {},
     pending: null,
     queue: [],
@@ -443,25 +440,31 @@ export const useBot = create<BotState>((set, get) => {
     hopWindows: false,
     onePosition: true,
     triggerTfs: [...TRIGGER_TFS_ALL],
+    dolInvalidationPts: DEFAULT_DOL_INVALIDATION_PTS,
 
-    begin: () => {
-      pendingEntries = [];
+    begin: (botId = 'fvg-strategy') => {
       nextBotId = 1;
       const settings = loadSettings();
       persistSettings(settings); // stamp this session's config with what it runs
       const t = now();
-      const { armed, watermarks } = t ? rebuildArming(t) : { armed: {}, watermarks: {} };
+      const mech = botId === 'mech-model';
+      const { armed, watermarks } =
+        !mech && t ? rebuildArming(t) : { armed: {}, watermarks: {} };
+      const sweeps = mech && t ? rebuildSweeps(dolSrc, levelsAt(dolSrc, t), t, settings.dolInvalidationPts) : {};
       set({
         active: true,
+        botId,
         action: settings.action,
         window: settings.window,
         risk: settings.risk,
         hopWindows: settings.hopWindows,
         onePosition: settings.onePosition,
         triggerTfs: settings.triggerTfs,
+        dolInvalidationPts: settings.dolInvalidationPts,
         biases: [],
         armed,
         watermarks,
+        sweeps,
         fired: {},
         pending: null,
         queue: [],
@@ -470,23 +473,28 @@ export const useBot = create<BotState>((set, get) => {
     },
 
     resume: (events, upTo, config) => {
-      pendingEntries = [];
       nextBotId = events.length + 1;
       const settings = settingsFromConfig(config);
+      const botId = botOfConfig(config)?.id ?? 'fvg-strategy';
+      const mech = botId === 'mech-model';
       const biases = biasesFromEvents(events);
       updateBiasDeaths(biases, sources.NQ.getVisibleBars(upTo));
-      const { armed, watermarks } = rebuildArming(upTo);
+      const { armed, watermarks } = mech ? { armed: {}, watermarks: {} } : rebuildArming(upTo);
+      const sweeps = mech ? rebuildSweeps(dolSrc, levelsAt(dolSrc, upTo), upTo, settings.dolInvalidationPts) : {};
       set({
         active: true,
+        botId,
         action: settings.action,
         window: settings.window,
         risk: settings.risk,
         hopWindows: settings.hopWindows,
         onePosition: settings.onePosition,
         triggerTfs: settings.triggerTfs,
+        dolInvalidationPts: settings.dolInvalidationPts,
         biases,
         armed,
         watermarks,
+        sweeps,
         fired: firedFromEvents(events),
         pending: null,
         queue: [],
@@ -495,8 +503,7 @@ export const useBot = create<BotState>((set, get) => {
     },
 
     deactivate: () => {
-      pendingEntries = [];
-      set({ active: false, biases: [], armed: {}, watermarks: {}, fired: {}, pending: null, queue: [] });
+      set({ active: false, biases: [], armed: {}, watermarks: {}, sweeps: {}, fired: {}, pending: null, queue: [] });
     },
 
     setAction: (a) => {
@@ -526,6 +533,16 @@ export const useBot = create<BotState>((set, get) => {
       if (next.length === 0) return; // at least one trigger TF stays on
       set({ triggerTfs: next });
       persistSettings(currentSettings(get()));
+    },
+    setDolInvalidationPts: (v) => {
+      if (!Number.isFinite(v) || v <= 0) return;
+      set({ dolInvalidationPts: v });
+      persistSettings(currentSettings(get()));
+      // the band changed — re-derive every sweep state under the new width
+      const t = now();
+      if (t && get().botId === 'mech-model') {
+        set({ sweeps: rebuildSweeps(dolSrc, levelsAt(dolSrc, t), t, v) });
+      }
     },
 
     addBias: (direction, until) => {
@@ -584,63 +601,85 @@ export const useBot = create<BotState>((set, get) => {
       const s = get();
       if (!s.active) return;
       const newBars = getBarsInWindow(from, to);
+      const mech = s.botId === 'mech-model';
 
-      // 1. bias deaths (derived, no events)
+      // 1. bias deaths (derived, no events; FVG model only uses them)
       const biases = s.biases.map((b) => ({ ...b }));
       updateBiasDeaths(biases, newBars);
 
-      // 2. condition gaps + arming (incremental: new bars advance each gap's
-      // fill watermark; arming needs an in-session print BEYOND the
-      // watermark). An armed state is only valid while its tap is in the
+      // 2. condition state, per bot.
+      // FVG strategy: condition gaps + arming (incremental: new bars advance
+      // each gap's fill watermark; arming needs an in-session print BEYOND
+      // the watermark). An armed state is only valid while its tap is in the
       // CURRENT day's session — crossing into a new trading day stales every
       // prior tap, and a stale gap re-arms only on a fresh qualifying print.
+      // Mech model: fold new bars into each DOL level's sweep state (a level
+      // first seen this advance — day roll, window close — scans from its
+      // own formation).
       const sessionOpen = sessionOpenOf(to);
-      const condGaps = conditionGapsAt(to);
       const armed: Record<string, { t: number; ref: number }> = {};
       const watermarks: Record<string, number> = {};
-      for (const g of condGaps) {
-        const key = gapKey(g);
-        const prev = s.armed[key];
-        const stillArmed = prev !== undefined && prev.t >= sessionOpen;
-        const scan = scanForTap({
-          bars: newBars,
-          dir: g.dir,
-          top: g.top,
-          bottom: g.bottom,
-          fromTs: g.formedAt,
-          armFromTs: sessionOpen,
-          watermark: s.watermarks[key],
-          alreadyArmed: stillArmed || g.invertedAt !== null || g.expiredAt !== null,
-        });
-        watermarks[key] = scan.watermark;
-        // full mitigation is terminal for condition use: it DISARMS an armed
-        // gap and blocks any future re-arm (locked 2026-07-30)
-        if (isFullyMitigated(g.dir, scan.watermark, g.top, g.bottom)) continue;
-        if (stillArmed) {
-          // arming invalidation: ANY print (a wick counts) strictly beyond
-          // the leg extreme the retrace departed from disarms — the move the
-          // setup was hunting already ran without a trigger
-          if (!newBars.some((b) => refBreached(g.dir, prev.ref, b))) armed[key] = prev;
-        } else if (scan.armedBar) {
-          const t = scan.armedBar.t;
-          const ref = armingRef(getBarsInWindow(g.aT - 60, t + 60), g.dir, g.aT, t);
-          // arm unless this same advance already took the reference extreme
-          if (!newBars.some((b) => b.t > t && refBreached(g.dir, ref, b))) armed[key] = { t, ref };
-        }
-      }
+      const sweeps: Record<string, SweepState> = {};
       const conditions: ArmedCondition[] = [];
-      for (const g of condGaps) {
-        const at = armed[gapKey(g)];
-        if (at !== undefined) conditions.push({ gap: g, armedAt: at.t });
+      const armedSweeps: ArmedSweep[] = [];
+      if (mech) {
+        for (const level of levelsAt(dolSrc, to)) {
+          const prev = s.sweeps[level.id];
+          const state = prev
+            ? foldSweep(level, prev, newBars, s.dolInvalidationPts)
+            : foldSweep(
+                level,
+                freshSweepState(level),
+                getBarsInWindow(level.formedAt - 60, to),
+                s.dolInvalidationPts,
+              );
+          sweeps[level.id] = state;
+          if (state.sweptAt !== null) armedSweeps.push({ level, sweptAt: state.sweptAt });
+        }
+      } else {
+        const condGaps = conditionGapsAt(to);
+        for (const g of condGaps) {
+          const key = gapKey(g);
+          const prev = s.armed[key];
+          const stillArmed = prev !== undefined && prev.t >= sessionOpen;
+          const scan = scanForTap({
+            bars: newBars,
+            dir: g.dir,
+            top: g.top,
+            bottom: g.bottom,
+            fromTs: g.formedAt,
+            armFromTs: sessionOpen,
+            watermark: s.watermarks[key],
+            alreadyArmed: stillArmed || g.invertedAt !== null || g.expiredAt !== null,
+          });
+          watermarks[key] = scan.watermark;
+          // full mitigation is terminal for condition use: it DISARMS an armed
+          // gap and blocks any future re-arm (locked 2026-07-30)
+          if (isFullyMitigated(g.dir, scan.watermark, g.top, g.bottom)) continue;
+          if (stillArmed) {
+            // arming invalidation: ANY print (a wick counts) strictly beyond
+            // the leg extreme the retrace departed from disarms — the move the
+            // setup was hunting already ran without a trigger
+            if (!newBars.some((b) => refBreached(g.dir, prev.ref, b))) armed[key] = prev;
+          } else if (scan.armedBar) {
+            const t = scan.armedBar.t;
+            const ref = armingRef(getBarsInWindow(g.aT - 60, t + 60), g.dir, g.aT, t);
+            // arm unless this same advance already took the reference extreme
+            if (!newBars.some((b) => b.t > t && refBreached(g.dir, ref, b))) armed[key] = { t, ref };
+          }
+        }
+        for (const g of condGaps) {
+          const at = armed[gapKey(g)];
+          if (at !== undefined) conditions.push({ gap: g, armedAt: at.t });
+        }
       }
 
       // one-position gate (locked 2026-07-30): while a trade is on — open
-      // position, ANY working order, or an entry awaiting its fill — the bot
-      // doesn't look for candidates at all. Also prevents the cancel-out
-      // glitch (opposite entries netting flat and orphaning every leg).
+      // position or ANY working order (an unfilled entry is a working order)
+      // — the bot doesn't look for candidates at all. Also prevents the
+      // cancel-out glitch (opposite entries netting flat, orphaning legs).
       const book = useTrading.getState().derived;
-      const busy =
-        book.position.qty !== 0 || book.workingOrders.length > 0 || pendingEntries.length > 0;
+      const busy = book.position.qty !== 0 || book.workingOrders.length > 0;
 
       // 3. rule-3 triggers across ALL trigger TFs (15s–5m), with the overlap
       // hierarchy: the full pool is passed as blockers so a lower-TF
@@ -659,21 +698,24 @@ export const useBot = create<BotState>((set, get) => {
             if (g.invertedAt !== null && g.invertedAt > from && g.invertedAt <= to) triggers.push(g);
           }
         }
-        drafts = matchTriggers({
+        const common = {
           triggers,
-          conditions,
-          biases,
           bars1m: sources.NQ.getVisibleBars(to),
           fired: new Set(Object.keys(s.fired)),
           window: s.window,
           blockers: pool,
-        }).sort((a, b) => a.confirmTs - b.confirmTs);
+        };
+        drafts = (
+          mech
+            ? matchSweepTriggers({ ...common, sweeps: armedSweeps })
+            : matchTriggers({ ...common, conditions, biases })
+        ).sort((a, b) => a.confirmTs - b.confirmTs);
       }
 
-      const armedCount = conditions.filter(
-        ({ gap }) => gap.invertedAt === null && gap.expiredAt === null,
-      ).length;
-      set({ biases, armed, watermarks, armedCount });
+      const armedCount = mech
+        ? armedSweeps.length
+        : conditions.filter(({ gap }) => gap.invertedAt === null && gap.expiredAt === null).length;
+      set({ biases, armed, watermarks, sweeps, armedCount });
 
       const isJump = to - from > 3600;
       if (drafts.length > 0) {
@@ -701,20 +743,14 @@ export const useBot = create<BotState>((set, get) => {
         }
       }
 
-      // 4. wrap any filled bot entries with their SL/1R-TP legs
-      placeLegsForFills();
-
-      // 5. window hopping (opt-in): outside the active window with nothing
+      // 4. window hopping (opt-in): outside the active window with nothing
       // running -> jump to just before the next window open ("the next
-      // 9:29"). A running trade / working legs / pending fill / open prompt
-      // keeps the clock going instead.
+      // 9:29"). A running trade / working orders / open prompt keeps the
+      // clock going instead.
       if (get().hopWindows && !hopBusy) {
         const t = useTrading.getState().derived;
         const idle =
-          t.position.qty === 0 &&
-          t.workingOrders.length === 0 &&
-          pendingEntries.length === 0 &&
-          get().pending === null;
+          t.position.qty === 0 && t.workingOrders.length === 0 && get().pending === null;
         if (idle) {
           const w = get().window;
           const hhmm = (sec: number) => [Math.floor(sec / 3600), Math.floor((sec % 3600) / 60)] as const;
@@ -753,15 +789,17 @@ export const useBot = create<BotState>((set, get) => {
     onRewind: (_from, to) => {
       const s = get();
       if (!s.active) return;
-      pendingEntries = pendingEntries.filter((pe) => pe.placedTs <= to);
+      const mech = s.botId === 'mech-model';
       const biases = s.biases
         .filter((b) => b.setTs <= to)
         .map((b) => ({ ...b, deadAt: b.deadAt !== null && b.deadAt > to ? null : b.deadAt }));
-      const { armed, watermarks } = rebuildArming(to);
+      const { armed, watermarks } = mech ? { armed: {}, watermarks: {} } : rebuildArming(to);
+      const sweeps = mech ? rebuildSweeps(dolSrc, levelsAt(dolSrc, to), to, s.dolInvalidationPts) : {};
       set({
         biases,
         armed,
         watermarks,
+        sweeps,
         fired: Object.fromEntries(Object.entries(s.fired).filter(([, ts]) => ts <= to)),
         pending: s.pending && s.pending.confirmTs > to ? null : s.pending,
         queue: s.queue.filter((d) => d.confirmTs <= to),

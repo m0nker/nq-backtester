@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import { botOfConfig } from '@/lib/bots/registry';
 import { setSessionStatus, type SessionRow } from '@/lib/data/sessions';
 import { formatET } from '@/lib/time/et';
 
@@ -27,7 +28,7 @@ export default function SessionList({ sessions, onResume, onChanged }: Props) {
   };
 
   return (
-    <div className="w-[26rem] rounded-xl border border-slate-800 bg-[#0d1119] p-6">
+    <div className="w-full rounded-xl border border-slate-800 bg-[#0d1119] p-6">
       <div className="mb-3 flex items-center justify-between">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-400">Sessions</h2>
         <label className="flex items-center gap-1 text-xs text-slate-500">
@@ -39,24 +40,34 @@ export default function SessionList({ sessions, onResume, onChanged }: Props) {
       {!sessions ? (
         <p className="text-sm text-slate-600">Loading…</p>
       ) : !visible || visible.length === 0 ? (
-        <p className="text-sm text-slate-600">No sessions yet — start one on the left.</p>
+        <p className="text-sm text-slate-600">No sessions yet — add one below.</p>
       ) : (
         <div className="flex max-h-96 flex-col gap-2 overflow-y-auto">
-          {visible.map((s) => (
+          {visible.map((s) => {
+            const bot = botOfConfig(s.config);
+            const name = typeof s.config?.name === 'string' ? s.config.name : '';
+            const startLabel = formatET(new Date(s.start_ts).getTime() / 1000);
+            return (
             <div
               key={s.id}
               className={`flex items-center gap-2 rounded border border-slate-800 px-3 py-2 text-sm ${s.status === 'archived' ? 'opacity-50' : ''}`}
             >
               <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-1.5 font-mono text-slate-200">
-                  {formatET(new Date(s.start_ts).getTime() / 1000)}
-                  {s.config?.mode === 'bot' && (
-                    <span className="rounded border border-teal-700 bg-teal-950/70 px-1 text-[10px] uppercase text-teal-300">
-                      bot
+                <div className="flex items-center gap-1.5 text-slate-200">
+                  <span className={`truncate ${name ? '' : 'font-mono'}`}>
+                    {name || startLabel}
+                  </span>
+                  {bot && (
+                    <span
+                      className="shrink-0 rounded border border-teal-700 bg-teal-950/70 px-1 text-[10px] uppercase text-teal-300"
+                      title={bot.description}
+                    >
+                      {bot.name}
                     </span>
                   )}
                 </div>
-                <div className="text-xs text-slate-500">
+                <div className="truncate text-xs text-slate-500">
+                  {name && <span className="font-mono">{startLabel} · </span>}
                   ${Number(s.starting_balance).toLocaleString()} · created{' '}
                   {new Date(s.created_at).toLocaleDateString()}
                   {s.status === 'archived' && ' · archived'}
@@ -78,7 +89,8 @@ export default function SessionList({ sessions, onResume, onChanged }: Props) {
                 {s.status === 'archived' ? 'Unarchive' : 'Archive'}
               </button>
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>

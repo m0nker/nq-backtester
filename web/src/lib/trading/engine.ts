@@ -126,6 +126,21 @@ export function deriveState(events: SessionEvent[]): EngineState {
           if (pos.qty === 0) {
             const dir = p.side === 'buy' ? 1 : -1;
             const bracket = filledOrder?.bracket;
+            // normalize both bracket forms to risk/SL/TP off the actual fill
+            let riskPts: number | undefined;
+            let slPrice: number | undefined;
+            let tpPrice: number | undefined;
+            if (bracket) {
+              if ('stopPrice' in bracket) {
+                riskPts = (p.price - bracket.stopPrice) * dir;
+                slPrice = bracket.stopPrice;
+                tpPrice = riskPts > 0 ? p.price + dir * bracket.rr * riskPts : undefined;
+              } else {
+                riskPts = bracket.stopLossPts;
+                slPrice = p.price - dir * bracket.stopLossPts;
+                tpPrice = p.price + dir * bracket.takeProfitPts;
+              }
+            }
             open = {
               entryTs: ev.tsMarket,
               side: p.side,
@@ -135,9 +150,9 @@ export function deriveState(events: SessionEvent[]): EngineState {
               exitSum: 0,
               exitQty: 0,
               ambiguous: p.ambiguousBar,
-              riskPts: bracket?.stopLossPts,
-              slPrice: bracket ? p.price - dir * bracket.stopLossPts : undefined,
-              tpPrice: bracket ? p.price + dir * bracket.takeProfitPts : undefined,
+              riskPts,
+              slPrice,
+              tpPrice,
             };
           } else if (open) {
             open.entrySum += p.price * p.qty;

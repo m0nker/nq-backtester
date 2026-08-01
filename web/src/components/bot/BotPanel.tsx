@@ -27,6 +27,8 @@ const ACTION_LABELS: Record<CandidateAction, string> = {
 
 export default function BotPanel() {
   const active = useBot((s) => s.active);
+  const botId = useBot((s) => s.botId);
+  const dolInvalidationPts = useBot((s) => s.dolInvalidationPts);
   const action = useBot((s) => s.action);
   const win = useBot((s) => s.window); // named `win`: don't shadow globalThis.window
   const risk = useBot((s) => s.risk);
@@ -46,6 +48,7 @@ export default function BotPanel() {
 
   if (!active) return null;
 
+  const mech = botId === 'mech-model';
   const liveCount = biases.filter((b) => b.deadAt === null).length;
   const add = () => {
     const p = parseFloat(until);
@@ -80,7 +83,7 @@ export default function BotPanel() {
         title="Bot settings — bias, active time, candidate action, risk"
         onClick={() => setOpen(!open)}
       >
-        Bot ▾
+        {mech ? 'Mech ▾' : 'Bot ▾'}
       </button>
       <span className="text-slate-500">
         {action === 'prompt-trade' ? 'prompt & trade' : action === 'label-only' ? 'label only' : 'auto-trade all'}
@@ -90,14 +93,14 @@ export default function BotPanel() {
         {riskSummary}
         {hopWindows ? ' · hop' : ''}
         {' · '}
-        {liveCount ? `${liveCount} bias` : 'no bias — dormant'}
-        {' · '}
-        {armedCount} armed
+        {mech
+          ? `±${dolInvalidationPts} pts · ${armedCount} swept`
+          : (liveCount ? `${liveCount} bias` : 'no bias — dormant') + ` · ${armedCount} armed`}
       </span>
 
       <span className="mx-1 h-4 w-px bg-slate-700" />
 
-      {biases.map((b) => (
+      {!mech && biases.map((b) => (
         <span
           key={b.id}
           className={`flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono ${
@@ -130,6 +133,31 @@ export default function BotPanel() {
 
       {open && (
         <div className="absolute left-2 top-full z-50 mt-1 w-[21rem] rounded-lg border border-slate-700 bg-[#0d1119] p-3 shadow-2xl">
+          {mech && (
+            <>
+              <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
+                Draw-on-liquidity invalidation
+              </div>
+              <div className="mb-1 flex items-center gap-2">
+                <input
+                  type="number"
+                  min={5}
+                  step={5}
+                  className="w-20 rounded bg-slate-800 px-2 py-1 font-mono"
+                  value={dolInvalidationPts}
+                  onChange={(e) => useBot.getState().setDolInvalidationPts(+e.target.value)}
+                />
+                <span className="text-slate-500">pts from the level</span>
+              </div>
+              <p className="mb-3 text-[11px] leading-snug text-slate-600">
+                An armed sweep dies once price trades farther than this from the swept level —
+                beyond it (breakout) or away from it (the reversal ran without a trigger).
+                Direction comes from the sweep: sellside → longs, buyside → shorts (no bias
+                needed).
+              </p>
+            </>
+          )}
+          {!mech && (<>
           <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Bias</div>
           <div className="mb-3 flex items-center gap-1">
             <div className="flex overflow-hidden rounded border border-slate-700">
@@ -164,6 +192,7 @@ export default function BotPanel() {
               Add
             </button>
           </div>
+          </>)}
 
           <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Active time (ET)</div>
           <div className="mb-3 flex items-center gap-2">

@@ -88,8 +88,15 @@ export const useTrading = create<TradingState>((set, get) => {
     return orderId;
   };
 
-  // Spawn OCO bracket legs after an entry fill.
-  const spawnBracket = (entrySide: Side, qty: number, fillPrice: number, bracket: BracketSpec, ts: number) => {
+  // Spawn OCO bracket legs after an entry fill (points form — absolute-stop
+  // brackets are normalized to points at the fill in applyFill).
+  const spawnBracket = (
+    entrySide: Side,
+    qty: number,
+    fillPrice: number,
+    bracket: { stopLossPts: number; takeProfitPts: number },
+    ts: number,
+  ) => {
     const legSide: Side = entrySide === 'buy' ? 'sell' : 'buy';
     const dir = entrySide === 'buy' ? 1 : -1;
     const ocoId = `oco-${oid()}`;
@@ -152,7 +159,31 @@ export const useTrading = create<TradingState>((set, get) => {
       const reversed = pre !== 0 && post !== 0 && Math.sign(post) !== Math.sign(pre);
       const increase = reversed ? Math.abs(post) : quantizeQty(Math.max(0, Math.abs(post) - Math.abs(pre)));
       if (increase > 0) {
-        spawnBracket(post > 0 ? 'buy' : 'sell', increase, intent.price, order.bracket, barTs);
+        const entrySide: Side = post > 0 ? 'buy' : 'sell';
+        const dir = post > 0 ? 1 : -1;
+        const spec = order.bracket;
+        if ('stopPrice' in spec) {
+          const riskPts = (intent.price - spec.stopPrice) * dir;
+          if (riskPts > 0) {
+            spawnBracket(entrySide, increase, intent.price, {
+              stopLossPts: riskPts,
+              takeProfitPts: spec.rr * riskPts,
+            }, barTs);
+          } else {
+            // entry filled at/beyond the stop (gap-through): still protect —
+            // a lone reduce-only stop closes it at the next print
+            appendEvent('order_placed', barTs, {
+              orderId: oid(),
+              side: entrySide === 'buy' ? 'sell' : 'buy',
+              type: 'stop',
+              qty: increase,
+              stopPrice: spec.stopPrice,
+              reduceOnly: true,
+            });
+          }
+        } else {
+          spawnBracket(entrySide, increase, intent.price, spec, barTs);
+        }
       }
     }
     return true;

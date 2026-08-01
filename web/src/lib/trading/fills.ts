@@ -17,7 +17,7 @@
 //  - No partial fills, no commission in v1 (config slot exists).
 
 import type { Bar } from '../types';
-import type { FillKind, Side } from '../events/types';
+import type { BracketSpec, FillKind, Side } from '../events/types';
 
 export interface WorkingOrder {
   id: string;
@@ -28,7 +28,7 @@ export interface WorkingOrder {
   stopPrice?: number;
   ocoId?: string;
   reduceOnly?: boolean;
-  bracket?: { stopLossPts: number; takeProfitPts: number };
+  bracket?: BracketSpec;
 }
 
 export interface FillIntent {

@@ -17,6 +17,12 @@ import { timeToLogical, type ChartGeo } from '@/components/DrawingLayer';
 import { sources, type InstrumentId } from '@/lib/data/barSource';
 import { useBot } from '@/lib/concepts/botStore';
 import { computeFVGs, statusOf, type FVG } from '@/lib/concepts/fvg';
+import {
+  levelsAt,
+  sweptForDisplay,
+  type DOLLevel,
+  type LevelDataSource,
+} from '@/lib/concepts/liquidity';
 import { FVG_TF_CHOICES, useConcepts } from '@/lib/concepts/store';
 import { useReplay } from '@/lib/replay/clock';
 
@@ -38,6 +44,7 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
   const enabled = useConcepts((s) => s.enabled);
   const showInverted = useConcepts((s) => s.showInverted);
   const showCE = useConcepts((s) => s.showCE);
+  const showLiquidity = useConcepts((s) => s.showLiquidity);
   const panelOpen = useConcepts((s) => s.panelOpen);
   const pendingCandidate = useBot((s) => s.pending);
 
@@ -53,6 +60,21 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
     }
     return out;
   }, [currentTime, dataVersion, enabled, instrument]);
+
+  // Draw-on-liquidity levels (mech concepts): recomputed on the clock like
+  // gaps; `swept` is display styling only (bot arming state lives elsewhere).
+  const dolLevels = useMemo<{ level: DOLLevel; swept: boolean }[]>(() => {
+    void dataVersion;
+    if (currentTime === null || !showLiquidity) return [];
+    const src: LevelDataSource = {
+      barsInWindow: (a, b) => sources[instrument].getBarsInWindow(a, b),
+      candles: (upTo, tf) => sources[instrument].getVisibleCandles(upTo, tf),
+    };
+    return levelsAt(src, currentTime).map((level) => ({
+      level,
+      swept: sweptForDisplay(level, src, currentTime),
+    }));
+  }, [currentTime, dataVersion, showLiquidity, instrument]);
 
   let paneW = 0,
     paneH = 0;
@@ -151,12 +173,76 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
       );
     }
 
+    // Draw-on-liquidity level lines: from level formation to now. Unswept
+    // levels are solid (resting liquidity); swept ones dashed and dimmer.
+    for (let i = 0; i < dolLevels.length; i++) {
+      const { level, swept } = dolLevels[i];
+      const yC = series.priceToCoordinate(level.price);
+      if (yC === null) continue;
+      const y = yC as number;
+      if (y < -2 || y > paneH + 2) continue;
+      const xL = Math.max(toX(level.formedAt) ?? 0, 0);
+      if (xL > paneW) continue;
+      const color = level.side === 'buyside' ? BEAR : BULL;
+      boxes.push(
+        <g key={`dol-${level.id}`}>
+          <line
+            x1={xL}
+            y1={y}
+            x2={paneW}
+            y2={y}
+            stroke={color}
+            strokeOpacity={swept ? 0.3 : 0.65}
+            strokeWidth={1}
+            strokeDasharray={swept ? '4 4' : undefined}
+          />
+          <text
+            x={paneW - 4}
+            y={y - 3}
+            textAnchor="end"
+            fill={color}
+            fillOpacity={swept ? 0.45 : 0.8}
+            fontSize={9}
+            fontFamily="monospace"
+          >
+            {level.label}
+            {swept ? ' ⨯' : ''}
+          </text>
+        </g>,
+      );
+    }
+
     // Pending-candidate highlight: while the prompt is up, the exact
-    // condition FVG (amber) and trigger IFVG (sky) get loud outlines —
-    // rendered regardless of which indicator TFs are toggled on.
+    // condition (FVG zone — amber — or swept DOL level line) and trigger
+    // IFVG (sky) get loud outlines — regardless of indicator toggles.
     if (pendingCandidate) {
+      if (pendingCandidate.dol) {
+        const d = pendingCandidate.dol;
+        const yC = series.priceToCoordinate(d.price);
+        if (yC !== null) {
+          const y = yC as number;
+          boxes.push(
+            <g key="cand-dol">
+              <line x1={0} y1={y} x2={paneW} y2={y} stroke="#f5b942" strokeOpacity={0.95} strokeWidth={2} />
+              <text
+                x={paneW - 4}
+                y={Math.max(y - 6, 10)}
+                textAnchor="end"
+                fill="#f5b942"
+                fontSize={10}
+                fontWeight={700}
+                fontFamily="monospace"
+              >
+                DOL {d.label} swept
+              </text>
+            </g>,
+          );
+        }
+      }
       const marks = [
-        { z: pendingCandidate.condition, color: '#f5b942', label: `COND ${pendingCandidate.condition.tf}` },
+        ...(pendingCandidate.condition
+          ? [{ z: pendingCandidate.condition, color: '#f5b942', label: `COND ${pendingCandidate.condition.tf}` }]
+          : []),
         { z: pendingCandidate.ifvg, color: '#38bdf8', label: `IFVG ${pendingCandidate.ifvg.tf}` },
       ];
       for (const m of marks) {
@@ -219,6 +305,17 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
           onClick={() => useConcepts.getState().setPanelOpen(!panelOpen)}
         >
           FVG{enabled.length > 0 ? ` ${enabled.length}` : ''}
+        </button>
+        <button
+          className={`flex h-7 items-center justify-center rounded border px-1.5 font-mono text-[11px] ${
+            showLiquidity
+              ? 'border-teal-500 bg-teal-950/80 text-teal-300'
+              : 'border-slate-700 bg-slate-900/90 text-slate-400 hover:bg-slate-800'
+          }`}
+          title="Draws on liquidity — session H/L (Asia 20–24, London 2–5, NY AM 9:30–11, NY PM 13–16 ET), previous day/week H/L, HTF swings. Solid = resting, dashed ⨯ = swept."
+          onClick={() => useConcepts.getState().setShowLiquidity(!showLiquidity)}
+        >
+          LIQ
         </button>
         {panelOpen && (
           <div className="flex flex-wrap items-center gap-1 rounded border border-slate-700 bg-[#0d1119]/95 p-1.5">

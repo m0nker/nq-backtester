@@ -3,11 +3,15 @@ import type { Timeframe } from '../types';
 export type Side = 'buy' | 'sell';
 export type OrderType = 'market' | 'limit' | 'stop';
 
-// Bracket distances in POINTS from the entry fill price.
-export interface BracketSpec {
-  stopLossPts: number;
-  takeProfitPts: number;
-}
+// Bracket attached to an entry order. Two forms:
+//  - points: SL/TP distances from the entry fill price;
+//  - absolute stop: SL pinned at a price (bot swing-extreme stops), TP at
+//    rr × the realized risk from the ACTUAL fill. Legs spawn inside the fill
+//    pipeline the moment the entry fills, so they are live for every bar
+//    after the fill — never a full advance behind it.
+export type BracketSpec =
+  | { stopLossPts: number; takeProfitPts: number }
+  | { stopPrice: number; rr: number };
 
 export type FillKind = 'market_next_open' | 'limit_touch' | 'stop_trigger';
 
@@ -60,12 +64,14 @@ export interface EventPayloads {
     candidateId: string; // = `${ifvg.tf}:${ifvg.formedAt}:${direction}` (dedupe key)
     direction: 'long' | 'short';
     confirmTs: number; // the IFVG inversion close (rule-3 confirmation)
-    condition: { tf: Timeframe; top: number; bottom: number; formedAt: number; armedAt: number; bT: number };
+    // FVG strategy: armed condition FVG. Mech model: swept draw on liquidity.
+    condition?: { tf: Timeframe; top: number; bottom: number; formedAt: number; armedAt: number; bT: number };
     otherConditions: Timeframe[]; // additional armed condition-FVG TFs, if any
+    dol?: { kind: string; side: 'buyside' | 'sellside'; price: number; label: string; sweptAt: number };
     ifvg: { tf: Timeframe; top: number; bottom: number; formedAt: number; bT: number };
     stop: number; // retracement swing low/high (absolute)
     entryEst: number; // last close at confirmation; real entry = next bar's open
-    biasId: string; // the live bias entry this aligned with
+    biasId?: string; // the live bias entry this aligned with (FVG strategy only)
   };
   decision_made: {
     candidateId: string;

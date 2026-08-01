@@ -18,9 +18,10 @@ interface Persisted {
   enabled: Timeframe[];
   showInverted: boolean;
   showCE: boolean;
+  showLiquidity: boolean; // draw-on-liquidity level lines (lib/concepts/liquidity.ts)
 }
 
-const DEFAULTS: Persisted = { enabled: ['15m'], showInverted: true, showCE: true };
+const DEFAULTS: Persisted = { enabled: ['15m'], showInverted: true, showCE: true, showLiquidity: true };
 
 function loadPersisted(): Persisted {
   if (typeof window === 'undefined') return DEFAULTS;
@@ -34,6 +35,7 @@ function loadPersisted(): Persisted {
       ),
       showInverted: p.showInverted ?? DEFAULTS.showInverted,
       showCE: p.showCE ?? DEFAULTS.showCE,
+      showLiquidity: p.showLiquidity ?? DEFAULTS.showLiquidity,
     };
   } catch {
     return DEFAULTS;
@@ -53,6 +55,7 @@ interface ConceptsState extends Persisted {
   toggleTf: (tf: Timeframe) => void;
   setShowInverted: (v: boolean) => void;
   setShowCE: (v: boolean) => void;
+  setShowLiquidity: (v: boolean) => void;
   setPanelOpen: (v: boolean) => void;
 }
 
@@ -65,20 +68,26 @@ export const useConcepts = create<ConceptsState>((set) => ({
       const enabled = s.enabled.includes(tf)
         ? s.enabled.filter((t) => t !== tf)
         : [...s.enabled, tf];
-      save({ enabled, showInverted: s.showInverted, showCE: s.showCE });
+      save({ enabled, showInverted: s.showInverted, showCE: s.showCE, showLiquidity: s.showLiquidity });
       return { enabled };
     }),
 
   setShowInverted: (v) =>
     set((s) => {
-      save({ enabled: s.enabled, showInverted: v, showCE: s.showCE });
+      save({ enabled: s.enabled, showInverted: v, showCE: s.showCE, showLiquidity: s.showLiquidity });
       return { showInverted: v };
     }),
 
   setShowCE: (v) =>
     set((s) => {
-      save({ enabled: s.enabled, showInverted: s.showInverted, showCE: v });
+      save({ enabled: s.enabled, showInverted: s.showInverted, showCE: v, showLiquidity: s.showLiquidity });
       return { showCE: v };
+    }),
+
+  setShowLiquidity: (v) =>
+    set((s) => {
+      save({ enabled: s.enabled, showInverted: s.showInverted, showCE: s.showCE, showLiquidity: v });
+      return { showLiquidity: v };
     }),
 
   setPanelOpen: (v) => set({ panelOpen: v }),

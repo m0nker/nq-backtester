@@ -101,16 +101,34 @@ export default function CandidateModal() {
       </div>
 
       <div className="mb-3 space-y-1 font-mono text-xs">
-        <div className="flex justify-between">
-          <span className="text-slate-500">condition FVG</span>
-          <span>
-            {pending.condition.tf} {long ? 'bull' : 'bear'} {zone(pending.condition.top, pending.condition.bottom)}
-          </span>
-        </div>
-        <div className="flex justify-between">
-          <span className="text-slate-500">tapped</span>
-          <span>{formatET(pending.condition.armedAt, false)}</span>
-        </div>
+        {pending.condition && (
+          <>
+            <div className="flex justify-between">
+              <span className="text-slate-500">condition FVG</span>
+              <span>
+                {pending.condition.tf} {long ? 'bull' : 'bear'} {zone(pending.condition.top, pending.condition.bottom)}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-slate-500">tapped</span>
+              <span>{formatET(pending.condition.armedAt, false)}</span>
+            </div>
+          </>
+        )}
+        {pending.dol && (
+          <>
+            <div className="flex justify-between">
+              <span className="text-slate-500">draw on liquidity</span>
+              <span>
+                {pending.dol.label} {pending.dol.price.toFixed(2)}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-slate-500">{pending.dol.side} swept</span>
+              <span>{formatET(pending.dol.sweptAt, false)}</span>
+            </div>
+          </>
+        )}
         {pending.otherConditions.length > 0 && (
           <div className="flex justify-between">
             <span className="text-slate-500">also armed</span>

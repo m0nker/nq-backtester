@@ -1,11 +1,12 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Dashboard from '@/components/dashboard/Dashboard';
 import BotPanel from '@/components/bot/BotPanel';
 import CandidateModal from '@/components/bot/CandidateModal';
 import ReplayChart from '@/components/ReplayChart';
 import ReplayControls from '@/components/ReplayControls';
+import NewSessionModal, { type NewSessionOpts } from '@/components/sessions/NewSessionModal';
 import SessionList from '@/components/sessions/SessionList';
 import OrderPanel from '@/components/trading/OrderPanel';
 import PositionBar from '@/components/trading/PositionBar';
@@ -21,11 +22,9 @@ import type { DayMeta } from '@/lib/types';
 export default function Home() {
   const [manifest, setManifest] = useState<DayMeta[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [date, setDate] = useState('');
-  const [time, setTime] = useState('09:25');
-  const [endDate, setEndDate] = useState('');
-  const [balance, setBalance] = useState(50000);
-  const [botEnabled, setBotEnabled] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
+  const [sessionName, setSessionName] = useState('');
+  const [rangeLabel, setRangeLabel] = useState('');
   const [rewindMode, setRewindMode] = useState(false);
   const [showTrades, setShowTrades] = useState(false);
   const [showDashboard, setShowDashboard] = useState(false);
@@ -69,10 +68,7 @@ export default function Home() {
 
   useEffect(() => {
     initBarSource()
-      .then((m) => {
-        setManifest(m);
-        if (m.length) setDate(m[m.length - 1].trading_date);
-      })
+      .then(setManifest)
       .catch((e) => setError(String(e)));
     refreshSessions();
   }, [refreshSessions]);
@@ -80,6 +76,8 @@ export default function Home() {
   const resume = async (s: SessionRow) => {
     setResuming(true);
     try {
+      setSessionName(typeof s.config?.name === 'string' ? s.config.name : '');
+      setRangeLabel('');
       const events = await loadSessionEvents(s.id);
       await trading.resume(s.id, events);
       const startTs = new Date(s.start_ts).getTime() / 1000;
@@ -112,30 +110,32 @@ export default function Home() {
     return () => window.removeEventListener('keydown', onKey);
   }, [trading]);
 
-  const availableDates = useMemo(() => new Set(manifest?.map((d) => d.trading_date)), [manifest]);
-  const dateKnown = availableDates.has(date);
-  const endBeforeStart = endDate !== '' && endDate < date;
-
-  const begin = async () => {
-    if (!date || !time || endBeforeStart) return;
-    const [y, mo, d] = date.split('-').map(Number);
-    const [h, mi] = time.split(':').map(Number);
+  const begin = async (opts: NewSessionOpts) => {
+    const [y, mo, d] = opts.date.split('-').map(Number);
+    const [h, mi] = opts.time.split(':').map(Number);
     let endTs: number | null = null;
-    if (endDate) {
-      const [ey, emo, ed] = endDate.split('-').map(Number);
+    if (opts.endDate) {
+      const [ey, emo, ed] = opts.endDate.split('-').map(Number);
       endTs = etWallToUtc(ey, emo, ed, 17);
     }
     const startTs = etWallToUtc(y, mo, d, h, mi);
+    setSessionName(opts.name);
+    setRangeLabel(opts.endDate ? `range ${opts.date} → ${opts.endDate}` : '');
     // bot settings (action/window/risk/hop) live in the in-session BOT panel;
     // begin() seeds them from the last-used values and stamps the config
     await trading.begin({
       startTs,
       endTs,
-      startingBalance: balance,
-      config: { mode: botEnabled ? 'bot' : 'manual' },
+      startingBalance: opts.balance,
+      config: {
+        mode: opts.botId ? 'bot' : 'manual',
+        botId: opts.botId ?? undefined,
+        name: opts.name || undefined,
+      },
     });
+    setShowCreate(false);
     await start(startTs, endTs);
-    if (botEnabled) useBot.getState().begin();
+    if (opts.botId) useBot.getState().begin(opts.botId);
     else useBot.getState().deactivate();
   };
 
@@ -143,6 +143,8 @@ export default function Home() {
     useBot.getState().deactivate();
     void trading.end();
     reset();
+    setSessionName('');
+    setRangeLabel('');
     refreshSessions();
   };
 
@@ -152,10 +154,17 @@ export default function Home() {
 
   if (!started) {
     return (
-      <main className="flex min-h-screen flex-1 items-center justify-center gap-6 bg-[#0b0e14] text-slate-200">
-        <div className="w-96 rounded-xl border border-slate-800 bg-[#0d1119] p-8">
-          <div className="mb-1 flex items-center justify-between">
-            <h1 className="text-xl font-semibold">NQ Replay</h1>
+      <main className="flex min-h-screen flex-1 items-center justify-center bg-[#0b0e14] text-slate-200">
+        <div className="flex w-[28rem] max-w-full flex-col gap-4 p-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-xl font-semibold">NQ Replay</h1>
+              <p className="text-sm text-slate-500">
+                {manifest
+                  ? `${manifest.length} trading days available (${manifest[0]?.trading_date} → ${manifest[manifest.length - 1]?.trading_date})`
+                  : (error ?? 'Loading available days…')}
+              </p>
+            </div>
             <a
               href="https://github.com/m0nker/nq-backtester"
               target="_blank"
@@ -169,94 +178,34 @@ export default function Home() {
               GitHub
             </a>
           </div>
-          <p className="mb-6 text-sm text-slate-500">
-            {manifest
-              ? `${manifest.length} trading days available (${manifest[0]?.trading_date} → ${manifest[manifest.length - 1]?.trading_date})`
-              : (error ?? 'Loading available days…')}
-          </p>
 
-          <label className="mb-1 block text-xs uppercase tracking-wide text-slate-500">
-            Trading day
-          </label>
-          <input
-            type="date"
-            className="mb-1 w-full rounded bg-slate-800 px-3 py-2"
-            value={date}
-            min={manifest?.[0]?.trading_date}
-            max={manifest?.[manifest.length - 1]?.trading_date}
-            onChange={(e) => setDate(e.target.value)}
-          />
-          {date && manifest && !dateKnown && (
-            <p className="mb-2 text-xs text-amber-400">
-              No data for this date (weekend/holiday) — pick another day.
-            </p>
-          )}
+          <SessionList sessions={sessions} onResume={(s) => void resume(s)} onChanged={refreshSessions} />
 
-          <label className="mb-1 mt-3 block text-xs uppercase tracking-wide text-slate-500">
-            Start time (ET)
-          </label>
-          <input
-            type="time"
-            className="mb-3 w-full rounded bg-slate-800 px-3 py-2"
-            value={time}
-            onChange={(e) => setTime(e.target.value)}
-          />
-
-          <label className="mb-1 block text-xs uppercase tracking-wide text-slate-500">
-            End date <span className="normal-case text-slate-600">(optional — replay stops here)</span>
-          </label>
-          <input
-            type="date"
-            className="mb-3 w-full rounded bg-slate-800 px-3 py-2"
-            value={endDate}
-            min={date || manifest?.[0]?.trading_date}
-            max={manifest?.[manifest.length - 1]?.trading_date}
-            onChange={(e) => setEndDate(e.target.value)}
-          />
-          {endBeforeStart && (
-            <p className="mb-2 text-xs text-amber-400">End date is before the start date.</p>
-          )}
-
-          <label className="mb-1 block text-xs uppercase tracking-wide text-slate-500">
-            Starting balance ($)
-          </label>
-          <input
-            type="number"
-            min={0}
-            step={1000}
-            className="mb-3 w-full rounded bg-slate-800 px-3 py-2"
-            value={balance}
-            onChange={(e) => setBalance(+e.target.value)}
-          />
-
-          <label
-            className="mb-3 flex cursor-pointer items-center gap-2 text-sm text-slate-300"
-            title="Strategy engine: enter bias, play, get prompted at setup candidates. All bot settings live in the in-session Bot panel."
-          >
-            <input
-              type="checkbox"
-              checked={botEnabled}
-              onChange={(e) => setBotEnabled(e.target.checked)}
-            />
-            Bot <span className="text-xs text-slate-500">(strategy engine — configure in-session)</span>
-          </label>
-
-          <button
-            className="mt-2 w-full rounded bg-amber-500 py-2 font-medium text-slate-950 hover:bg-amber-400 disabled:opacity-40"
-            disabled={!manifest || !dateKnown || loading || endBeforeStart || resuming}
-            onClick={() => void begin()}
-          >
-            {loading || resuming ? 'Loading data…' : 'Start session'}
-          </button>
-          <button
-            className="mt-2 w-full rounded bg-slate-800 py-2 text-sm text-slate-300 hover:bg-slate-700"
-            onClick={() => setShowDashboard(true)}
-          >
-            Dashboard
-          </button>
+          <div className="flex gap-2">
+            <button
+              className="flex-1 rounded bg-amber-500 py-2 font-medium text-slate-950 hover:bg-amber-400 disabled:opacity-40"
+              disabled={!manifest || loading || resuming}
+              onClick={() => setShowCreate(true)}
+            >
+              {resuming ? 'Loading data…' : '+ Add session'}
+            </button>
+            <button
+              className="rounded bg-slate-800 px-4 py-2 text-sm text-slate-300 hover:bg-slate-700"
+              onClick={() => setShowDashboard(true)}
+            >
+              Dashboard
+            </button>
+          </div>
         </div>
 
-        <SessionList sessions={sessions} onResume={(s) => void resume(s)} onChanged={refreshSessions} />
+        {showCreate && (
+          <NewSessionModal
+            manifest={manifest}
+            busy={loading || resuming}
+            onClose={() => setShowCreate(false)}
+            onCreate={(opts) => void begin(opts)}
+          />
+        )}
       </main>
     );
   }
@@ -267,10 +216,12 @@ export default function Home() {
     <main className="flex h-screen flex-col bg-[#0b0e14] text-slate-200">
       <header className="flex items-center justify-between border-b border-slate-800 bg-[#0d1119] px-4 py-2">
         <div className="flex items-baseline gap-3">
-          <h1 className="text-sm font-semibold tracking-wide">NQ Replay</h1>
+          <h1 className="text-sm font-semibold tracking-wide">
+            {sessionName || 'NQ Replay'}
+          </h1>
           <span className="text-xs text-slate-500">
             bar replay · no lookahead
-            {endDate && ` · range ${date} → ${endDate}`}
+            {rangeLabel && ` · ${rangeLabel}`}
           </span>
         </div>
         <div className="flex items-center gap-2">

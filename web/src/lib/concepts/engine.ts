@@ -200,16 +200,19 @@ export interface ArmedCondition {
   armedAt: number; // open time of the tapping 1m bar
 }
 
+// A draft carries ONE condition shape: `condition` (armed FVG — the FVG
+// strategy) or `dol` (swept draw on liquidity — the mech model).
 export interface CandidateDraft {
   candidateId: string;
   direction: BiasDirection;
   confirmTs: number;
-  condition: { tf: Timeframe; top: number; bottom: number; formedAt: number; armedAt: number; bT: number };
+  condition?: { tf: Timeframe; top: number; bottom: number; formedAt: number; armedAt: number; bT: number };
   otherConditions: Timeframe[];
+  dol?: { kind: string; side: 'buyside' | 'sellside'; price: number; label: string; sweptAt: number };
   ifvg: { tf: Timeframe; top: number; bottom: number; formedAt: number; bT: number };
   stop: number;
   entryEst: number;
-  biasId: string;
+  biasId?: string; // FVG strategy only — the mech model derives direction from the sweep
 }
 
 // Rule 1 + 2 + 3 assembly. `triggers` are trigger-TF gaps whose inversion
