@@ -8,7 +8,7 @@ import { writeFileSync } from 'node:fs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const test = `
 import {
-  armingRef, biasAliveAt, firstInsidePrint, gapKey, inExecutionWindow, isFullyMitigated, matchTriggers, refBreached, resweepBreached, resweepRef, scanForTap, sessionOpenOf, sizeContracts, standingVeto, updateBiasDeaths,
+  armingRef, biasAliveAt, firstInsidePrint, gapKey, inExecutionWindow, isFullyMitigated, matchTriggers, refBreached, resweepBreached, resweepRef, scanForTap, sessionOpenOf, sizeContracts, standingVeto, updateBiasDeaths, wouldInvert,
   type BiasEntry, type TriggerOutcome,
 } from './src/lib/concepts/engine';
 import type { FVG } from './src/lib/concepts/fvg';
@@ -373,6 +373,59 @@ check('trigger-not-self-blocked', matchTriggers({ ...base, blockers: [trigger] }
     standingVeto('1m', 'bear', pool, w(9, 45)),
     standingVeto('1m', 'bear', pool, w(9, 45), new Set([gapKey(pool[0])])),
   ], ['5m', null]);
+}
+
+// ---- fully mitigated gaps stay usable as conditions (2026-08-06) ----
+// What disqualifies a condition is price sitting on its INVERTING side when
+// the trigger fires, not whether a wick already took the whole zone.
+{
+  check('would-invert-bull', [
+    wouldInvert('bull', 21899, 21950, 21900), // below the bottom -> would invert
+    wouldInvert('bull', 21900, 21950, 21900), // exactly on it -> no
+    wouldInvert('bull', 21925, 21950, 21900), // inside the zone -> no
+    wouldInvert('bull', 22600, 21950, 21900), // far above -> no
+  ], [true, false, false, false]);
+  check('would-invert-bear', [
+    wouldInvert('bear', 21951, 21950, 21900),
+    wouldInvert('bear', 21950, 21950, 21900),
+    wouldInvert('bear', 21000, 21950, 21900),
+  ], [true, false, false]);
+
+  // the user's worked example, scaled to this fixture: a bull condition
+  // 21900-21950 whose zone was fully wicked through but never closed
+  // through. entryEst here is 21938 (inside), so the long still stands.
+  check('fully-mitigated-condition-still-works', matchTriggers({
+    ...base, conditions: [{ gap: { ...condition, fillPct: 1 }, armedAt: w(9, 35) }],
+  }).length, 1);
+
+  // price BELOW the gap's bottom at the trigger -> a close there would
+  // invert it, so it cannot be the condition
+  {
+    const lowBars = [
+      bar(w(9, 30), 21960, 21970, 21955, 21960),
+      bar(w(9, 35), 21950, 21955, 21940, 21945),
+      bar(w(9, 40), 21945, 21945, 21860, 21870),
+      bar(w(9, 45), 21870, 21880, 21860, 21870), // last close 21870 < bottom 21900
+    ];
+    const diag = [];
+    check('price-on-inverting-side-rejected',
+      matchTriggers({ ...base, bars1m: lowBars, diag }).length, 0);
+    check('rejection-reads-no-condition', diag.map((d) => d.result), ['no-condition']);
+  }
+  // a bear condition mirrors: price above its top disqualifies it
+  {
+    const sCond = mkGap({ tf: '30m', dir: 'bear', top: 21930, bottom: 21900, formedAt: w(9, 30) });
+    const sTrig = mkGap({ tf: '1m', dir: 'bull', top: 21980, bottom: 21970, formedAt: w(9, 43), invertedAt: w(9, 46) });
+    const sBars = [
+      bar(w(9, 30), 21900, 21910, 21895, 21900),
+      bar(w(9, 35), 21905, 21960, 21900, 21955),
+      bar(w(9, 45), 21955, 21990, 21950, 21985), // last close 21985 > top 21930
+    ];
+    check('bear-condition-price-above-top-rejected', matchTriggers({
+      triggers: [sTrig], conditions: [{ gap: sCond, armedAt: w(9, 35) }],
+      biases: [bias('S1', 'short', 21800, 25)], bars1m: sBars, fired: new Set(),
+    }).length, 0);
+  }
 }
 
 if (failures) { console.log(failures + ' FAILURES'); process.exit(1); }

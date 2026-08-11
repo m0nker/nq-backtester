@@ -26,6 +26,10 @@ interface Persisted {
   // regardless of which indicator timeframes are toggled on.
   showBotConditions: boolean;
   showBotTriggers: boolean;
+  // ...and which SIDE of the book to draw. A bull condition / bear trigger
+  // gap belongs to the long side; their mirrors to the short side.
+  showBotLong: boolean;
+  showBotShort: boolean;
 }
 
 const DEFAULTS: Persisted = {
@@ -35,6 +39,8 @@ const DEFAULTS: Persisted = {
   showLiquidity: true,
   showBotConditions: true,
   showBotTriggers: false,
+  showBotLong: true,
+  showBotShort: true,
 };
 
 // Statuses replaced the old single `showInverted` flag. A settings blob
@@ -64,6 +70,8 @@ function loadPersisted(): Persisted {
       showLiquidity: p.showLiquidity ?? DEFAULTS.showLiquidity,
       showBotConditions: p.showBotConditions ?? DEFAULTS.showBotConditions,
       showBotTriggers: p.showBotTriggers ?? DEFAULTS.showBotTriggers,
+      showBotLong: p.showBotLong ?? DEFAULTS.showBotLong,
+      showBotShort: p.showBotShort ?? DEFAULTS.showBotShort,
     };
   } catch {
     return DEFAULTS;
@@ -86,6 +94,8 @@ interface ConceptsState extends Persisted {
   setShowLiquidity: (v: boolean) => void;
   setShowBotConditions: (v: boolean) => void;
   setShowBotTriggers: (v: boolean) => void;
+  setShowBotLong: (v: boolean) => void;
+  setShowBotShort: (v: boolean) => void;
   setPanelOpen: (v: boolean) => void;
 }
 
@@ -100,6 +110,8 @@ export const useConcepts = create<ConceptsState>((set) => {
       showLiquidity: patch.showLiquidity ?? s.showLiquidity,
       showBotConditions: patch.showBotConditions ?? s.showBotConditions,
       showBotTriggers: patch.showBotTriggers ?? s.showBotTriggers,
+      showBotLong: patch.showBotLong ?? s.showBotLong,
+      showBotShort: patch.showBotShort ?? s.showBotShort,
     });
     return patch;
   };
@@ -128,6 +140,8 @@ export const useConcepts = create<ConceptsState>((set) => {
     setShowLiquidity: (v) => set((s) => commit(s, { showLiquidity: v })),
     setShowBotConditions: (v) => set((s) => commit(s, { showBotConditions: v })),
     setShowBotTriggers: (v) => set((s) => commit(s, { showBotTriggers: v })),
+    setShowBotLong: (v) => set((s) => commit(s, { showBotLong: v })),
+    setShowBotShort: (v) => set((s) => commit(s, { showBotShort: v })),
     setPanelOpen: (v) => set({ panelOpen: v }),
   };
 });

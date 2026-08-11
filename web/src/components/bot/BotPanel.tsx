@@ -42,6 +42,9 @@ export default function BotPanel() {
   const sweepMaxCandles = useBot((s) => s.sweepMaxCandles);
   const sweepMaxMinutes = useBot((s) => s.sweepMaxMinutes);
   const dolKinds = useBot((s) => s.dolKinds);
+  const gapMaxAgeCandles = useBot((s) => s.gapMaxAgeCandles);
+  const conditionLookbackCandles = useBot((s) => s.conditionLookbackCandles);
+  const triggerLookbackCandles = useBot((s) => s.triggerLookbackCandles);
   const action = useBot((s) => s.action);
   const win = useBot((s) => s.window); // named `win`: don't shadow globalThis.window
   const risk = useBot((s) => s.risk);
@@ -342,6 +345,53 @@ export default function BotPanel() {
               </button>
             ))}
           </div>
+
+          <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
+            Candle distances
+          </div>
+          <div className="mb-1 flex items-center gap-2">
+            <input
+              type="number"
+              min={1}
+              step={1}
+              className="w-14 rounded bg-slate-800 px-2 py-1 font-mono"
+              value={gapMaxAgeCandles}
+              onChange={(e) => useBot.getState().setScanBound('gapMaxAgeCandles', +e.target.value)}
+            />
+            <span className="flex-1 text-slate-500">gap expiry (own-TF candles)</span>
+          </div>
+          <div className="mb-1 flex items-center gap-2">
+            <input
+              type="number"
+              min={1}
+              step={5}
+              className="w-14 rounded bg-slate-800 px-2 py-1 font-mono"
+              value={conditionLookbackCandles}
+              onChange={(e) =>
+                useBot.getState().setScanBound('conditionLookbackCandles', +e.target.value)
+              }
+            />
+            <span className="flex-1 text-slate-500">condition scan lookback</span>
+          </div>
+          <div className="mb-1 flex items-center gap-2">
+            <input
+              type="number"
+              min={1}
+              step={5}
+              className="w-14 rounded bg-slate-800 px-2 py-1 font-mono"
+              value={triggerLookbackCandles}
+              onChange={(e) =>
+                useBot.getState().setScanBound('triggerLookbackCandles', +e.target.value)
+              }
+            />
+            <span className="flex-1 text-slate-500">trigger scan lookback</span>
+          </div>
+          <p className="mb-3 text-[11px] leading-snug text-slate-600">
+            A gap stops being considered once it is this many of its OWN timeframe&apos;s candles
+            old — 25 on 5m is ~2h, on 4h is ~4 days. The lookbacks bound how far back each scan
+            searches and are floored at the expiry + 10, so a short lookback can never silently
+            cut the expiry short.
+          </p>
 
           <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Risk sizing</div>
           <div className="mb-3 flex items-center gap-2">

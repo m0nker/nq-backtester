@@ -95,8 +95,13 @@ const rulesOf = (s: {
 
 export type CandidateAction = 'prompt-trade' | 'label-only' | 'auto';
 
-const CONDITION_LOOKBACK = 40; // 25-candle expiry + margin — active gaps only
+// Defaults for the candle-distance settings (all user-adjustable).
+const DEFAULT_GAP_MAX_AGE = 25; // doc §2.3 locked default
+const CONDITION_LOOKBACK = 40; // expiry + margin — active gaps only
 const TRIGGER_LOOKBACK = 60;
+// A lookback shorter than the expiry would silently cap it (the gap would
+// drop out of the scan before it aged out), so floor it with margin.
+const effLookback = (lookback: number, maxAge: number) => Math.max(lookback, maxAge + 10);
 
 let nextBotId = 1;
 const bid = () => `b${nextBotId++}-${Date.now().toString(36)}`;
@@ -120,6 +125,10 @@ export interface BotSettings {
   sweepMaxCandles: number; // candles (of each trigger TF) allowed to invert
   sweepMaxMinutes: number; // absolute ceiling from the sweep; overrides the above
   dolKinds: DOLKind[]; // which draw-on-liquidity categories can be traded
+  // ---- candle-distance bounds (both bots) ----
+  gapMaxAgeCandles: number; // a gap expires this many candles of ITS OWN tf after forming
+  conditionLookbackCandles: number; // how far back the condition scan looks
+  triggerLookbackCandles: number; // how far back the trigger scan looks
 }
 const SETTINGS_KEY = 'bot-settings-v1';
 const DEFAULT_SETTINGS: BotSettings = {
@@ -133,6 +142,9 @@ const DEFAULT_SETTINGS: BotSettings = {
   sweepMaxCandles: DEFAULT_SWEEP_MAX_CANDLES,
   sweepMaxMinutes: DEFAULT_SWEEP_MAX_MINUTES,
   dolKinds: [...ALL_DOL_KINDS],
+  gapMaxAgeCandles: DEFAULT_GAP_MAX_AGE,
+  conditionLookbackCandles: CONDITION_LOOKBACK,
+  triggerLookbackCandles: TRIGGER_LOOKBACK,
 };
 const validDolKinds = (v: unknown): DOLKind[] => {
   const list = Array.isArray(v) ? v.filter(isDOLKind) : [];
@@ -161,6 +173,9 @@ function loadSettings(): BotSettings {
       sweepMaxCandles: posNum(p.sweepMaxCandles, DEFAULT_SWEEP_MAX_CANDLES),
       sweepMaxMinutes: posNum(p.sweepMaxMinutes, DEFAULT_SWEEP_MAX_MINUTES),
       dolKinds: validDolKinds(p.dolKinds),
+      gapMaxAgeCandles: posNum(p.gapMaxAgeCandles, DEFAULT_GAP_MAX_AGE),
+      conditionLookbackCandles: posNum(p.conditionLookbackCandles, CONDITION_LOOKBACK),
+      triggerLookbackCandles: posNum(p.triggerLookbackCandles, TRIGGER_LOOKBACK),
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -186,6 +201,9 @@ function persistSettings(s: BotSettings) {
       sweepMaxCandles: s.sweepMaxCandles,
       sweepMaxMinutes: s.sweepMaxMinutes,
       dolKinds: s.dolKinds,
+      gapMaxAgeCandles: s.gapMaxAgeCandles,
+      conditionLookbackCandles: s.conditionLookbackCandles,
+      triggerLookbackCandles: s.triggerLookbackCandles,
     });
   }
 }
@@ -201,6 +219,9 @@ const currentSettings = (s: {
   sweepMaxCandles: number;
   sweepMaxMinutes: number;
   dolKinds: DOLKind[];
+  gapMaxAgeCandles: number;
+  conditionLookbackCandles: number;
+  triggerLookbackCandles: number;
 }): BotSettings => ({
   action: s.action,
   window: s.window,
@@ -212,6 +233,9 @@ const currentSettings = (s: {
   sweepMaxCandles: s.sweepMaxCandles,
   sweepMaxMinutes: s.sweepMaxMinutes,
   dolKinds: s.dolKinds,
+  gapMaxAgeCandles: s.gapMaxAgeCandles,
+  conditionLookbackCandles: s.conditionLookbackCandles,
+  triggerLookbackCandles: s.triggerLookbackCandles,
 });
 
 // settings from a resumed session's config row, falling back to local defaults
@@ -232,6 +256,9 @@ function settingsFromConfig(config: Record<string, unknown> | undefined): BotSet
     sweepMaxCandles: posNum(config.sweepMaxCandles, local.sweepMaxCandles),
     sweepMaxMinutes: posNum(config.sweepMaxMinutes, local.sweepMaxMinutes),
     dolKinds: config.dolKinds !== undefined ? validDolKinds(config.dolKinds) : local.dolKinds,
+    gapMaxAgeCandles: posNum(config.gapMaxAgeCandles, local.gapMaxAgeCandles),
+    conditionLookbackCandles: posNum(config.conditionLookbackCandles, local.conditionLookbackCandles),
+    triggerLookbackCandles: posNum(config.triggerLookbackCandles, local.triggerLookbackCandles),
   };
 }
 
@@ -321,6 +348,9 @@ interface BotState {
   sweepMaxCandles: number; // mech model: candles per trigger TF to invert
   sweepMaxMinutes: number; // mech model: absolute minute ceiling from the sweep
   dolKinds: DOLKind[]; // mech model: tradeable draw-on-liquidity categories
+  gapMaxAgeCandles: number; // gap expiry, in candles of its own timeframe
+  conditionLookbackCandles: number;
+  triggerLookbackCandles: number;
 
   begin: (botId?: string) => void; // settings come from localStorage defaults
   resume: (events: SessionEvent[], upTo: number, config?: Record<string, unknown>) => void;
@@ -335,6 +365,7 @@ interface BotState {
   setSweepMaxCandles: (v: number) => void;
   setSweepMaxMinutes: (v: number) => void;
   toggleDolKind: (k: DOLKind) => void;
+  setScanBound: (k: 'gapMaxAgeCandles' | 'conditionLookbackCandles' | 'triggerLookbackCandles', v: number) => void;
   addBias: (direction: BiasDirection, until: number) => void;
   removeBias: (biasId: string) => void;
   submitDecision: (decision: 'take' | 'marginal' | 'skip', notes: string) => void;
@@ -343,12 +374,50 @@ interface BotState {
   onRewind: (from: number, to: number) => void;
 }
 
-const conditionGapsAt = (upTo: number): FVG[] => {
+// Candle-distance bounds for a scan (user-adjustable; see BotSettings).
+export interface ScanBounds {
+  maxAge: number;
+  condLookback: number;
+  trigLookback: number;
+}
+const DEFAULT_BOUNDS: ScanBounds = {
+  maxAge: DEFAULT_GAP_MAX_AGE,
+  condLookback: CONDITION_LOOKBACK,
+  trigLookback: TRIGGER_LOOKBACK,
+};
+const boundsOf = (s: {
+  gapMaxAgeCandles: number;
+  conditionLookbackCandles: number;
+  triggerLookbackCandles: number;
+}): ScanBounds => ({
+  maxAge: s.gapMaxAgeCandles,
+  condLookback: s.conditionLookbackCandles,
+  trigLookback: s.triggerLookbackCandles,
+});
+
+// Trigger-timeframe gap pool under the given bounds.
+const triggerGapsAt = (upTo: number, tfs: Timeframe[], b: ScanBounds): FVG[] => {
+  const look = effLookback(b.trigLookback, b.maxAge);
+  const out: FVG[] = [];
+  for (const tf of tfs) {
+    out.push(
+      ...computeFVGs(sources.NQ.getRecentCandles(upTo, tf, look + 5), tf, upTo, {
+        lookbackCandles: look,
+        maxAgeCandles: b.maxAge,
+      }),
+    );
+  }
+  return out;
+};
+
+const conditionGapsAt = (upTo: number, b: ScanBounds = DEFAULT_BOUNDS): FVG[] => {
+  const look = effLookback(b.condLookback, b.maxAge);
   const out: FVG[] = [];
   for (const tf of CONDITION_TFS) {
     out.push(
-      ...computeFVGs(sources.NQ.getRecentCandles(upTo, tf, CONDITION_LOOKBACK + 5), tf, upTo, {
-        lookbackCandles: CONDITION_LOOKBACK,
+      ...computeFVGs(sources.NQ.getRecentCandles(upTo, tf, look + 5), tf, upTo, {
+        lookbackCandles: look,
+        maxAgeCandles: b.maxAge,
       }),
     );
   }
@@ -368,11 +437,12 @@ const conditionGapsAt = (upTo: number): FVG[] => {
 //   arm -> breach -> re-arm sequences historically.
 const rebuildArming = (
   upTo: number,
+  bounds: ScanBounds = DEFAULT_BOUNDS,
 ): { armed: Record<string, ArmedState>; watermarks: Record<string, number> } => {
   const armed: Record<string, ArmedState> = {};
   const watermarks: Record<string, number> = {};
   const sessionOpen = sessionOpenOf(upTo);
-  for (const g of conditionGapsAt(upTo)) {
+  for (const g of conditionGapsAt(upTo, bounds)) {
     const zone = { dir: g.dir, top: g.top, bottom: g.bottom };
     // life-wide watermark (also decides full mitigation, which is terminal)
     const fullWm = scanForTap({
@@ -384,7 +454,12 @@ const rebuildArming = (
     }).watermark;
     watermarks[gapKey(g)] = fullWm;
     if (g.invertedAt !== null || g.expiredAt !== null) continue;
-    if (isFullyMitigated(g.dir, fullWm, g.top, g.bottom)) continue;
+    // NOTE: full mitigation is deliberately NOT a skip anymore (2026-08-06).
+    // A gap wicked through but never closed through is still a condition;
+    // what disqualifies it is price sitting on its inverting side when the
+    // trigger fires, which matchTriggers checks. (It still can't ARM from
+    // scratch once fully mitigated — the watermark sits at the far edge, so
+    // no print can go beyond it.)
 
     let cursor = g.formedAt;
     let wm: number | undefined;
@@ -468,17 +543,9 @@ function snapshotScope(
   sweeps: ScopeSweep[],
   triggerTfs: Timeframe[],
   dormant: 'position' | null,
+  bounds: ScanBounds,
 ): BotScope {
-  const pool: FVG[] = [];
-  if (!dormant) {
-    for (const tf of triggerTfs) {
-      pool.push(
-        ...computeFVGs(sources.NQ.getRecentCandles(to, tf, TRIGGER_LOOKBACK + 5), tf, to, {
-          lookbackCandles: TRIGGER_LOOKBACK,
-        }),
-      );
-    }
-  }
+  const pool: FVG[] = dormant ? [] : triggerGapsAt(to, triggerTfs, bounds);
   return {
     at: to,
     dormant,
@@ -515,6 +582,7 @@ const clearedFromArming = (
   condGaps: FVG[],
   triggerTfs: Timeframe[],
   upTo: number,
+  bounds: ScanBounds,
 ): Record<string, number> => {
   const dirs = new Set<FVG['dir']>();
   for (const g of condGaps) {
@@ -522,14 +590,10 @@ const clearedFromArming = (
   }
   const out: Record<string, number> = {};
   if (dirs.size === 0) return out;
-  for (const tf of triggerTfs) {
-    for (const g of computeFVGs(sources.NQ.getRecentCandles(upTo, tf, TRIGGER_LOOKBACK + 5), tf, upTo, {
-      lookbackCandles: TRIGGER_LOOKBACK,
-    })) {
-      if (!dirs.has(g.dir)) continue;
-      if (g.tappedAt === null || g.invertedAt !== null || g.expiredAt !== null) continue;
-      out[gapKey(g)] = penetrationOf(g, upTo);
-    }
+  for (const g of triggerGapsAt(upTo, triggerTfs, bounds)) {
+    if (!dirs.has(g.dir)) continue;
+    if (g.tappedAt === null || g.invertedAt !== null || g.expiredAt !== null) continue;
+    out[gapKey(g)] = penetrationOf(g, upTo);
   }
   return out;
 };
@@ -592,7 +656,7 @@ export const useBot = create<BotState>((set, get) => {
     }
     const wantDir = direction === 'long' ? 'bull' : 'bear';
     const drop = new Set(
-      conditionGapsAt(now())
+      conditionGapsAt(now(), boundsOf(get()))
         .filter((g) => g.dir === wantDir)
         .map(gapKey),
     );
@@ -682,6 +746,9 @@ export const useBot = create<BotState>((set, get) => {
     sweepMaxCandles: DEFAULT_SWEEP_MAX_CANDLES,
     sweepMaxMinutes: DEFAULT_SWEEP_MAX_MINUTES,
     dolKinds: [...ALL_DOL_KINDS],
+    gapMaxAgeCandles: DEFAULT_GAP_MAX_AGE,
+    conditionLookbackCandles: CONDITION_LOOKBACK,
+    triggerLookbackCandles: TRIGGER_LOOKBACK,
 
     begin: (botId = 'fvg-strategy') => {
       nextBotId = 1;
@@ -689,8 +756,9 @@ export const useBot = create<BotState>((set, get) => {
       persistSettings(settings); // stamp this session's config with what it runs
       const t = now();
       const mech = botId === 'mech-model';
+      const bounds = boundsOf(settings);
       const { armed, watermarks } =
-        !mech && t ? rebuildArming(t) : { armed: {}, watermarks: {} };
+        !mech && t ? rebuildArming(t, bounds) : { armed: {}, watermarks: {} };
       const sweeps =
         mech && t
           ? rebuildSweeps(dolSrc, dolLevelsFor(t, settings.dolKinds), t, rulesOf(settings))
@@ -708,10 +776,15 @@ export const useBot = create<BotState>((set, get) => {
         sweepMaxCandles: settings.sweepMaxCandles,
         sweepMaxMinutes: settings.sweepMaxMinutes,
         dolKinds: settings.dolKinds,
+        gapMaxAgeCandles: settings.gapMaxAgeCandles,
+        conditionLookbackCandles: settings.conditionLookbackCandles,
+        triggerLookbackCandles: settings.triggerLookbackCandles,
         biases: [],
         armed,
         clearedTriggers:
-          !mech && t ? clearedFromArming(armed, conditionGapsAt(t), settings.triggerTfs, t) : {},
+          !mech && t
+            ? clearedFromArming(armed, conditionGapsAt(t, bounds), settings.triggerTfs, t, bounds)
+            : {},
         watermarks,
         sweeps,
         fired: {},
@@ -719,7 +792,14 @@ export const useBot = create<BotState>((set, get) => {
         queue: [],
         armedCount: 0,
         scope: t
-          ? snapshotScope(t, mech ? [] : conditionsFrom(armed, conditionGapsAt(t)), [], settings.triggerTfs, null)
+          ? snapshotScope(
+              t,
+              mech ? [] : conditionsFrom(armed, conditionGapsAt(t, bounds)),
+              [],
+              settings.triggerTfs,
+              null,
+              bounds,
+            )
           : null,
       });
     },
@@ -731,7 +811,10 @@ export const useBot = create<BotState>((set, get) => {
       const mech = botId === 'mech-model';
       const biases = biasesFromEvents(events);
       updateBiasDeaths(biases, sources.NQ.getVisibleBars(upTo));
-      const { armed, watermarks } = mech ? { armed: {}, watermarks: {} } : rebuildArming(upTo);
+      const bounds = boundsOf(settings);
+      const { armed, watermarks } = mech
+        ? { armed: {}, watermarks: {} }
+        : rebuildArming(upTo, bounds);
       const sweeps = mech
         ? rebuildSweeps(dolSrc, dolLevelsFor(upTo, settings.dolKinds), upTo, rulesOf(settings))
         : {};
@@ -748,11 +831,14 @@ export const useBot = create<BotState>((set, get) => {
         sweepMaxCandles: settings.sweepMaxCandles,
         sweepMaxMinutes: settings.sweepMaxMinutes,
         dolKinds: settings.dolKinds,
+        gapMaxAgeCandles: settings.gapMaxAgeCandles,
+        conditionLookbackCandles: settings.conditionLookbackCandles,
+        triggerLookbackCandles: settings.triggerLookbackCandles,
         biases,
         armed,
         clearedTriggers: mech
           ? {}
-          : clearedFromArming(armed, conditionGapsAt(upTo), settings.triggerTfs, upTo),
+          : clearedFromArming(armed, conditionGapsAt(upTo, bounds), settings.triggerTfs, upTo, bounds),
         watermarks,
         sweeps,
         fired: firedFromEvents(events),
@@ -761,7 +847,7 @@ export const useBot = create<BotState>((set, get) => {
         armedCount: 0,
         scope: snapshotScope(
           upTo,
-          mech ? [] : conditionsFrom(armed, conditionGapsAt(upTo)),
+          mech ? [] : conditionsFrom(armed, conditionGapsAt(upTo, bounds)),
           mech
             ? Object.entries(sweeps)
                 .filter(([, sw]) => isArmed(sw))
@@ -774,6 +860,7 @@ export const useBot = create<BotState>((set, get) => {
             : [],
           settings.triggerTfs,
           null,
+          bounds,
         ),
       });
     },
@@ -821,6 +908,26 @@ export const useBot = create<BotState>((set, get) => {
       const next = cur.includes(k) ? cur.filter((x) => x !== k) : [...cur, k];
       if (next.length === 0) return; // at least one category stays on
       applyMechSetting({ dolKinds: next });
+    },
+
+    // Candle-distance bounds decide which gaps exist at all, so a change has
+    // to re-derive arming from scratch.
+    setScanBound: (k, v) => {
+      const n = Math.round(v);
+      if (!Number.isFinite(n) || n < 1) return;
+      set({ [k]: n } as Partial<BotState>);
+      persistSettings(currentSettings(get()));
+      const t = now();
+      const s = get();
+      if (!t || !s.active || s.botId === 'mech-model') return;
+      const bounds = boundsOf(s);
+      const { armed, watermarks } = rebuildArming(t, bounds);
+      set({
+        armed,
+        watermarks,
+        clearedTriggers: clearedFromArming(armed, conditionGapsAt(t, bounds), s.triggerTfs, t, bounds),
+        scope: snapshotScope(t, conditionsFrom(armed, conditionGapsAt(t, bounds)), [], s.triggerTfs, null, bounds),
+      });
     },
 
     addBias: (direction, until) => {
@@ -920,7 +1027,7 @@ export const useBot = create<BotState>((set, get) => {
           }
         }
       } else {
-        const condGaps = conditionGapsAt(to);
+        const condGaps = conditionGapsAt(to, boundsOf(s));
         for (const g of condGaps) {
           const key = gapKey(g);
           const prev = s.armed[key];
@@ -936,9 +1043,10 @@ export const useBot = create<BotState>((set, get) => {
             alreadyArmed: stillArmed || g.invertedAt !== null || g.expiredAt !== null,
           });
           watermarks[key] = scan.watermark;
-          // full mitigation is terminal for condition use: it DISARMS an armed
-          // gap and blocks any future re-arm (locked 2026-07-30)
-          if (isFullyMitigated(g.dir, scan.watermark, g.top, g.bottom)) continue;
+          // Full mitigation no longer disarms (revised 2026-08-06): a wick
+          // through the whole zone leaves it usable as a condition, and the
+          // price-side test at the trigger decides. Re-arming from scratch is
+          // still impossible once the watermark reaches the far edge.
           if (stillArmed) {
             // arming invalidation: ANY print (a wick counts) strictly beyond
             // the leg extreme the retrace departed from disarms — the move the
@@ -994,13 +1102,9 @@ export const useBot = create<BotState>((set, get) => {
         const triggers: FVG[] = [];
         // only the enabled trigger TFs participate — as triggers AND as
         // overlap blockers (a disabled TF is not considered at all)
-        for (const tf of s.triggerTfs) {
-          for (const g of computeFVGs(sources.NQ.getRecentCandles(to, tf, TRIGGER_LOOKBACK + 5), tf, to, {
-            lookbackCandles: TRIGGER_LOOKBACK,
-          })) {
-            pool.push(g);
-            if (g.invertedAt !== null && g.invertedAt > from && g.invertedAt <= to) triggers.push(g);
-          }
+        pool = triggerGapsAt(to, s.triggerTfs, boundsOf(s));
+        for (const g of pool) {
+          if (g.invertedAt !== null && g.invertedAt > from && g.invertedAt <= to) triggers.push(g);
         }
         // Resweep bookkeeping, in this order:
         //  1. drop entries whose gap is gone (expired / out of lookback);
@@ -1169,22 +1273,24 @@ export const useBot = create<BotState>((set, get) => {
       const biases = s.biases
         .filter((b) => b.setTs <= to)
         .map((b) => ({ ...b, deadAt: b.deadAt !== null && b.deadAt > to ? null : b.deadAt }));
-      const { armed, watermarks } = mech ? { armed: {}, watermarks: {} } : rebuildArming(to);
+      const bounds = boundsOf(s);
+      const { armed, watermarks } = mech ? { armed: {}, watermarks: {} } : rebuildArming(to, bounds);
       const sweeps = mech ? rebuildSweeps(dolSrc, dolLevelsFor(to, s.dolKinds), to, rulesOf(s)) : {};
       set({
         biases,
         armed,
         clearedTriggers: mech
           ? {}
-          : clearedFromArming(armed, conditionGapsAt(to), s.triggerTfs, to),
+          : clearedFromArming(armed, conditionGapsAt(to, bounds), s.triggerTfs, to, bounds),
         watermarks,
         sweeps,
         scope: snapshotScope(
           to,
-          mech ? [] : conditionsFrom(armed, conditionGapsAt(to)),
+          mech ? [] : conditionsFrom(armed, conditionGapsAt(to, bounds)),
           [],
           s.triggerTfs,
           null,
+          bounds,
         ),
         fired: Object.fromEntries(Object.entries(s.fired).filter(([, ts]) => ts <= to)),
         pending: s.pending && s.pending.confirmTs > to ? null : s.pending,

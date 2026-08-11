@@ -115,6 +115,21 @@ export function resweepBreached(dir: FVGDir, ref: number, bar: Bar): boolean {
 export function isFullyMitigated(dir: FVGDir, watermark: number, top: number, bottom: number): boolean {
   return dir === 'bear' ? watermark >= top : watermark <= bottom;
 }
+
+// Would a candle closing HERE invert this gap? A bull gap inverts on a close
+// below its bottom, a bear gap on a close above its top.
+//
+// Locked 2026-08-06: a fully mitigated gap (wicked through, never closed
+// through) is STILL a usable condition — what disqualifies it is price
+// sitting on the inverting side when the trigger fires. So a bull condition
+// 25000–25500 still works with price at 25600, as long as the confirming
+// close is above 25000. Inside the zone counts; beyond the FAR edge does
+// not. This is checked at the trigger, not at arming, because a higher-
+// timeframe gap only registers a real inversion on its OWN candle close —
+// intrabar, price can sit through the edge without the gap being marked.
+export function wouldInvert(dir: FVGDir, price: number, top: number, bottom: number): boolean {
+  return dir === 'bull' ? price < bottom : price > top;
+}
 export function scanForTap(opts: {
   bars: Bar[];
   dir: FVGDir;
@@ -353,15 +368,30 @@ export function matchTriggers(opts: {
       continue;
     }
 
+    // price at the trigger = last 1m close before the confirmation
+    let entryEst: number | null = null;
+    for (const bar of opts.bars1m) {
+      if (bar.t + 60 <= confirmTs) entryEst = bar.c;
+    }
+    if (entryEst === null) {
+      note('geometry');
+      continue;
+    }
+
     const wantDir = direction === 'long' ? 'bull' : 'bear';
     const sessionOpen = sessionOpenOf(confirmTs);
+    const price = entryEst;
     const matched = opts.conditions.filter(
       ({ gap, armedAt }) =>
         gap.dir === wantDir &&
         armedAt >= sessionOpen &&
         armedAt <= confirmTs &&
         (gap.invertedAt === null || gap.invertedAt > confirmTs) &&
-        (gap.expiredAt === null || gap.expiredAt > confirmTs),
+        (gap.expiredAt === null || gap.expiredAt > confirmTs) &&
+        // price must not be sitting on the gap's inverting side right now —
+        // this is what lets a FULLY MITIGATED (never closed through) gap keep
+        // working as a condition
+        !wouldInvert(gap.dir, price, gap.top, gap.bottom),
     );
     if (matched.length === 0) {
       note('no-condition');
@@ -374,13 +404,11 @@ export function matchTriggers(opts: {
     // stop = retracement swing extreme (locked): lowest low (long) / highest
     // high (short) from the primary condition's tap bar through confirmation
     let stop = direction === 'long' ? Infinity : -Infinity;
-    let entryEst: number | null = null;
     for (const bar of opts.bars1m) {
-      if (bar.t + 60 <= confirmTs) entryEst = bar.c;
       if (bar.t < primary.armedAt || bar.t >= confirmTs) continue;
       stop = direction === 'long' ? Math.min(stop, bar.l) : Math.max(stop, bar.h);
     }
-    if (!Number.isFinite(stop) || entryEst === null) {
+    if (!Number.isFinite(stop)) {
       note('geometry');
       continue;
     }

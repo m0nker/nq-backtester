@@ -42,6 +42,8 @@ export default function BotScopePanel({ onClose }: { onClose: () => void }) {
   const biases = useBot((s) => s.biases);
   const showCond = useConcepts((s) => s.showBotConditions);
   const showTrig = useConcepts((s) => s.showBotTriggers);
+  const showLong = useConcepts((s) => s.showBotLong);
+  const showShort = useConcepts((s) => s.showBotShort);
 
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -141,6 +143,33 @@ export default function BotScopePanel({ onClose }: { onClose: () => void }) {
           onClick={() => useConcepts.getState().setShowBotTriggers(!showTrig)}
         >
           highlight triggers
+        </button>
+      </div>
+
+      {/* which side of the book the highlights cover */}
+      <div className="mb-2 flex items-center gap-1">
+        <span className="text-[10px] uppercase tracking-wide text-slate-500">side</span>
+        <button
+          className={`rounded border px-1.5 py-0.5 font-mono text-[10px] ${
+            showLong
+              ? 'border-emerald-600 bg-emerald-900/50 text-emerald-200'
+              : 'border-slate-700 bg-slate-900 text-slate-500 hover:bg-slate-800'
+          }`}
+          title="Draw the long-side zones: bull conditions and the bear trigger gaps that invert into longs"
+          onClick={() => useConcepts.getState().setShowBotLong(!showLong)}
+        >
+          ▲ longs
+        </button>
+        <button
+          className={`rounded border px-1.5 py-0.5 font-mono text-[10px] ${
+            showShort
+              ? 'border-rose-600 bg-rose-900/50 text-rose-200'
+              : 'border-slate-700 bg-slate-900 text-slate-500 hover:bg-slate-800'
+          }`}
+          title="Draw the short-side zones: bear conditions and the bull trigger gaps that invert into shorts"
+          onClick={() => useConcepts.getState().setShowBotShort(!showShort)}
+        >
+          ▼ shorts
         </button>
       </div>
 

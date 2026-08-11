@@ -75,6 +75,8 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
   const botScope = useBot((s) => s.scope);
   const showBotConditions = useConcepts((s) => s.showBotConditions);
   const showBotTriggers = useConcepts((s) => s.showBotTriggers);
+  const showBotLong = useConcepts((s) => s.showBotLong);
+  const showBotShort = useConcepts((s) => s.showBotShort);
 
   // Detection is keyed to the replay clock, not to pan/zoom: overlayTick
   // re-renders only re-map boxes to pixels.
@@ -262,12 +264,25 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
     // conditions are gold (what it's waiting on); trigger-TF gaps still in
     // play are sky (what could fire, or what is vetoing a lower timeframe).
     if (botActive && botScope) {
+      // Side of the book a zone belongs to: a BULL condition arms longs, and
+      // longs come from a BEAR trigger gap inverting — so the two roles map
+      // to the same side from opposite polarities.
+      const sideOk = (dir: 'bull' | 'bear', role: 'cond' | 'trig') => {
+        const long = role === 'cond' ? dir === 'bull' : dir === 'bear';
+        return long ? showBotLong : showBotShort;
+      };
       const marks: { zone: (typeof botScope.conditions)[number]; color: string; tag: string }[] = [];
       if (showBotConditions) {
-        for (const z of botScope.conditions) marks.push({ zone: z, color: '#f5b942', tag: 'ARMED' });
+        for (const z of botScope.conditions) {
+          if (!sideOk(z.dir, 'cond')) continue;
+          marks.push({ zone: z, color: '#f5b942', tag: z.dir === 'bull' ? 'ARMED ▲' : 'ARMED ▼' });
+        }
       }
       if (showBotTriggers) {
-        for (const z of botScope.inPlay) marks.push({ zone: z, color: '#38bdf8', tag: 'IN PLAY' });
+        for (const z of botScope.inPlay) {
+          if (!sideOk(z.dir, 'trig')) continue;
+          marks.push({ zone: z, color: '#38bdf8', tag: z.dir === 'bear' ? 'IN PLAY ▲' : 'IN PLAY ▼' });
+        }
       }
       for (let i = 0; i < marks.length; i++) {
         const { zone, color, tag } = marks[i];
@@ -284,7 +299,7 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
         const w = Math.max(Math.min(xRRaw, paneW + 8) - x, 2);
         const labelX = Math.min(x + w - 4, paneW - 4);
         boxes.push(
-          <g key={`scope-${tag}-${zone.tf}-${zone.bT}-${i}`}>
+          <g key={`scope-${tag}-${zone.tf}-${zone.bT}-${i}`.replace(/\s/g, '')}>
             <rect
               x={x}
               y={y}
