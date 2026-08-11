@@ -18,7 +18,7 @@ import { getBarsInWindow, lastVisibleBar, sources } from '../data/barSource';
 import { updateSessionConfig } from '../data/sessions';
 import { appendEvent, getEvents, getSessionId } from '../events/eventLog';
 import type { SessionEvent } from '../events/types';
-import { TF_SECONDS, isSessionTf, type Timeframe } from '../types';
+import { TF_SECONDS, isSessionTf, type Bar, type Timeframe } from '../types';
 import { useReplay } from '../replay/clock';
 import { etWallToUtc, tradingDateOf } from '../time/et';
 import { deriveState } from '../trading/engine';
@@ -26,6 +26,8 @@ import { roundToTick } from '../trading/contractMath';
 import { useTrading } from '../trading/store';
 import {
   armingRef,
+  resweepBreached,
+  resweepRef,
   standingVeto,
   DEFAULT_RISK,
   DEFAULT_WINDOW,
@@ -233,6 +235,26 @@ function settingsFromConfig(config: Record<string, unknown> | undefined): BotSet
   };
 }
 
+export interface ArmedState {
+  t: number; // arming 1m bar open time
+  ref: number; // leg extreme — breaching it INVALIDATES the arm
+  swept: number; // the arming tap's own extreme — breaching it is a RESWEEP
+  reswept: boolean; // the resweep already fired for this arming
+}
+
+// How deep price has driven into a gap, as an absolute price: the highest
+// high for a bear zone (it fills upward), the lowest low for a bull one.
+// Used as the re-arm watermark for a resweep-cleared blocker — it must be
+// penetrated FURTHER than this to start vetoing again.
+const penetrationOf = (g: FVG, upTo: number): number => {
+  const bars = getBarsInWindow(g.formedAt - 60, upTo);
+  let ext = g.dir === 'bear' ? -Infinity : Infinity;
+  for (const b of bars) ext = g.dir === 'bear' ? Math.max(ext, b.h) : Math.min(ext, b.l);
+  return Number.isFinite(ext) ? ext : g.dir === 'bear' ? g.bottom : g.top;
+};
+const penetratedBeyond = (g: FVG, mark: number, bars: Bar[]): boolean =>
+  bars.some((b) => (g.dir === 'bear' ? b.h > mark : b.l < mark));
+
 // ---- live scope (what the bot is looking at RIGHT NOW) ----
 // Rebuilt every advance so the UI can answer "there's a 1m IFVG on my screen,
 // why isn't the bot taking it?" without the user re-deriving the rules.
@@ -251,6 +273,7 @@ export interface ScopeTrigger {
   blockedLong: Timeframe | null;
   blockedShort: Timeframe | null;
   live: number; // active gaps on this TF currently in play (any status)
+  cleared: number; // gaps on this TF a resweep retired (not vetoing)
   last: TriggerOutcome | null; // most recent inversion this TF produced
 }
 export interface ScopeSweep {
@@ -274,9 +297,14 @@ interface BotState {
   scope: BotScope | null;
   action: CandidateAction;
   biases: BiasEntry[];
-  // gapKey -> armed state: t = arming 1m bar open time; ref = the leg
-  // extreme whose breach ("taking the low") invalidates the arm
-  armed: Record<string, { t: number; ref: number }>;
+  // gapKey -> armed state. t = arming 1m bar open time; ref = the leg extreme
+  // whose breach ("taking the low") invalidates the arm; swept = the arming
+  // TAP's own extreme, whose breach is a RESWEEP; reswept = that already
+  // fired for this arming (edge-triggered, see onAdvance).
+  armed: Record<string, ArmedState>;
+  // gapKey of a trigger gap -> how deep price had penetrated it when a
+  // resweep retired it. It stops vetoing until price goes deeper than this.
+  clearedTriggers: Record<string, number>;
   watermarks: Record<string, number>; // gapKey -> deepest fill price since formation
   sweeps: Record<string, SweepState>; // mech model: DOL levelId -> sweep state
   fired: Record<string, number>; // candidateId -> confirmTs (already shown)
@@ -340,8 +368,8 @@ const conditionGapsAt = (upTo: number): FVG[] => {
 //   arm -> breach -> re-arm sequences historically.
 const rebuildArming = (
   upTo: number,
-): { armed: Record<string, { t: number; ref: number }>; watermarks: Record<string, number> } => {
-  const armed: Record<string, { t: number; ref: number }> = {};
+): { armed: Record<string, ArmedState>; watermarks: Record<string, number> } => {
+  const armed: Record<string, ArmedState> = {};
   const watermarks: Record<string, number> = {};
   const sessionOpen = sessionOpenOf(upTo);
   for (const g of conditionGapsAt(upTo)) {
@@ -373,7 +401,12 @@ const rebuildArming = (
       const ref = armingRef(getBarsInWindow(g.aT - 60, t + 60), g.dir, g.aT, t);
       const breachBar = getBarsInWindow(t, upTo).find((b) => b.t > t && refBreached(g.dir, ref, b));
       if (!breachBar) {
-        armed[gapKey(g)] = { t, ref };
+        const swept = resweepRef(scan.armedBar, g.dir);
+        // replay whether the resweep already fired during this arming
+        const reswept = getBarsInWindow(t, upTo).some(
+          (b) => b.t > t && resweepBreached(g.dir, swept, b),
+        );
+        armed[gapKey(g)] = { t, ref, swept, reswept };
         break;
       }
       // invalidated: resume the hunt after the breach, with the watermark as
@@ -468,10 +501,38 @@ function snapshotScope(
       blockedLong: dormant ? null : standingVeto(tf, 'bear', pool, to),
       blockedShort: dormant ? null : standingVeto(tf, 'bull', pool, to),
       live: pool.filter((g) => g.tf === tf && g.invertedAt === null && g.expiredAt === null).length,
+      cleared: 0,
       last: null,
     })),
   };
 }
+
+// Rebuild the resweep-cleared blocker set (begin/resume/rewind). A condition
+// whose resweep already fired historically must come back with its blockers
+// still retired, or a resumed session would veto trades the live run took.
+const clearedFromArming = (
+  armed: Record<string, ArmedState>,
+  condGaps: FVG[],
+  triggerTfs: Timeframe[],
+  upTo: number,
+): Record<string, number> => {
+  const dirs = new Set<FVG['dir']>();
+  for (const g of condGaps) {
+    if (armed[gapKey(g)]?.reswept) dirs.add(g.dir === 'bull' ? 'bear' : 'bull');
+  }
+  const out: Record<string, number> = {};
+  if (dirs.size === 0) return out;
+  for (const tf of triggerTfs) {
+    for (const g of computeFVGs(sources.NQ.getRecentCandles(upTo, tf, TRIGGER_LOOKBACK + 5), tf, upTo, {
+      lookbackCandles: TRIGGER_LOOKBACK,
+    })) {
+      if (!dirs.has(g.dir)) continue;
+      if (g.tappedAt === null || g.invertedAt !== null || g.expiredAt !== null) continue;
+      out[gapKey(g)] = penetrationOf(g, upTo);
+    }
+  }
+  return out;
+};
 
 // Armed condition list from an armed-map + the gaps it refers to.
 const conditionsFrom = (
@@ -604,6 +665,7 @@ export const useBot = create<BotState>((set, get) => {
     action: 'prompt-trade',
     biases: [],
     armed: {},
+    clearedTriggers: {},
     watermarks: {},
     sweeps: {},
     fired: {},
@@ -648,6 +710,8 @@ export const useBot = create<BotState>((set, get) => {
         dolKinds: settings.dolKinds,
         biases: [],
         armed,
+        clearedTriggers:
+          !mech && t ? clearedFromArming(armed, conditionGapsAt(t), settings.triggerTfs, t) : {},
         watermarks,
         sweeps,
         fired: {},
@@ -686,6 +750,9 @@ export const useBot = create<BotState>((set, get) => {
         dolKinds: settings.dolKinds,
         biases,
         armed,
+        clearedTriggers: mech
+          ? {}
+          : clearedFromArming(armed, conditionGapsAt(upTo), settings.triggerTfs, upTo),
         watermarks,
         sweeps,
         fired: firedFromEvents(events),
@@ -712,7 +779,7 @@ export const useBot = create<BotState>((set, get) => {
     },
 
     deactivate: () => {
-      set({ active: false, scope: null, biases: [], armed: {}, watermarks: {}, sweeps: {}, fired: {}, pending: null, queue: [] });
+      set({ active: false, scope: null, biases: [], armed: {}, clearedTriggers: {}, watermarks: {}, sweeps: {}, fired: {}, pending: null, queue: [] });
     },
 
     setAction: (a) => {
@@ -828,7 +895,9 @@ export const useBot = create<BotState>((set, get) => {
       // first seen this advance — day roll, window close — scans from its
       // own formation).
       const sessionOpen = sessionOpenOf(to);
-      const armed: Record<string, { t: number; ref: number }> = {};
+      const armed: Record<string, ArmedState> = {};
+      // directions whose blockers a resweep retired on this advance
+      const resweptDirs = new Set<FVG['dir']>();
       const watermarks: Record<string, number> = {};
       const sweeps: Record<string, SweepState> = {};
       const conditions: ArmedCondition[] = [];
@@ -874,12 +943,30 @@ export const useBot = create<BotState>((set, get) => {
             // arming invalidation: ANY print (a wick counts) strictly beyond
             // the leg extreme the retrace departed from disarms — the move the
             // setup was hunting already ran without a trigger
-            if (!newBars.some((b) => refBreached(g.dir, prev.ref, b))) armed[key] = prev;
+            if (!newBars.some((b) => refBreached(g.dir, prev.ref, b))) {
+              // RESWEEP: price drove back through the arming tap's own extreme
+              // (bull: below the tap low). The retracement went deeper, so
+              // every trigger that was in play is stale. Edge-triggered — one
+              // per arming, else a fixed reference would re-clear on every bar
+              // below it and nothing could ever re-arm.
+              const hit =
+                !prev.reswept && newBars.some((b) => resweepBreached(g.dir, prev.swept, b));
+              if (hit) resweptDirs.add(g.dir === 'bull' ? 'bear' : 'bull');
+              armed[key] = hit ? { ...prev, reswept: true } : prev;
+            }
           } else if (scan.armedBar) {
             const t = scan.armedBar.t;
             const ref = armingRef(getBarsInWindow(g.aT - 60, t + 60), g.dir, g.aT, t);
             // arm unless this same advance already took the reference extreme
-            if (!newBars.some((b) => b.t > t && refBreached(g.dir, ref, b))) armed[key] = { t, ref };
+            if (!newBars.some((b) => b.t > t && refBreached(g.dir, ref, b))) {
+              const swept = resweepRef(scan.armedBar, g.dir);
+              armed[key] = {
+                t,
+                ref,
+                swept,
+                reswept: newBars.some((b) => b.t > t && resweepBreached(g.dir, swept, b)),
+              };
+            }
           }
         }
         for (const g of condGaps) {
@@ -902,6 +989,7 @@ export const useBot = create<BotState>((set, get) => {
       const dormant: 'position' | null = s.onePosition && busy ? 'position' : null;
       const diag: TriggerOutcome[] = [];
       let pool: FVG[] = [];
+      let clearedTriggers = s.clearedTriggers;
       if (!dormant) {
         const triggers: FVG[] = [];
         // only the enabled trigger TFs participate — as triggers AND as
@@ -914,6 +1002,29 @@ export const useBot = create<BotState>((set, get) => {
             if (g.invertedAt !== null && g.invertedAt > from && g.invertedAt <= to) triggers.push(g);
           }
         }
+        // Resweep bookkeeping, in this order:
+        //  1. drop entries whose gap is gone (expired / out of lookback);
+        //  2. RE-ARM any cleared blocker price has now driven deeper than it
+        //     had reached when it was retired (the user's "same logic as
+        //     re-arming a filled condition");
+        //  3. retire the blockers of any direction reswept on THIS advance —
+        //     done last so a gap cleared now isn't re-armed by the same bars.
+        const byKey = new Map(pool.map((g) => [gapKey(g), g]));
+        const next: Record<string, number> = {};
+        for (const [key, mark] of Object.entries(clearedTriggers)) {
+          const g = byKey.get(key);
+          if (!g) continue; // (1)
+          if (penetratedBeyond(g, mark, newBars)) continue; // (2)
+          next[key] = mark;
+        }
+        for (const g of pool) {
+          if (!resweptDirs.has(g.dir)) continue; // (3)
+          if (g.tappedAt === null || g.invertedAt !== null || g.expiredAt !== null) continue;
+          const key = gapKey(g);
+          if (next[key] === undefined) next[key] = penetrationOf(g, to);
+        }
+        clearedTriggers = next;
+
         const common = {
           triggers,
           bars1m: sources.NQ.getVisibleBars(to),
@@ -924,7 +1035,13 @@ export const useBot = create<BotState>((set, get) => {
         drafts = (
           mech
             ? matchSweepTriggers({ ...common, sweeps: armedSweeps, rules: rulesOf(s) })
-            : matchTriggers({ ...common, conditions, biases, diag })
+            : matchTriggers({
+                ...common,
+                conditions,
+                biases,
+                diag,
+                clearedBlockers: new Set(Object.keys(clearedTriggers)),
+              })
         ).sort((a, b) => a.confirmTs - b.confirmTs);
       } else {
         pool = [];
@@ -938,6 +1055,7 @@ export const useBot = create<BotState>((set, get) => {
       // it shows which higher timeframe currently owns the move, so a 1m
       // inversion that will be suppressed is visible BEFORE it happens.
       const prevTriggers = s.scope?.triggers ?? [];
+      const clearedSet = new Set(Object.keys(clearedTriggers));
       const scope: BotScope = {
         at: to,
         dormant,
@@ -965,14 +1083,15 @@ export const useBot = create<BotState>((set, get) => {
           return {
             tf,
             // a LONG comes from a bear gap inverting, so a bear blocker vetoes it
-            blockedLong: dormant ? null : standingVeto(tf, 'bear', pool, to),
-            blockedShort: dormant ? null : standingVeto(tf, 'bull', pool, to),
+            blockedLong: dormant ? null : standingVeto(tf, 'bear', pool, to, clearedSet),
+            blockedShort: dormant ? null : standingVeto(tf, 'bull', pool, to, clearedSet),
             live: pool.filter((g) => g.tf === tf && g.invertedAt === null && g.expiredAt === null).length,
+            cleared: pool.filter((g) => g.tf === tf && clearedSet.has(gapKey(g))).length,
             last,
           };
         }),
       };
-      set({ biases, armed, watermarks, sweeps, armedCount, scope });
+      set({ biases, armed, clearedTriggers, watermarks, sweeps, armedCount, scope });
 
       const isJump = to - from > 3600;
       if (drafts.length > 0) {
@@ -1055,6 +1174,9 @@ export const useBot = create<BotState>((set, get) => {
       set({
         biases,
         armed,
+        clearedTriggers: mech
+          ? {}
+          : clearedFromArming(armed, conditionGapsAt(to), s.triggerTfs, to),
         watermarks,
         sweeps,
         scope: snapshotScope(

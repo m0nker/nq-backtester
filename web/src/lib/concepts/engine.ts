@@ -91,6 +91,23 @@ export function refBreached(dir: FVGDir, ref: number, bar: Bar): boolean {
   return dir === 'bear' ? bar.l < ref : bar.h > ref;
 }
 
+// RESWEEP reference (locked 2026-08-06): the extreme of the bar that ARMED
+// the condition — the low of the tap for a bull condition (price dipped in),
+// the high for a bear one. Price returning through it is a deeper raid on
+// the same condition, which stales every trigger that was in play: see
+// botStore's resweep handling. Fixed at arm time (user decision); a fresh
+// arming tap installs a new one.
+//
+// Note this is a DIFFERENT level from armingRef above, and points the other
+// way: armingRef is the leg extreme whose breach means the move already ran
+// (bull: the high), while this is the raid extreme (bull: the low).
+export function resweepRef(bar: Bar, dir: FVGDir): number {
+  return dir === 'bull' ? bar.l : bar.h;
+}
+export function resweepBreached(dir: FVGDir, ref: number, bar: Bar): boolean {
+  return dir === 'bull' ? bar.l < ref : bar.h > ref;
+}
+
 // Fully mitigated (locked 2026-07-30): price has traded through the ENTIRE
 // gap (watermark at the far edge). Terminal for condition use — it can never
 // arm or re-arm, even without an inversion. (Triggers are unaffected: a full
@@ -231,11 +248,13 @@ export function standingVeto(
   dir: FVGDir,
   pool: FVG[],
   at: number,
+  clearedBlockers?: ReadonlySet<string>,
 ): Timeframe | null {
   // No self-exclusion here (unlike the per-inversion check): this asks about
   // a hypothetical future inversion, and a filled SAME-TF gap blocks too.
   const hit = pool.find(
     (b) =>
+      !clearedBlockers?.has(gapKey(b)) &&
       b.dir === dir &&
       tfSec(b.tf) >= tfSec(tf) &&
       b.formedAt <= at &&
@@ -285,6 +304,10 @@ export function matchTriggers(opts: {
   // still-filled 4m can't veto a 5m close, which lands first by bucket
   // timing).
   blockers?: FVG[];
+  // Blockers a RESWEEP has retired (gapKey set). They stop vetoing until
+  // price penetrates them deeper than they had been filled when cleared —
+  // the caller owns that watermark and drops the key when it re-arms.
+  clearedBlockers?: ReadonlySet<string>;
   // optional diagnostics sink — every considered inversion appends one entry
   diag?: TriggerOutcome[];
 }): CandidateDraft[] {
@@ -310,6 +333,7 @@ export function matchTriggers(opts: {
     const blocker = opts.blockers?.find(
       (b) =>
         !(b.tf === trig.tf && b.formedAt === trig.formedAt) && // not the trigger itself
+        !opts.clearedBlockers?.has(gapKey(b)) && // retired by a resweep
         b.dir === trig.dir &&
         tfSec(b.tf) >= tfSec(trig.tf) && // same-or-higher TF (locked: same TF blocks too)
         b.formedAt <= confirmTs &&

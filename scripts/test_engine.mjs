@@ -8,7 +8,7 @@ import { writeFileSync } from 'node:fs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const test = `
 import {
-  armingRef, biasAliveAt, firstInsidePrint, inExecutionWindow, isFullyMitigated, matchTriggers, refBreached, scanForTap, sessionOpenOf, sizeContracts, standingVeto, updateBiasDeaths,
+  armingRef, biasAliveAt, firstInsidePrint, gapKey, inExecutionWindow, isFullyMitigated, matchTriggers, refBreached, resweepBreached, resweepRef, scanForTap, sessionOpenOf, sizeContracts, standingVeto, updateBiasDeaths,
   type BiasEntry, type TriggerOutcome,
 } from './src/lib/concepts/engine';
 import type { FVG } from './src/lib/concepts/fvg';
@@ -336,6 +336,43 @@ check('trigger-not-self-blocked', matchTriggers({ ...base, blockers: [trigger] }
   check('standing-veto-before-tap-clear', standingVeto('1m', 'bear', [filled5m], w(9, 30)), null);
   check('standing-veto-inverted-clear', standingVeto('1m', 'bear', [blockGap('5m', { invertedAt: w(9, 42) })], w(9, 45)), null);
   check('standing-veto-expired-clear', standingVeto('1m', 'bear', [blockGap('5m', { expiredAt: w(9, 42) })], w(9, 45)), null);
+}
+
+// ---- resweep: the arming TAP's own extreme, and clearing blockers ----
+{
+  // bull condition: price dips IN to arm, so the tap's LOW is the reference
+  const tap = bar(w(9, 35), 21950, 21955, 21940, 21945);
+  check('resweep-ref-bull-is-tap-low', resweepRef(tap, 'bull'), 21940);
+  check('resweep-ref-bear-is-tap-high', resweepRef(tap, 'bear'), 21955);
+  // breach = a print back THROUGH it (a wick counts); an exact touch does not
+  check('resweep-bull-below-breaches', resweepBreached('bull', 21940, bar(w(9, 40), 21945, 21946, 21939.75, 21944)), true);
+  check('resweep-bull-touch-no-breach', resweepBreached('bull', 21940, bar(w(9, 40), 21945, 21946, 21940, 21944)), false);
+  check('resweep-bear-above-breaches', resweepBreached('bear', 21955, bar(w(9, 40), 21950, 21955.25, 21949, 21951)), true);
+  // it is a DIFFERENT level from armingRef, and points the other way
+  const leg = [bar(w(9, 30), 21990, 22000, 21960, 21965), tap];
+  check('resweep-vs-arming-ref', [armingRef(leg, 'bull', w(9, 30), w(9, 35)), resweepRef(tap, 'bull')], [22000, 21940]);
+}
+
+// ---- cleared blockers stop vetoing ----
+{
+  const blocked = matchTriggers({ ...base, blockers: [blockGap('5m')] });
+  check('veto-active-before-resweep', blocked.length, 0);
+  const cleared = matchTriggers({
+    ...base,
+    blockers: [blockGap('5m')],
+    clearedBlockers: new Set([gapKey(blockGap('5m'))]),
+  });
+  check('cleared-blocker-lets-trigger-through', cleared.length, 1);
+  // clearing an UNRELATED gap changes nothing
+  check('unrelated-clear-still-vetoed', matchTriggers({
+    ...base, blockers: [blockGap('5m')], clearedBlockers: new Set(['5m:999']),
+  }).length, 0);
+  // the standing veto agrees with the match-time veto
+  const pool = [blockGap('5m')];
+  check('standing-veto-respects-cleared', [
+    standingVeto('1m', 'bear', pool, w(9, 45)),
+    standingVeto('1m', 'bear', pool, w(9, 45), new Set([gapKey(pool[0])])),
+  ], ['5m', null]);
 }
 
 if (failures) { console.log(failures + ' FAILURES'); process.exit(1); }

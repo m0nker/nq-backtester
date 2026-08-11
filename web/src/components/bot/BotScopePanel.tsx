@@ -212,6 +212,10 @@ export default function BotScopePanel({ onClose }: { onClose: () => void }) {
                           ? `longs blocked by ${t.blockedLong}`
                           : `shorts blocked by ${t.blockedShort}`}
                     </span>
+                  ) : t.cleared > 0 ? (
+                    <span className="text-teal-300" title="A resweep retired these blockers — they veto again only once price drives deeper into them than it already had">
+                      ↺ {t.cleared} cleared
+                    </span>
                   ) : (
                     <span className="text-slate-500">watching</span>
                   )}
@@ -227,7 +231,9 @@ export default function BotScopePanel({ onClose }: { onClose: () => void }) {
           </div>
           <p className="mt-2 text-[10px] leading-snug text-slate-600">
             ⊘ = the standing overlap veto: a tapped-but-not-inverted gap on that timeframe or
-            higher owns the move, so an inversion here is suppressed until it resolves.
+            higher owns the move, so an inversion here is suppressed until it resolves. ↺ = a
+            RESWEEP (price back through the arming tap&apos;s extreme) retired those blockers;
+            they only veto again once price drives deeper into them than it already had.
           </p>
         </>
       )}
