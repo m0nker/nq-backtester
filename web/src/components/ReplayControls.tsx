@@ -82,17 +82,24 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
 
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
-      if (target.tagName === 'INPUT' || target.tagName === 'SELECT' || target.tagName === 'TEXTAREA') return;
+      // Text entry owns every key. A focused SELECT (step size / speed) only
+      // owns the typing keys: transport still works, because otherwise the
+      // arrows silently stop stepping the moment you touch a dropdown — and
+      // worse, the browser's own arrow handling would quietly change the
+      // dropdown's value instead.
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+      const inSelect = target.tagName === 'SELECT';
 
-      // typed timeframe buffer
-      if (/^[0-9hHdDwWmMsS]$/.test(e.key)) {
+      // typed timeframe buffer (never while a modifier is held — Ctrl+1 etc.
+      // are shortcuts, not timeframe input)
+      if (!inSelect && !e.ctrlKey && !e.metaKey && !e.altKey && /^[0-9hHdDwWmMsS]$/.test(e.key)) {
         e.preventDefault();
         setTfInvalid(false);
         setTfBuffer((b) => b + e.key);
         armTimeout();
         return;
       }
-      if (e.key === 'Enter') {
+      if (!inSelect && e.key === 'Enter') {
         const buffer = tfBufferRef.current;
         if (buffer) {
           e.preventDefault();
@@ -116,15 +123,18 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
         clearBuffer();
         return;
       }
-      if (e.key === 'Backspace') {
+      if (!inSelect && e.key === 'Backspace') {
         setTfBuffer((b) => b.slice(0, -1));
         return;
       }
 
-      // transport
+      // transport. preventDefault matters on a focused SELECT: it stops the
+      // browser from changing the dropdown's value on the same arrow press.
       if (e.code === 'Space') {
         e.preventDefault();
-        togglePlay();
+        // Ctrl/Cmd+Space = advance exactly one candle (never toggles play)
+        if (e.ctrlKey || e.metaKey) void stepForward();
+        else togglePlay();
       } else if (e.code === 'ArrowRight') {
         e.preventDefault();
         void stepForward();
@@ -219,16 +229,40 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
           {atRangeEnd && <span className="ml-2 text-red-400">■ range end</span>}
         </div>
 
-        {/* transport */}
+        {/* Transport. The two STEP buttons are grouped and labelled; autoplay
+            sits apart and turns amber while running — it used to be an
+            unlabelled ▶ wedged between ◀ and ▶▮, which reads as "go forward"
+            and silently ran the clock instead of stepping one candle. */}
         <div className="flex items-center gap-1">
-          <button className={btn} onClick={stepBack} title="Step back (←)">
-            ◀
-          </button>
-          <button className={btn} onClick={togglePlay} disabled={atRangeEnd} title="Play/Pause (space)">
-            {playing ? '❚❚' : '▶'}
-          </button>
-          <button className={btn} onClick={() => void stepForward()} disabled={atRangeEnd} title="Step forward (→)">
-            ▶▮
+          <div className="flex overflow-hidden rounded border border-slate-700">
+            <button
+              className="bg-slate-800 px-3 py-1.5 text-sm text-slate-200 hover:bg-slate-700 disabled:opacity-40"
+              onClick={stepBack}
+              title="Step back one candle (←)"
+            >
+              ◀▮
+            </button>
+            <span className="w-px bg-slate-700" />
+            <button
+              className="bg-slate-800 px-3 py-1.5 text-sm text-slate-200 hover:bg-slate-700 disabled:opacity-40"
+              onClick={() => void stepForward()}
+              disabled={atRangeEnd}
+              title="Step forward one candle (→ or Ctrl+Space)"
+            >
+              ▮▶
+            </button>
+          </div>
+          <button
+            className={`rounded px-3 py-1.5 text-sm disabled:opacity-40 ${
+              playing
+                ? 'bg-amber-500/25 text-amber-200 ring-1 ring-amber-400 hover:bg-amber-500/35'
+                : 'bg-slate-800 text-slate-200 hover:bg-slate-700'
+            }`}
+            onClick={togglePlay}
+            disabled={atRangeEnd}
+            title="Autoplay — runs the clock continuously at the speed on the right (Space)"
+          >
+            {playing ? '❚❚ playing' : '▶ auto'}
           </button>
           <button className={btn} onClick={goToNextDay} disabled={atRangeEnd} title="Jump to next trading day, 09:25 ET">
             day ⏭
@@ -237,7 +271,12 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
           <select
             className="rounded bg-slate-800 px-2 py-1.5 text-sm text-slate-200"
             value={stepSize}
-            onChange={(e) => setStepSize(e.target.value as StepSize)}
+            // blur on pick: a still-focused select would otherwise keep
+            // swallowing the arrow keys the user reaches for next
+            onChange={(e) => {
+              setStepSize(e.target.value as StepSize);
+              e.target.blur();
+            }}
             title="Step size: advance by one bar of this timeframe (independent of the chart timeframe)"
           >
             <option value="view">chart tf</option>
@@ -251,7 +290,10 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
           <select
             className="rounded bg-slate-800 px-2 py-1.5 text-sm text-slate-200"
             value={speed}
-            onChange={(e) => setSpeed(+e.target.value)}
+            onChange={(e) => {
+              setSpeed(+e.target.value);
+              e.target.blur();
+            }}
             title="Autoplay speed (base bars/sec)"
           >
             {SPEEDS.map((s) => (
