@@ -16,10 +16,11 @@ import type { IChartApi, ISeriesApi, Logical } from 'lightweight-charts';
 import { timeToLogical, type ChartGeo } from '@/components/DrawingLayer';
 import { sources, type InstrumentId } from '@/lib/data/barSource';
 import { useBot } from '@/lib/concepts/botStore';
-import { computeFVGs, statusOf, type FVG } from '@/lib/concepts/fvg';
+import { FVG_STATUSES, computeFVGs, statusOf, type FVG, type FVGStatus } from '@/lib/concepts/fvg';
 import { levelsAt, sweptSet, type DOLLevel, type LevelDataSource } from '@/lib/concepts/liquidity';
 import { FVG_TF_CHOICES, useConcepts } from '@/lib/concepts/store';
 import { useReplay } from '@/lib/replay/clock';
+import { TF_SECONDS, isSessionTf, type Timeframe } from '@/lib/types';
 
 interface Props {
   instrument: InstrumentId;
@@ -33,12 +34,38 @@ const BULL = '#26a69a';
 const BEAR = '#ef5350';
 const OVERLAY_LOOKBACK = 1500; // matches the detector's own default bound
 
+const STATUS_SUFFIX: Record<FVGStatus, string> = {
+  unmitigated: '',
+  filled: ' filled',
+  'fully-mitigated': ' full mit',
+  inverted: ' IFVG',
+};
+const STROKE_OPACITY: Record<FVGStatus, number> = {
+  unmitigated: 0.5,
+  filled: 0.3,
+  'fully-mitigated': 0.22,
+  inverted: 0.45,
+};
+
+// How far past the last candle a live gap's box reaches, in CHART bars.
+// Roughly one of the gap's own candles, floored by timeframe rank so the
+// ordering never collapses when the chart timeframe is large (every 4h gap
+// still out-reaches every 1m gap on a 4h chart) and capped so a 4h zone on a
+// 15s chart doesn't shoot off into empty space.
+const extendBars = (tf: Timeframe, chartTfSec: number): number => {
+  const rank = FVG_TF_CHOICES.indexOf(tf);
+  // gaps never form on session timeframes, but the type admits them
+  const tfSec = isSessionTf(tf) ? 0 : TF_SECONDS[tf];
+  const ownCandle = chartTfSec > 0 ? tfSec / chartTfSec : 1;
+  return Math.min(30, Math.max(1 + Math.max(rank, 0) * 0.6, ownCandle));
+};
+
 export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, overlayTick }: Props) {
   void overlayTick; // re-render trigger; coordinates read fresh below
   const currentTime = useReplay((s) => s.currentTime);
   const dataVersion = useReplay((s) => s.dataVersion);
   const enabled = useConcepts((s) => s.enabled);
-  const showInverted = useConcepts((s) => s.showInverted);
+  const statuses = useConcepts((s) => s.statuses);
   const showCE = useConcepts((s) => s.showCE);
   const showLiquidity = useConcepts((s) => s.showLiquidity);
   const panelOpen = useConcepts((s) => s.panelOpen);
@@ -118,10 +145,15 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
       const g = gaps[i];
       if (g.expiredAt !== null) continue; // aged out — no longer considered
       const status = statusOf(g);
+      if (!statuses.includes(status)) continue;
       const inverted = status === 'inverted';
-      if (inverted && !showInverted) continue;
       const xL = toX(g.bT);
-      const xR = toX(inverted ? g.invertedAt! : currentTime);
+      // Live gaps run to "now" plus a timeframe-scaled tail past the last
+      // candle, so a 4h zone visibly outranks a 1m one. An inverted gap is
+      // history: its box still stops at the inversion close.
+      const xR = inverted
+        ? toX(g.invertedAt!)
+        : (toX(currentTime) ?? 0) + extendBars(g.tf, geo.tfSec) * dx;
       if (xL === null || xR === null || xR < 0 || xL > paneW) continue;
       const yTop = series.priceToCoordinate(g.top);
       const yBot = series.priceToCoordinate(g.bottom);
@@ -133,6 +165,11 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
       const w = Math.max(Math.min(xR, paneW + 8) - x, 1);
       // an inverted gap's expected polarity flips — color follows the IFVG
       const color = inverted ? (g.dir === 'bull' ? BEAR : BULL) : g.dir === 'bull' ? BULL : BEAR;
+      const label = `${g.tf}${STATUS_SUFFIX[status]}`;
+      // Right-anchored, vertically centred: the old top-left corner sat under
+      // the candles and was unreadable. Clamped inside the pane so a box
+      // running off the right edge keeps its label on screen.
+      const labelX = Math.min(x + w - 4, paneW - 4);
       boxes.push(
         <g key={`${g.tf}-${g.formedAt}-${i}`}>
           <rect
@@ -141,12 +178,12 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
             width={w}
             height={Math.max(h, 1)}
             fill={color}
-            // unfilled (never tapped) gaps pop; filled (tapped) gaps recede
-            fillOpacity={status === 'unfilled' ? 0.12 : 0.05}
+            // untouched gaps pop; anything price has been into recedes
+            fillOpacity={status === 'unmitigated' ? 0.12 : 0.05}
             stroke={color}
-            strokeOpacity={status === 'unfilled' ? 0.5 : status === 'filled' ? 0.3 : 0.45}
+            strokeOpacity={STROKE_OPACITY[status]}
             strokeWidth={1}
-            strokeDasharray={inverted ? '3 3' : undefined}
+            strokeDasharray={inverted ? '3 3' : status === 'fully-mitigated' ? '1 3' : undefined}
           />
           {showCE && h >= 8 && (
             <line
@@ -160,17 +197,17 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
               strokeDasharray="2 4"
             />
           )}
-          {h >= 10 && w >= 26 && (
+          {h >= 10 && w >= 26 && labelX > 20 && (
             <text
-              x={x + 3}
-              y={y + Math.min(h - 2, 10)}
+              x={labelX}
+              y={y + h / 2 + 3}
+              textAnchor="end"
               fill={color}
-              fillOpacity={0.75}
+              fillOpacity={0.85}
               fontSize={9}
               fontFamily="monospace"
             >
-              {g.tf}
-              {inverted ? ' IFVG' : status === 'filled' ? ' filled' : ''}
+              {label}
             </text>
           )}
         </g>,
@@ -337,17 +374,22 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
               </button>
             ))}
             <span className="mx-0.5 h-4 w-px bg-slate-700" />
-            <button
-              className={`rounded border px-1.5 py-0.5 font-mono text-[11px] ${
-                showInverted
-                  ? 'border-slate-500 bg-slate-800 text-slate-200'
-                  : 'border-slate-700 bg-slate-900 text-slate-500 hover:bg-slate-800'
-              }`}
-              title="Show inverted gaps (IFVGs) — dashed, color flipped to their new polarity"
-              onClick={() => useConcepts.getState().setShowInverted(!showInverted)}
-            >
-              IFVG
-            </button>
+            {/* per-status visibility */}
+            {FVG_STATUSES.map(({ status, label, title }) => (
+              <button
+                key={status}
+                className={`rounded border px-1.5 py-0.5 font-mono text-[11px] ${
+                  statuses.includes(status)
+                    ? 'border-slate-500 bg-slate-800 text-slate-200'
+                    : 'border-slate-700 bg-slate-900 text-slate-500 hover:bg-slate-800'
+                }`}
+                title={title}
+                onClick={() => useConcepts.getState().toggleStatus(status)}
+              >
+                {label}
+              </button>
+            ))}
+            <span className="mx-0.5 h-4 w-px bg-slate-700" />
             <button
               className={`rounded border px-1.5 py-0.5 font-mono text-[11px] ${
                 showCE

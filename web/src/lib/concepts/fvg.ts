@@ -31,13 +31,47 @@ export interface FVG {
 
 export const ceOf = (g: FVG): number => (g.top + g.bottom) / 2;
 
-// Display/consideration status in the user's vocabulary (doc §2.3):
-// unfilled = never tapped, filled = tapped at least once (any depth),
-// inverted = closed through. Expired gaps are out of consideration entirely —
-// check `expiredAt` before using the status.
-export type FVGStatus = 'unfilled' | 'filled' | 'inverted';
+// Display status in the user's vocabulary (doc §2.3, extended 2026-08-05):
+//   unmitigated    — never tapped
+//   filled         — tapped, but price has not traded through the far edge
+//   fully-mitigated— a wick took the WHOLE zone (bull: through the bottom)
+//                    without a close beyond it, so no inversion happened
+//   inverted       — an own-TF candle CLOSED beyond the far edge (terminal)
+// Inversion outranks full mitigation: sweeping the zone and then closing
+// through it is the normal IFVG sequence, and that gap is an IFVG, not a
+// dead one. Expired gaps are out of consideration entirely — check
+// `expiredAt` before using the status.
+//
+// DISPLAY ONLY. The bot reads the raw lifecycle fields (tappedAt/invertedAt/
+// expiredAt) plus engine.ts's watermark-based isFullyMitigated, so the
+// locked trading rules — including "full mitigation is terminal for
+// CONDITION use but never blocks triggers" — are untouched by this.
+export type FVGStatus = 'unmitigated' | 'filled' | 'fully-mitigated' | 'inverted';
+
+// fillPct hits exactly 1 when a candle's wick reaches the far edge (the
+// depth ratio is clamped to the zone), so this is an equality test with a
+// float guard, not a threshold.
+const FULLY_MITIGATED_FILL = 0.999;
+
 export const statusOf = (g: FVG): FVGStatus =>
-  g.invertedAt !== null ? 'inverted' : g.tappedAt !== null ? 'filled' : 'unfilled';
+  g.invertedAt !== null
+    ? 'inverted'
+    : g.fillPct >= FULLY_MITIGATED_FILL
+      ? 'fully-mitigated'
+      : g.tappedAt !== null
+        ? 'filled'
+        : 'unmitigated';
+
+export const FVG_STATUSES: readonly { status: FVGStatus; label: string; title: string }[] = [
+  { status: 'unmitigated', label: 'unmit', title: 'Unmitigated — never tapped' },
+  { status: 'filled', label: 'filled', title: 'Filled — tapped, far edge still intact' },
+  {
+    status: 'fully-mitigated',
+    label: 'full mit',
+    title: 'Fully mitigated — a wick took the whole zone, but nothing closed through it',
+  },
+  { status: 'inverted', label: 'IFVG', title: 'Inverted — a candle closed beyond the far edge' },
+];
 
 // Condition-FVG timeframes (rule-2 taps) and trigger (IFVG) timeframes
 // (rule 3). 15s/30s trigger TFs only produce candles where 1s data exists.

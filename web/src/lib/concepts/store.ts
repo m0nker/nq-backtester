@@ -6,7 +6,10 @@
 // and never feeds the event log.
 
 import { create } from 'zustand';
+import { FVG_STATUSES, type FVGStatus } from './fvg';
 import type { Timeframe } from '../types';
+
+const ALL_STATUSES: FVGStatus[] = FVG_STATUSES.map((s) => s.status);
 
 export const FVG_TF_CHOICES: readonly Timeframe[] = [
   '15s', '30s', '1m', '2m', '3m', '4m', '5m', '15m', '30m', '1h', '4h',
@@ -16,12 +19,29 @@ const STORE_KEY = 'concepts-v1';
 
 interface Persisted {
   enabled: Timeframe[];
-  showInverted: boolean;
+  statuses: FVGStatus[]; // which gap statuses are drawn
   showCE: boolean;
   showLiquidity: boolean; // draw-on-liquidity level lines (lib/concepts/liquidity.ts)
 }
 
-const DEFAULTS: Persisted = { enabled: ['15m'], showInverted: true, showCE: true, showLiquidity: true };
+const DEFAULTS: Persisted = {
+  enabled: ['15m'],
+  statuses: [...ALL_STATUSES],
+  showCE: true,
+  showLiquidity: true,
+};
+
+// Statuses replaced the old single `showInverted` flag. A settings blob
+// written before that carries showInverted only: honor it so an existing
+// user's hidden IFVGs stay hidden instead of silently reappearing.
+function readStatuses(p: Partial<Persisted> & { showInverted?: boolean }): FVGStatus[] {
+  if (Array.isArray(p.statuses)) {
+    const list = p.statuses.filter((s): s is FVGStatus => ALL_STATUSES.includes(s as FVGStatus));
+    return list.length > 0 ? list : [...ALL_STATUSES];
+  }
+  if (p.showInverted === false) return ALL_STATUSES.filter((s) => s !== 'inverted');
+  return [...ALL_STATUSES];
+}
 
 function loadPersisted(): Persisted {
   if (typeof window === 'undefined') return DEFAULTS;
@@ -33,7 +53,7 @@ function loadPersisted(): Persisted {
       enabled: (p.enabled ?? DEFAULTS.enabled).filter((tf): tf is Timeframe =>
         FVG_TF_CHOICES.includes(tf as Timeframe),
       ),
-      showInverted: p.showInverted ?? DEFAULTS.showInverted,
+      statuses: readStatuses(p),
       showCE: p.showCE ?? DEFAULTS.showCE,
       showLiquidity: p.showLiquidity ?? DEFAULTS.showLiquidity,
     };
@@ -53,42 +73,47 @@ function save(s: Persisted) {
 interface ConceptsState extends Persisted {
   panelOpen: boolean;
   toggleTf: (tf: Timeframe) => void;
-  setShowInverted: (v: boolean) => void;
+  toggleStatus: (s: FVGStatus) => void;
   setShowCE: (v: boolean) => void;
   setShowLiquidity: (v: boolean) => void;
   setPanelOpen: (v: boolean) => void;
 }
 
-export const useConcepts = create<ConceptsState>((set) => ({
-  ...loadPersisted(),
-  panelOpen: false,
+export const useConcepts = create<ConceptsState>((set) => {
+  // Persist from the MERGED state so a new setting can never be dropped by
+  // an action that forgot to thread it through.
+  const commit = (s: ConceptsState, patch: Partial<Persisted>): Partial<Persisted> => {
+    save({
+      enabled: patch.enabled ?? s.enabled,
+      statuses: patch.statuses ?? s.statuses,
+      showCE: patch.showCE ?? s.showCE,
+      showLiquidity: patch.showLiquidity ?? s.showLiquidity,
+    });
+    return patch;
+  };
 
-  toggleTf: (tf) =>
-    set((s) => {
-      const enabled = s.enabled.includes(tf)
-        ? s.enabled.filter((t) => t !== tf)
-        : [...s.enabled, tf];
-      save({ enabled, showInverted: s.showInverted, showCE: s.showCE, showLiquidity: s.showLiquidity });
-      return { enabled };
-    }),
+  return {
+    ...loadPersisted(),
+    panelOpen: false,
 
-  setShowInverted: (v) =>
-    set((s) => {
-      save({ enabled: s.enabled, showInverted: v, showCE: s.showCE, showLiquidity: s.showLiquidity });
-      return { showInverted: v };
-    }),
+    toggleTf: (tf) =>
+      set((s) =>
+        commit(s, {
+          enabled: s.enabled.includes(tf) ? s.enabled.filter((t) => t !== tf) : [...s.enabled, tf],
+        }),
+      ),
 
-  setShowCE: (v) =>
-    set((s) => {
-      save({ enabled: s.enabled, showInverted: s.showInverted, showCE: v, showLiquidity: s.showLiquidity });
-      return { showCE: v };
-    }),
+    toggleStatus: (st) =>
+      set((s) =>
+        commit(s, {
+          statuses: s.statuses.includes(st)
+            ? s.statuses.filter((x) => x !== st)
+            : [...s.statuses, st],
+        }),
+      ),
 
-  setShowLiquidity: (v) =>
-    set((s) => {
-      save({ enabled: s.enabled, showInverted: s.showInverted, showCE: s.showCE, showLiquidity: v });
-      return { showLiquidity: v };
-    }),
-
-  setPanelOpen: (v) => set({ panelOpen: v }),
-}));
+    setShowCE: (v) => set((s) => commit(s, { showCE: v })),
+    setShowLiquidity: (v) => set((s) => commit(s, { showLiquidity: v })),
+    setPanelOpen: (v) => set({ panelOpen: v }),
+  };
+});

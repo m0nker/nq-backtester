@@ -123,7 +123,17 @@ const flats = (n: number) => Array.from({ length: n }, (_, k) => flat(180 + k * 
   const fresh = computeFVGs([A, B, C], '1m', 180)[0];
   const tapped = computeFVGs([A, B, C, bar(180, 106, 106.5, 104.9, 106)], '1m', 240)[0];
   const inv = computeFVGs([A, B, C, bar(180, 105, 105.5, 99, 99.5)], '1m', 240)[0];
-  check('status-vocab', [statusOf(fresh), statusOf(tapped), statusOf(inv)], ['unfilled', 'filled', 'inverted']);
+  check('status-vocab', [statusOf(fresh), statusOf(tapped), statusOf(inv)], ['unmitigated', 'filled', 'inverted']);
+  // fully mitigated: a WICK takes the whole bull zone (down through the
+  // bottom) but the candle closes back inside — no inversion, so the gap is
+  // spent rather than flipped. Closing beyond would make it 'inverted'.
+  const wickThrough = computeFVGs([A, B, C, bar(180, 105, 105.5, 99, 105.2)], '1m', 240)[0];
+  check('status-fully-mitigated', [statusOf(wickThrough), wickThrough.invertedAt, wickThrough.fillPct], ['fully-mitigated', null, 1]);
+  // a wick that stops just short of the far edge is still only 'filled'
+  const partial = computeFVGs([A, B, C, bar(180, 105, 105.5, 104.2, 105.2)], '1m', 240)[0];
+  check('status-partial-is-filled', statusOf(partial), 'filled');
+  // inversion outranks full mitigation (sweep-then-close-through = IFVG)
+  check('inverted-outranks-full-mit', [statusOf(inv), inv.fillPct], ['inverted', 1]);
 }
 // 18. maxAgeCandles is configurable
 {
