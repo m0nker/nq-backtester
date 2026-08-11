@@ -211,6 +211,10 @@ export interface RiskSettings {
   usd: number;
 }
 export const DEFAULT_RISK: RiskSettings = { mode: 'contracts', contracts: 1, percent: 1, usd: 500 };
+// Returns 0 when the trade CANNOT be sized — a non-positive risk budget (a
+// blown account) or a degenerate stop distance. Returning the 0.1 floor for
+// those, as this used to, hid a wiped balance behind a stream of tiny
+// trades instead of stopping. Callers must treat 0 as "do not trade".
 export function sizeContracts(
   risk: RiskSettings,
   stopPts: number,
@@ -221,9 +225,10 @@ export function sizeContracts(
   if (risk.mode === 'contracts') ideal = risk.contracts;
   else {
     const riskUsd = risk.mode === 'percent' ? (balance * risk.percent) / 100 : risk.usd;
-    ideal = stopPts > 0 ? riskUsd / (stopPts * pointValue) : 0;
+    if (riskUsd <= 0 || stopPts <= 0) return 0;
+    ideal = riskUsd / (stopPts * pointValue);
   }
-  if (!Number.isFinite(ideal) || ideal <= 0) return 0.1;
+  if (!Number.isFinite(ideal) || ideal <= 0) return 0;
   return Math.max(0.1, Math.round(ideal * 10) / 10);
 }
 

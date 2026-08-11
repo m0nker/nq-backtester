@@ -45,6 +45,8 @@ export default function BotPanel() {
   const gapMaxAgeCandles = useBot((s) => s.gapMaxAgeCandles);
   const conditionLookbackCandles = useBot((s) => s.conditionLookbackCandles);
   const triggerLookbackCandles = useBot((s) => s.triggerLookbackCandles);
+  const minStopPts = useBot((s) => s.minStopPts);
+  const maxContracts = useBot((s) => s.maxContracts);
   const action = useBot((s) => s.action);
   const win = useBot((s) => s.window); // named `win`: don't shadow globalThis.window
   const risk = useBot((s) => s.risk);
@@ -416,9 +418,36 @@ export default function BotPanel() {
               {risk.mode === 'contracts' ? 'ct' : risk.mode === 'percent' ? '%' : '$'}
             </span>
           </div>
-          <p className="mb-3 text-[11px] leading-snug text-slate-600">
+          <p className="mb-2 text-[11px] leading-snug text-slate-600">
             %/$ modes size to the nearest 0.1 contract (0.1 NQ ≈ 1 MNQ, min 0.1) from the stop
             distance; % uses the current balance.
+          </p>
+
+          <div className="mb-1 flex items-center gap-2">
+            <input
+              type="number"
+              min={0.25}
+              step={1}
+              className="w-14 rounded bg-slate-800 px-2 py-1 font-mono"
+              value={minStopPts}
+              onChange={(e) => useBot.getState().setSizeGuard('minStopPts', +e.target.value)}
+            />
+            <span className="flex-1 text-slate-500">min stop (pts)</span>
+            <input
+              type="number"
+              min={0.1}
+              step={1}
+              className="w-14 rounded bg-slate-800 px-2 py-1 font-mono"
+              value={maxContracts}
+              onChange={(e) => useBot.getState().setSizeGuard('maxContracts', +e.target.value)}
+            />
+            <span className="flex-1 text-slate-500">max contracts</span>
+          </div>
+          <p className="mb-3 text-[11px] leading-snug text-amber-600/80">
+            Size is proportional to 1/stop-distance, so a stop that price has already reached by
+            entry time would otherwise produce an enormous position. Candidates whose stop is
+            nearer than the minimum are skipped outright, and the contract ceiling is a
+            last-resort backstop.
           </p>
 
           <label className="mb-1.5 flex cursor-pointer items-center gap-2 text-slate-300">

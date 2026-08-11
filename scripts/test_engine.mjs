@@ -275,7 +275,15 @@ check('size-percent-current-balance', sizeContracts(R('percent', 1), 20, 60_000)
 check('size-usd', sizeContracts(R('usd', 100), 25, 50_000), 0.2); // 100/(25*20)
 check('size-min-floor', sizeContracts(R('usd', 10), 100, 50_000), 0.1); // 0.005 -> floor 0.1
 check('size-constant-rounds', sizeContracts(R('contracts', 1.25), 999, 0), 1.3);
-check('size-zero-stop-guard', sizeContracts(R('usd', 500), 0, 50_000), 0.1);
+// 0 = CANNOT size (was 0.1, which hid these cases behind a real-looking trade)
+check('size-zero-stop-guard', sizeContracts(R('usd', 500), 0, 50_000), 0);
+check('size-negative-stop-guard', sizeContracts(R('usd', 500), -5, 50_000), 0);
+// blown account: a non-positive balance must stop trading, not floor to 0.1.
+// This is what turned one -98,789 loss into a tail of tiny 0.1-lot trades.
+check('size-blown-account', sizeContracts(R('percent', 1), 50, -55_000), 0);
+check('size-zero-balance', sizeContracts(R('percent', 1), 50, 0), 0);
+// the incident itself: a 0.25-pt stop with a $436 budget asked for 87 lots
+check('size-degenerate-stop-is-huge', sizeContracts(R('percent', 1), 0.25, 43_617), 87.2);
 
 // ---- filled-gap veto: ANY filled same-or-higher gap suppresses a lower-TF
 // inversion (overlap NOT required — tightened by user after an adjacent

@@ -103,6 +103,12 @@ const TRIGGER_LOOKBACK = 60;
 // drop out of the scan before it aged out), so floor it with margin.
 const effLookback = (lookback: number, maxAge: number) => Math.max(lookback, maxAge + 10);
 
+// Position-size guards. Size is proportional to 1/stopPts, so a stop that
+// has collapsed toward zero by placement time produces an unbounded
+// position — see placeTrade for the incident these defend against.
+const DEFAULT_MIN_STOP_PTS = 5;
+const DEFAULT_MAX_CONTRACTS = 10;
+
 let nextBotId = 1;
 const bid = () => `b${nextBotId++}-${Date.now().toString(36)}`;
 
@@ -129,6 +135,9 @@ export interface BotSettings {
   gapMaxAgeCandles: number; // a gap expires this many candles of ITS OWN tf after forming
   conditionLookbackCandles: number; // how far back the condition scan looks
   triggerLookbackCandles: number; // how far back the trigger scan looks
+  // ---- position-size guards ----
+  minStopPts: number; // no trade when the stop is closer than this to entry
+  maxContracts: number; // hard ceiling on a bot position
 }
 const SETTINGS_KEY = 'bot-settings-v1';
 const DEFAULT_SETTINGS: BotSettings = {
@@ -145,6 +154,8 @@ const DEFAULT_SETTINGS: BotSettings = {
   gapMaxAgeCandles: DEFAULT_GAP_MAX_AGE,
   conditionLookbackCandles: CONDITION_LOOKBACK,
   triggerLookbackCandles: TRIGGER_LOOKBACK,
+  minStopPts: DEFAULT_MIN_STOP_PTS,
+  maxContracts: DEFAULT_MAX_CONTRACTS,
 };
 const validDolKinds = (v: unknown): DOLKind[] => {
   const list = Array.isArray(v) ? v.filter(isDOLKind) : [];
@@ -176,6 +187,8 @@ function loadSettings(): BotSettings {
       gapMaxAgeCandles: posNum(p.gapMaxAgeCandles, DEFAULT_GAP_MAX_AGE),
       conditionLookbackCandles: posNum(p.conditionLookbackCandles, CONDITION_LOOKBACK),
       triggerLookbackCandles: posNum(p.triggerLookbackCandles, TRIGGER_LOOKBACK),
+      minStopPts: posNum(p.minStopPts, DEFAULT_MIN_STOP_PTS),
+      maxContracts: posNum(p.maxContracts, DEFAULT_MAX_CONTRACTS),
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -204,6 +217,8 @@ function persistSettings(s: BotSettings) {
       gapMaxAgeCandles: s.gapMaxAgeCandles,
       conditionLookbackCandles: s.conditionLookbackCandles,
       triggerLookbackCandles: s.triggerLookbackCandles,
+      minStopPts: s.minStopPts,
+      maxContracts: s.maxContracts,
     });
   }
 }
@@ -222,6 +237,8 @@ const currentSettings = (s: {
   gapMaxAgeCandles: number;
   conditionLookbackCandles: number;
   triggerLookbackCandles: number;
+  minStopPts: number;
+  maxContracts: number;
 }): BotSettings => ({
   action: s.action,
   window: s.window,
@@ -236,6 +253,8 @@ const currentSettings = (s: {
   gapMaxAgeCandles: s.gapMaxAgeCandles,
   conditionLookbackCandles: s.conditionLookbackCandles,
   triggerLookbackCandles: s.triggerLookbackCandles,
+  minStopPts: s.minStopPts,
+  maxContracts: s.maxContracts,
 });
 
 // settings from a resumed session's config row, falling back to local defaults
@@ -259,6 +278,8 @@ function settingsFromConfig(config: Record<string, unknown> | undefined): BotSet
     gapMaxAgeCandles: posNum(config.gapMaxAgeCandles, local.gapMaxAgeCandles),
     conditionLookbackCandles: posNum(config.conditionLookbackCandles, local.conditionLookbackCandles),
     triggerLookbackCandles: posNum(config.triggerLookbackCandles, local.triggerLookbackCandles),
+    minStopPts: posNum(config.minStopPts, local.minStopPts),
+    maxContracts: posNum(config.maxContracts, local.maxContracts),
   };
 }
 
@@ -351,6 +372,8 @@ interface BotState {
   gapMaxAgeCandles: number; // gap expiry, in candles of its own timeframe
   conditionLookbackCandles: number;
   triggerLookbackCandles: number;
+  minStopPts: number; // refuse a trade whose stop is closer than this
+  maxContracts: number; // hard ceiling on a bot position
 
   begin: (botId?: string) => void; // settings come from localStorage defaults
   resume: (events: SessionEvent[], upTo: number, config?: Record<string, unknown>) => void;
@@ -366,6 +389,7 @@ interface BotState {
   setSweepMaxMinutes: (v: number) => void;
   toggleDolKind: (k: DOLKind) => void;
   setScanBound: (k: 'gapMaxAgeCandles' | 'conditionLookbackCandles' | 'triggerLookbackCandles', v: number) => void;
+  setSizeGuard: (k: 'minStopPts' | 'maxContracts', v: number) => void;
   addBias: (direction: BiasDirection, until: number) => void;
   removeBias: (biasId: string) => void;
   submitDecision: (decision: 'take' | 'marginal' | 'skip', notes: string) => void;
@@ -665,15 +689,42 @@ export const useBot = create<BotState>((set, get) => {
     }));
   };
 
-  const placeTrade = (draft: CandidateDraft) => {
+  // Returns false when the trade was NOT placed (degenerate stop / unsizeable).
+  const placeTrade = (draft: CandidateDraft): boolean => {
     // size per the bot's risk setting; % risk uses CURRENT balance. Sizing
     // uses the freshest visible price (≈ the next-open fill), not the
     // candidate's 1m-close estimate — % / $ risk tracks the actual fill.
     const derived = useTrading.getState().derived;
     const balance = derived.startingBalance + derived.realizedUsd;
     const entryRef = lastVisibleBar(now())?.c ?? draft.entryEst;
-    const stopPts = Math.abs(entryRef - draft.stop);
-    const qty = sizeContracts(get().risk, stopPts, balance);
+    const s = get();
+    // SIGNED distance from where we'd actually enter to the stop. Math.abs()
+    // here was the 2026-08-11 blow-up: the trigger confirms on a candle
+    // CLOSE and the entry goes in on the next bar, so price can already have
+    // travelled to (or through) the swing stop by placement time. Size is
+    // proportional to 1/stopPts, so a stop that has collapsed to a tick
+    // produces a colossal position — one live session sized 88.6 contracts
+    // off a 0.25-point stop, then lost 55 points when the stop gapped
+    // through, for -$98,789 against a $436 risk budget.
+    //
+    // A negative distance means price is already past the stop: the setup's
+    // premise is gone, so there is no trade to take.
+    const dir = draft.direction === 'long' ? 1 : -1;
+    const stopPts = (entryRef - draft.stop) * dir;
+    if (stopPts < s.minStopPts) {
+      console.warn(
+        `bot: skipping ${draft.candidateId} — stop ${stopPts.toFixed(2)} pts from entry (min ${s.minStopPts})`,
+      );
+      return false;
+    }
+    const sized = sizeContracts(s.risk, stopPts, balance);
+    if (sized <= 0) {
+      console.warn(`bot: skipping ${draft.candidateId} — cannot size (balance ${balance.toFixed(0)})`);
+      return false;
+    }
+    // Backstop: even a correct stop distance shouldn't be able to produce a
+    // position this book can't survive if the stop gaps.
+    const qty = Math.min(sized, s.maxContracts);
     // absolute-stop bracket: the fill pipeline spawns the SL (swing extreme)
     // + 1R-TP OCO legs at the entry fill itself, so they're live for every
     // bar after it — the old post-advance leg placement left the stop blind
@@ -687,6 +738,7 @@ export const useBot = create<BotState>((set, get) => {
     });
     refreshTrading();
     unarmAligned(draft.direction);
+    return true;
   };
 
   // Mech-model rule change: persist it, then re-derive every sweep state
@@ -749,6 +801,8 @@ export const useBot = create<BotState>((set, get) => {
     gapMaxAgeCandles: DEFAULT_GAP_MAX_AGE,
     conditionLookbackCandles: CONDITION_LOOKBACK,
     triggerLookbackCandles: TRIGGER_LOOKBACK,
+    minStopPts: DEFAULT_MIN_STOP_PTS,
+    maxContracts: DEFAULT_MAX_CONTRACTS,
 
     begin: (botId = 'fvg-strategy') => {
       nextBotId = 1;
@@ -779,6 +833,8 @@ export const useBot = create<BotState>((set, get) => {
         gapMaxAgeCandles: settings.gapMaxAgeCandles,
         conditionLookbackCandles: settings.conditionLookbackCandles,
         triggerLookbackCandles: settings.triggerLookbackCandles,
+        minStopPts: settings.minStopPts,
+        maxContracts: settings.maxContracts,
         biases: [],
         armed,
         clearedTriggers:
@@ -834,6 +890,8 @@ export const useBot = create<BotState>((set, get) => {
         gapMaxAgeCandles: settings.gapMaxAgeCandles,
         conditionLookbackCandles: settings.conditionLookbackCandles,
         triggerLookbackCandles: settings.triggerLookbackCandles,
+        minStopPts: settings.minStopPts,
+        maxContracts: settings.maxContracts,
         biases,
         armed,
         clearedTriggers: mech
@@ -910,6 +968,13 @@ export const useBot = create<BotState>((set, get) => {
       applyMechSetting({ dolKinds: next });
     },
 
+    // Size guards only affect the NEXT order, so no rebuild needed.
+    setSizeGuard: (k, v) => {
+      if (!Number.isFinite(v) || v <= 0) return;
+      set({ [k]: v } as Partial<BotState>);
+      persistSettings(currentSettings(get()));
+    },
+
     // Candle-distance bounds decide which gaps exist at all, so a change has
     // to re-derive arming from scratch.
     setScanBound: (k, v) => {
@@ -953,8 +1018,11 @@ export const useBot = create<BotState>((set, get) => {
       });
       let queue = s.queue;
       if (decision === 'take') {
-        if (s.action === 'prompt-trade') placeTrade(s.pending);
-        else unarmAligned(s.pending.direction); // label-only: counterfactual take still unarms
+        // A refused trade (degenerate stop / unsizeable) still unarms — the
+        // user's take is recorded either way; only the order is withheld.
+        if (s.action === 'prompt-trade') {
+          if (!placeTrade(s.pending)) unarmAligned(s.pending.direction);
+        } else unarmAligned(s.pending.direction); // label-only: counterfactual take still unarms
         // same-direction queued candidates lost their armed conditions
         queue = queue.filter((d) => d.direction !== s.pending!.direction);
       }
@@ -1205,9 +1273,18 @@ export const useBot = create<BotState>((set, get) => {
             // an earlier trade this batch unarmed this direction's conditions
             if (traded.has(d.direction)) continue;
             logCandidate(d);
-            appendEvent('decision_made', d.confirmTs, { candidateId: d.candidateId, decision: 'auto' });
-            placeTrade(d);
-            traded.add(d.direction);
+            // record what ACTUALLY happened: a refused trade is a skip, not
+            // an 'auto' take with no order behind it
+            if (placeTrade(d)) {
+              appendEvent('decision_made', d.confirmTs, { candidateId: d.candidateId, decision: 'auto' });
+              traded.add(d.direction);
+            } else {
+              appendEvent('decision_made', d.confirmTs, {
+                candidateId: d.candidateId,
+                decision: 'skip',
+                notes: 'auto-skipped (stop too close to entry, or unsizeable)',
+              });
+            }
           }
         } else if (isJump) {
           for (const d of drafts) {
