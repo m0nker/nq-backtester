@@ -26,6 +26,7 @@ import { roundToTick } from '../trading/contractMath';
 import { useTrading } from '../trading/store';
 import {
   armingRef,
+  standingVeto,
   DEFAULT_RISK,
   DEFAULT_WINDOW,
   gapKey,
@@ -42,6 +43,7 @@ import {
   type CandidateDraft,
   type ExecutionWindow,
   type RiskSettings,
+  type TriggerOutcome,
 } from './engine';
 import { CONDITION_TFS, TRIGGER_TFS_ALL, computeFVGs, type FVG } from './fvg';
 import {
@@ -231,9 +233,45 @@ function settingsFromConfig(config: Record<string, unknown> | undefined): BotSet
   };
 }
 
+// ---- live scope (what the bot is looking at RIGHT NOW) ----
+// Rebuilt every advance so the UI can answer "there's a 1m IFVG on my screen,
+// why isn't the bot taking it?" without the user re-deriving the rules.
+export interface ScopeZone {
+  tf: Timeframe;
+  dir: 'bull' | 'bear';
+  top: number;
+  bottom: number;
+  bT: number; // box left edge
+  armedAt?: number; // conditions only
+}
+export interface ScopeTrigger {
+  tf: Timeframe;
+  // A same-or-higher TF gap that WOULD veto an inversion right now, per
+  // direction. This is the standing veto — visible before anything fires.
+  blockedLong: Timeframe | null;
+  blockedShort: Timeframe | null;
+  live: number; // active gaps on this TF currently in play (any status)
+  last: TriggerOutcome | null; // most recent inversion this TF produced
+}
+export interface ScopeSweep {
+  label: string;
+  price: number;
+  side: 'buyside' | 'sellside';
+  sweptAt: number;
+}
+export interface BotScope {
+  at: number; // market time this snapshot describes
+  dormant: 'position' | null; // one-position gate: not scanning at all
+  conditions: ScopeZone[]; // armed condition FVGs (FVG strategy)
+  sweeps: ScopeSweep[]; // armed draws on liquidity (mech model)
+  inPlay: ScopeZone[]; // trigger-TF gaps that could still invert into a setup
+  triggers: ScopeTrigger[];
+}
+
 interface BotState {
   active: boolean;
   botId: string; // which bot runs this session ('fvg-strategy' | 'mech-model')
+  scope: BotScope | null;
   action: CandidateAction;
   biases: BiasEntry[];
   // gapKey -> armed state: t = arming 1m bar open time; ref = the leg
@@ -387,6 +425,67 @@ const firedFromEvents = (events: SessionEvent[]): Record<string, number> => {
   return fired;
 };
 
+// Scope snapshot WITHOUT running a trigger match — used at begin/resume/
+// rewind so the panel is populated the moment a session opens, instead of
+// looking broken until the first advance. onAdvance builds the richer
+// version (it also has the just-computed match diagnostics).
+function snapshotScope(
+  to: number,
+  conditions: ArmedCondition[],
+  sweeps: ScopeSweep[],
+  triggerTfs: Timeframe[],
+  dormant: 'position' | null,
+): BotScope {
+  const pool: FVG[] = [];
+  if (!dormant) {
+    for (const tf of triggerTfs) {
+      pool.push(
+        ...computeFVGs(sources.NQ.getRecentCandles(to, tf, TRIGGER_LOOKBACK + 5), tf, to, {
+          lookbackCandles: TRIGGER_LOOKBACK,
+        }),
+      );
+    }
+  }
+  return {
+    at: to,
+    dormant,
+    sweeps,
+    conditions: conditions
+      .filter(({ gap }) => gap.invertedAt === null && gap.expiredAt === null)
+      .map(({ gap, armedAt }) => ({
+        tf: gap.tf,
+        dir: gap.dir,
+        top: gap.top,
+        bottom: gap.bottom,
+        bT: gap.bT,
+        armedAt,
+      })),
+    inPlay: pool
+      .filter((g) => g.invertedAt === null && g.expiredAt === null && g.tappedAt !== null)
+      .map((g) => ({ tf: g.tf, dir: g.dir, top: g.top, bottom: g.bottom, bT: g.bT })),
+    triggers: triggerTfs.map((tf) => ({
+      tf,
+      blockedLong: dormant ? null : standingVeto(tf, 'bear', pool, to),
+      blockedShort: dormant ? null : standingVeto(tf, 'bull', pool, to),
+      live: pool.filter((g) => g.tf === tf && g.invertedAt === null && g.expiredAt === null).length,
+      last: null,
+    })),
+  };
+}
+
+// Armed condition list from an armed-map + the gaps it refers to.
+const conditionsFrom = (
+  armed: Record<string, { t: number; ref: number }>,
+  gaps: FVG[],
+): ArmedCondition[] => {
+  const out: ArmedCondition[] = [];
+  for (const g of gaps) {
+    const at = armed[gapKey(g)];
+    if (at !== undefined) out.push({ gap: g, armedAt: at.t });
+  }
+  return out;
+};
+
 export const useBot = create<BotState>((set, get) => {
   if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
     // debug handle — stripped from production builds
@@ -501,6 +600,7 @@ export const useBot = create<BotState>((set, get) => {
   return {
     active: false,
     botId: 'fvg-strategy',
+    scope: null,
     action: 'prompt-trade',
     biases: [],
     armed: {},
@@ -554,6 +654,9 @@ export const useBot = create<BotState>((set, get) => {
         pending: null,
         queue: [],
         armedCount: 0,
+        scope: t
+          ? snapshotScope(t, mech ? [] : conditionsFrom(armed, conditionGapsAt(t)), [], settings.triggerTfs, null)
+          : null,
       });
     },
 
@@ -589,11 +692,27 @@ export const useBot = create<BotState>((set, get) => {
         pending: null,
         queue: [],
         armedCount: 0,
+        scope: snapshotScope(
+          upTo,
+          mech ? [] : conditionsFrom(armed, conditionGapsAt(upTo)),
+          mech
+            ? Object.entries(sweeps)
+                .filter(([, sw]) => isArmed(sw))
+                .map(([id, sw]) => ({
+                  label: id,
+                  price: sw.wm,
+                  side: id.includes(':buyside:') ? ('buyside' as const) : ('sellside' as const),
+                  sweptAt: sw.sweptAt!,
+                }))
+            : [],
+          settings.triggerTfs,
+          null,
+        ),
       });
     },
 
     deactivate: () => {
-      set({ active: false, biases: [], armed: {}, watermarks: {}, sweeps: {}, fired: {}, pending: null, queue: [] });
+      set({ active: false, scope: null, biases: [], armed: {}, watermarks: {}, sweeps: {}, fired: {}, pending: null, queue: [] });
     },
 
     setAction: (a) => {
@@ -780,9 +899,11 @@ export const useBot = create<BotState>((set, get) => {
       // hierarchy: the full pool is passed as blockers so a lower-TF
       // inversion defers to any overlapping same-or-higher filled gap.
       let drafts: CandidateDraft[] = [];
-      if (!(s.onePosition && busy)) {
+      const dormant: 'position' | null = s.onePosition && busy ? 'position' : null;
+      const diag: TriggerOutcome[] = [];
+      let pool: FVG[] = [];
+      if (!dormant) {
         const triggers: FVG[] = [];
-        const pool: FVG[] = [];
         // only the enabled trigger TFs participate — as triggers AND as
         // overlap blockers (a disabled TF is not considered at all)
         for (const tf of s.triggerTfs) {
@@ -803,14 +924,55 @@ export const useBot = create<BotState>((set, get) => {
         drafts = (
           mech
             ? matchSweepTriggers({ ...common, sweeps: armedSweeps, rules: rulesOf(s) })
-            : matchTriggers({ ...common, conditions, biases })
+            : matchTriggers({ ...common, conditions, biases, diag })
         ).sort((a, b) => a.confirmTs - b.confirmTs);
+      } else {
+        pool = [];
       }
 
       const armedCount = mech
         ? Object.values(sweeps).filter(isArmed).length
         : conditions.filter(({ gap }) => gap.invertedAt === null && gap.expiredAt === null).length;
-      set({ biases, armed, watermarks, sweeps, armedCount });
+
+      // 3b. live scope snapshot for the UI. The standing veto is the payoff:
+      // it shows which higher timeframe currently owns the move, so a 1m
+      // inversion that will be suppressed is visible BEFORE it happens.
+      const prevTriggers = s.scope?.triggers ?? [];
+      const scope: BotScope = {
+        at: to,
+        dormant,
+        sweeps: armedSweeps.map((a) => ({
+          label: a.level.label,
+          price: a.level.price,
+          side: a.level.side,
+          sweptAt: a.sweptAt,
+        })),
+        conditions: conditions
+          .filter(({ gap }) => gap.invertedAt === null && gap.expiredAt === null)
+          .map(({ gap, armedAt }) => ({
+            tf: gap.tf,
+            dir: gap.dir,
+            top: gap.top,
+            bottom: gap.bottom,
+            bT: gap.bT,
+            armedAt,
+          })),
+        inPlay: pool
+          .filter((g) => g.invertedAt === null && g.expiredAt === null && g.tappedAt !== null)
+          .map((g) => ({ tf: g.tf, dir: g.dir, top: g.top, bottom: g.bottom, bT: g.bT })),
+        triggers: s.triggerTfs.map((tf) => {
+          const last = diag.find((d) => d.tf === tf) ?? prevTriggers.find((p) => p.tf === tf)?.last ?? null;
+          return {
+            tf,
+            // a LONG comes from a bear gap inverting, so a bear blocker vetoes it
+            blockedLong: dormant ? null : standingVeto(tf, 'bear', pool, to),
+            blockedShort: dormant ? null : standingVeto(tf, 'bull', pool, to),
+            live: pool.filter((g) => g.tf === tf && g.invertedAt === null && g.expiredAt === null).length,
+            last,
+          };
+        }),
+      };
+      set({ biases, armed, watermarks, sweeps, armedCount, scope });
 
       const isJump = to - from > 3600;
       if (drafts.length > 0) {
@@ -895,6 +1057,13 @@ export const useBot = create<BotState>((set, get) => {
         armed,
         watermarks,
         sweeps,
+        scope: snapshotScope(
+          to,
+          mech ? [] : conditionsFrom(armed, conditionGapsAt(to)),
+          [],
+          s.triggerTfs,
+          null,
+        ),
         fired: Object.fromEntries(Object.entries(s.fired).filter(([, ts]) => ts <= to)),
         pending: s.pending && s.pending.confirmTs > to ? null : s.pending,
         queue: s.queue.filter((d) => d.confirmTs <= to),

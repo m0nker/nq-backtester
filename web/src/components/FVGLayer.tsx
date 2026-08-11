@@ -71,6 +71,10 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
   const panelOpen = useConcepts((s) => s.panelOpen);
   const pendingCandidate = useBot((s) => s.pending);
   const dolKinds = useBot((s) => s.dolKinds);
+  const botActive = useBot((s) => s.active);
+  const botScope = useBot((s) => s.scope);
+  const showBotConditions = useConcepts((s) => s.showBotConditions);
+  const showBotTriggers = useConcepts((s) => s.showBotTriggers);
 
   // Detection is keyed to the replay clock, not to pan/zoom: overlayTick
   // re-renders only re-map boxes to pixels.
@@ -251,6 +255,63 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
           </text>
         </g>,
       );
+    }
+
+    // BOT SCOPE: the zones the engine is actually using right now, drawn
+    // regardless of which indicator timeframes are toggled on. Armed
+    // conditions are gold (what it's waiting on); trigger-TF gaps still in
+    // play are sky (what could fire, or what is vetoing a lower timeframe).
+    if (botActive && botScope) {
+      const marks: { zone: (typeof botScope.conditions)[number]; color: string; tag: string }[] = [];
+      if (showBotConditions) {
+        for (const z of botScope.conditions) marks.push({ zone: z, color: '#f5b942', tag: 'ARMED' });
+      }
+      if (showBotTriggers) {
+        for (const z of botScope.inPlay) marks.push({ zone: z, color: '#38bdf8', tag: 'IN PLAY' });
+      }
+      for (let i = 0; i < marks.length; i++) {
+        const { zone, color, tag } = marks[i];
+        const xL = toX(zone.bT);
+        const xRRaw = (toX(currentTime) ?? 0) + extendBars(zone.tf, geo.tfSec) * dx;
+        if (xL === null || xRRaw < 0 || xL > paneW) continue;
+        const yTop = series.priceToCoordinate(zone.top);
+        const yBot = series.priceToCoordinate(zone.bottom);
+        if (yTop === null || yBot === null) continue;
+        const y = Math.min(yTop as number, yBot as number);
+        const h = Math.abs((yBot as number) - (yTop as number));
+        if (y > paneH || y + h < 0) continue;
+        const x = Math.max(xL, -8);
+        const w = Math.max(Math.min(xRRaw, paneW + 8) - x, 2);
+        const labelX = Math.min(x + w - 4, paneW - 4);
+        boxes.push(
+          <g key={`scope-${tag}-${zone.tf}-${zone.bT}-${i}`}>
+            <rect
+              x={x}
+              y={y}
+              width={w}
+              height={Math.max(h, 2)}
+              fill={color}
+              fillOpacity={0.1}
+              stroke={color}
+              strokeOpacity={0.9}
+              strokeWidth={2}
+            />
+            {h >= 10 && labelX > 30 && (
+              <text
+                x={labelX}
+                y={y + h / 2 + 3}
+                textAnchor="end"
+                fill={color}
+                fontSize={9}
+                fontWeight={700}
+                fontFamily="monospace"
+              >
+                {tag} {zone.tf}
+              </text>
+            )}
+          </g>,
+        );
+      }
     }
 
     // Pending-candidate highlight: while the prompt is up, the exact

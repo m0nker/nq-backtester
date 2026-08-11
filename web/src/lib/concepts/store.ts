@@ -22,6 +22,10 @@ interface Persisted {
   statuses: FVGStatus[]; // which gap statuses are drawn
   showCE: boolean;
   showLiquidity: boolean; // draw-on-liquidity level lines (lib/concepts/liquidity.ts)
+  // Bot scope highlights: the zones the ENGINE is actually using, drawn
+  // regardless of which indicator timeframes are toggled on.
+  showBotConditions: boolean;
+  showBotTriggers: boolean;
 }
 
 const DEFAULTS: Persisted = {
@@ -29,6 +33,8 @@ const DEFAULTS: Persisted = {
   statuses: [...ALL_STATUSES],
   showCE: true,
   showLiquidity: true,
+  showBotConditions: true,
+  showBotTriggers: false,
 };
 
 // Statuses replaced the old single `showInverted` flag. A settings blob
@@ -56,6 +62,8 @@ function loadPersisted(): Persisted {
       statuses: readStatuses(p),
       showCE: p.showCE ?? DEFAULTS.showCE,
       showLiquidity: p.showLiquidity ?? DEFAULTS.showLiquidity,
+      showBotConditions: p.showBotConditions ?? DEFAULTS.showBotConditions,
+      showBotTriggers: p.showBotTriggers ?? DEFAULTS.showBotTriggers,
     };
   } catch {
     return DEFAULTS;
@@ -76,6 +84,8 @@ interface ConceptsState extends Persisted {
   toggleStatus: (s: FVGStatus) => void;
   setShowCE: (v: boolean) => void;
   setShowLiquidity: (v: boolean) => void;
+  setShowBotConditions: (v: boolean) => void;
+  setShowBotTriggers: (v: boolean) => void;
   setPanelOpen: (v: boolean) => void;
 }
 
@@ -88,6 +98,8 @@ export const useConcepts = create<ConceptsState>((set) => {
       statuses: patch.statuses ?? s.statuses,
       showCE: patch.showCE ?? s.showCE,
       showLiquidity: patch.showLiquidity ?? s.showLiquidity,
+      showBotConditions: patch.showBotConditions ?? s.showBotConditions,
+      showBotTriggers: patch.showBotTriggers ?? s.showBotTriggers,
     });
     return patch;
   };
@@ -114,6 +126,8 @@ export const useConcepts = create<ConceptsState>((set) => {
 
     setShowCE: (v) => set((s) => commit(s, { showCE: v })),
     setShowLiquidity: (v) => set((s) => commit(s, { showLiquidity: v })),
+    setShowBotConditions: (v) => set((s) => commit(s, { showBotConditions: v })),
+    setShowBotTriggers: (v) => set((s) => commit(s, { showBotTriggers: v })),
     setPanelOpen: (v) => set({ panelOpen: v }),
   };
 });

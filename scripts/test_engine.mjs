@@ -8,8 +8,8 @@ import { writeFileSync } from 'node:fs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const test = `
 import {
-  armingRef, biasAliveAt, firstInsidePrint, inExecutionWindow, isFullyMitigated, matchTriggers, refBreached, scanForTap, sessionOpenOf, sizeContracts, updateBiasDeaths,
-  type BiasEntry,
+  armingRef, biasAliveAt, firstInsidePrint, inExecutionWindow, isFullyMitigated, matchTriggers, refBreached, scanForTap, sessionOpenOf, sizeContracts, standingVeto, updateBiasDeaths,
+  type BiasEntry, type TriggerOutcome,
 } from './src/lib/concepts/engine';
 import type { FVG } from './src/lib/concepts/fvg';
 import { etWallToUtc } from './src/lib/time/et';
@@ -304,6 +304,38 @@ check('trigger-not-self-blocked', matchTriggers({ ...base, blockers: [trigger] }
   const trig15s = mkGap({ tf: '15s', dir: 'bear', top: 21933, bottom: 21928, formedAt: w(9, 43), invertedAt: w(9, 46) });
   check('15s-blocked-by-1m', matchTriggers({ ...base, triggers: [trig15s], blockers: [blockGap('1m')] }).length, 0);
   check('15s-fires-alone', matchTriggers({ ...base, triggers: [trig15s] }).length, 1);
+}
+
+// ---- trigger diagnostics: every rejection reports WHY (drives the scope panel) ----
+{
+  const run = (opts: Parameters<typeof matchTriggers>[0]) => {
+    const diag: TriggerOutcome[] = [];
+    matchTriggers({ ...opts, diag });
+    return diag.map((d) => [d.result, d.blockedBy ?? null]);
+  };
+  check('diag-candidate', run(base), [['candidate', null]]);
+  check('diag-duplicate', run({ ...base, fired: new Set(['1m:' + w(9, 43) + ':long']) }), [['duplicate', null]]);
+  check('diag-window', run({ ...base, triggers: [{ ...trigger, invertedAt: w(11, 5) }] }), [['window', null]]);
+  check('diag-vetoed-names-blocker', run({ ...base, blockers: [blockGap('5m')] }), [['vetoed', '5m']]);
+  check('diag-no-bias', run({ ...base, biases: [bias('S1', 'short', 21000, 25)] }), [['no-bias', null]]);
+  check('diag-no-condition', run({ ...base, conditions: [{ gap: condition, armedAt: w(9, 50) }] }), [['no-condition', null]]);
+  check('diag-geometry', run({ ...base, bars1m: [bar(w(9, 35), 21950, 21955, 21945, 21950), bar(w(9, 45), 21950, 21952, 21948, 21900)] }), [['geometry', null]]);
+  // diagnostics are opt-in: omitting the sink changes nothing
+  check('diag-optional', matchTriggers(base).length, 1);
+}
+
+// ---- standing veto: the block is visible BEFORE anything inverts ----
+{
+  const filled5m = blockGap('5m'); // bear, tapped 9:40, still active
+  // a LONG comes from a BEAR gap inverting, so a filled bear gap blocks longs
+  check('standing-veto-blocks-lower', standingVeto('1m', 'bear', [filled5m], w(9, 45)), '5m');
+  check('standing-veto-same-tf-blocks', standingVeto('5m', 'bear', [filled5m], w(9, 45)), '5m');
+  check('standing-veto-higher-unblocked', standingVeto('15m', 'bear', [filled5m], w(9, 45)), null);
+  check('standing-veto-other-dir-clear', standingVeto('1m', 'bull', [filled5m], w(9, 45)), null);
+  check('standing-veto-unfilled-clear', standingVeto('1m', 'bear', [blockGap('5m', { tappedAt: null })], w(9, 45)), null);
+  check('standing-veto-before-tap-clear', standingVeto('1m', 'bear', [filled5m], w(9, 30)), null);
+  check('standing-veto-inverted-clear', standingVeto('1m', 'bear', [blockGap('5m', { invertedAt: w(9, 42) })], w(9, 45)), null);
+  check('standing-veto-expired-clear', standingVeto('1m', 'bear', [blockGap('5m', { expiredAt: w(9, 42) })], w(9, 45)), null);
 }
 
 if (failures) { console.log(failures + ' FAILURES'); process.exit(1); }

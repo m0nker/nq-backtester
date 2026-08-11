@@ -7,6 +7,7 @@
 // new sessions) and to the session's config row (survives resume).
 
 import { useState } from 'react';
+import BotScopePanel from '@/components/bot/BotScopePanel';
 import { useBot, type CandidateAction } from '@/lib/concepts/botStore';
 import type { RiskMode } from '@/lib/concepts/engine';
 import { TRIGGER_TFS_ALL } from '@/lib/concepts/fvg';
@@ -55,6 +56,7 @@ export default function BotPanel() {
   const loading = useReplay((s) => s.loading);
 
   const [open, setOpen] = useState(false);
+  const [scopeOpen, setScopeOpen] = useState(false);
   const [dir, setDir] = useState<'long' | 'short'>('long');
   const [until, setUntil] = useState('');
 
@@ -135,6 +137,18 @@ export default function BotPanel() {
       <span className="flex-1" />
 
       <button
+        className={`rounded border px-2.5 py-1 ${
+          scopeOpen
+            ? 'border-teal-400 bg-teal-500/20 text-teal-200'
+            : 'border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800'
+        }`}
+        title="Live scope — armed conditions, per-timeframe IFVG scan, and why a trigger was or wasn't taken"
+        onClick={() => setScopeOpen((v) => !v)}
+      >
+        Scope
+      </button>
+
+      <button
         className="rounded border border-slate-700 bg-slate-900 px-2.5 py-1 text-slate-300 hover:bg-slate-800 disabled:opacity-40"
         title="Jump to the next trading day's 09:25 ET"
         disabled={loading}
@@ -142,6 +156,8 @@ export default function BotPanel() {
       >
         Next day ⇥
       </button>
+
+      {scopeOpen && <BotScopePanel onClose={() => setScopeOpen(false)} />}
 
       {open && (
         <div className="absolute left-2 top-full z-50 mt-1 w-[21rem] rounded-lg border border-slate-700 bg-[#0d1119] p-3 shadow-2xl">

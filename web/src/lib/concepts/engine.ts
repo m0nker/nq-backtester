@@ -200,6 +200,53 @@ export interface ArmedCondition {
   armedAt: number; // open time of the tapping 1m bar
 }
 
+// ---- trigger diagnostics ----
+// Why a detected inversion did or didn't become a candidate. Every `continue`
+// in matchTriggers records one of these, so the UI can answer "there WAS a 1m
+// IFVG — why didn't the bot take it?" without re-deriving the rules.
+export type TriggerResult =
+  | 'candidate'
+  | 'duplicate' // already shown once (dedupe key)
+  | 'window' // confirmation landed outside the execution window
+  | 'vetoed' // a filled same-or-higher trigger TF gap owns this move
+  | 'no-bias' // no live bias entry in that direction
+  | 'no-condition' // no armed condition FVG aligned at the confirmation
+  | 'geometry'; // stop on the wrong side of the estimated entry
+
+export interface TriggerOutcome {
+  tf: Timeframe;
+  formedAt: number;
+  direction: BiasDirection;
+  confirmTs: number;
+  result: TriggerResult;
+  blockedBy?: Timeframe; // set when result === 'vetoed'
+}
+
+// The filled-gap veto evaluated as a STANDING condition rather than at an
+// inversion: "if a `dir` gap on `tf` inverted right now, which same-or-higher
+// timeframe would suppress it?" This is what makes the veto visible BEFORE a
+// trigger fires — the case the user kept hitting with 1m inversions.
+export function standingVeto(
+  tf: Timeframe,
+  dir: FVGDir,
+  pool: FVG[],
+  at: number,
+): Timeframe | null {
+  // No self-exclusion here (unlike the per-inversion check): this asks about
+  // a hypothetical future inversion, and a filled SAME-TF gap blocks too.
+  const hit = pool.find(
+    (b) =>
+      b.dir === dir &&
+      tfSec(b.tf) >= tfSec(tf) &&
+      b.formedAt <= at &&
+      b.tappedAt !== null &&
+      b.tappedAt <= at &&
+      (b.invertedAt === null || b.invertedAt > at) &&
+      (b.expiredAt === null || b.expiredAt > at),
+  );
+  return hit ? hit.tf : null;
+}
+
 // A draft carries ONE condition shape: `condition` (armed FVG — the FVG
 // strategy) or `dol` (swept draw on liquidity — the mech model).
 export interface CandidateDraft {
@@ -238,6 +285,8 @@ export function matchTriggers(opts: {
   // still-filled 4m can't veto a 5m close, which lands first by bucket
   // timing).
   blockers?: FVG[];
+  // optional diagnostics sink — every considered inversion appends one entry
+  diag?: TriggerOutcome[];
 }): CandidateDraft[] {
   const out: CandidateDraft[] = [];
   for (const trig of opts.triggers) {
@@ -246,27 +295,39 @@ export function matchTriggers(opts: {
     // a bearish gap inverting bullishly triggers a LONG; mirror for shorts
     const direction: BiasDirection = trig.dir === 'bear' ? 'long' : 'short';
     const candidateId = `${trig.tf}:${trig.formedAt}:${direction}`;
-    if (opts.fired.has(candidateId)) continue;
-    if (!inExecutionWindow(confirmTs, opts.window)) continue;
+    const note = (result: TriggerResult, blockedBy?: Timeframe) => {
+      opts.diag?.push({ tf: trig.tf, formedAt: trig.formedAt, direction, confirmTs, result, blockedBy });
+    };
+    if (opts.fired.has(candidateId)) {
+      note('duplicate');
+      continue;
+    }
+    if (!inExecutionWindow(confirmTs, opts.window)) {
+      note('window');
+      continue;
+    }
 
-    if (
-      opts.blockers?.some(
-        (b) =>
-          !(b.tf === trig.tf && b.formedAt === trig.formedAt) && // not the trigger itself
-          b.dir === trig.dir &&
-          tfSec(b.tf) >= tfSec(trig.tf) && // same-or-higher TF (locked: same TF blocks too)
-          b.formedAt <= confirmTs &&
-          b.tappedAt !== null &&
-          b.tappedAt <= confirmTs && // 'filled' at confirmation (unfilled never blocks)
-          (b.invertedAt === null || b.invertedAt > confirmTs) &&
-          (b.expiredAt === null || b.expiredAt > confirmTs),
-      )
-    ) {
+    const blocker = opts.blockers?.find(
+      (b) =>
+        !(b.tf === trig.tf && b.formedAt === trig.formedAt) && // not the trigger itself
+        b.dir === trig.dir &&
+        tfSec(b.tf) >= tfSec(trig.tf) && // same-or-higher TF (locked: same TF blocks too)
+        b.formedAt <= confirmTs &&
+        b.tappedAt !== null &&
+        b.tappedAt <= confirmTs && // 'filled' at confirmation (unfilled never blocks)
+        (b.invertedAt === null || b.invertedAt > confirmTs) &&
+        (b.expiredAt === null || b.expiredAt > confirmTs),
+    );
+    if (blocker) {
+      note('vetoed', blocker.tf);
       continue;
     }
 
     const bias = opts.biases.find((b) => b.direction === direction && biasAliveAt(b, confirmTs));
-    if (!bias) continue;
+    if (!bias) {
+      note('no-bias');
+      continue;
+    }
 
     const wantDir = direction === 'long' ? 'bull' : 'bear';
     const sessionOpen = sessionOpenOf(confirmTs);
@@ -278,7 +339,10 @@ export function matchTriggers(opts: {
         (gap.invertedAt === null || gap.invertedAt > confirmTs) &&
         (gap.expiredAt === null || gap.expiredAt > confirmTs),
     );
-    if (matched.length === 0) continue;
+    if (matched.length === 0) {
+      note('no-condition');
+      continue;
+    }
     // primary condition = highest timeframe (matches "highest TF" instinct;
     // its tap anchors the retracement swing for the stop)
     const primary = matched.reduce((a, b) => (tfSec(b.gap.tf) > tfSec(a.gap.tf) ? b : a));
@@ -292,9 +356,16 @@ export function matchTriggers(opts: {
       if (bar.t < primary.armedAt || bar.t >= confirmTs) continue;
       stop = direction === 'long' ? Math.min(stop, bar.l) : Math.max(stop, bar.h);
     }
-    if (!Number.isFinite(stop) || entryEst === null) continue;
+    if (!Number.isFinite(stop) || entryEst === null) {
+      note('geometry');
+      continue;
+    }
     // degenerate geometry (stop on the wrong side of the estimated entry)
-    if (direction === 'long' ? stop >= entryEst : stop <= entryEst) continue;
+    if (direction === 'long' ? stop >= entryEst : stop <= entryEst) {
+      note('geometry');
+      continue;
+    }
+    note('candidate');
 
     out.push({
       candidateId,
