@@ -9,7 +9,7 @@
 // axis price lines. Auto-scroll follows the newest candle only while the
 // user is parked at the right edge; panning away disarms it.
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   CandlestickSeries,
   ColorType,
@@ -22,6 +22,8 @@ import {
 } from 'lightweight-charts';
 import DrawingLayer, { type ChartGeo } from '@/components/DrawingLayer';
 import FVGLayer from '@/components/FVGLayer';
+import SessionLayer from '@/components/SessionLayer';
+import { useConcepts, type ChartColors } from '@/lib/concepts/store';
 import { isSubMinute, sources, type InstrumentId } from '@/lib/data/barSource';
 import { useReplay } from '@/lib/replay/clock';
 import { fmtPts, fmtUsd, ptsToUsd, roundToTick } from '@/lib/trading/contractMath';
@@ -44,6 +46,11 @@ interface DragState {
   y: number;
 }
 
+const gridColor = (c: ChartColors): string => {
+  const n = parseInt(c.grid.slice(1), 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${c.gridOpacityPct / 100})`;
+};
+
 export default function ReplayChart({ instrument, tradingEnabled, clickMode, onRewindClick, onPriceClick }: Props) {
   const source = sources[instrument];
   const containerRef = useRef<HTMLDivElement>(null);
@@ -60,6 +67,8 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
   const [drag, setDrag] = useState<DragState | null>(null);
   const dragRef = useRef<DragState | null>(null);
 
+  const chartColors = useConcepts((s) => s.chartColors);
+  const followTail = useConcepts((s) => s.followTail);
   const currentTime = useReplay((s) => s.currentTime);
   const timeframe = useReplay((s) => s.timeframes[instrument]);
   const dataVersion = useReplay((s) => s.dataVersion);
@@ -77,18 +86,42 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
   const clickRef = useRef({ clickMode, onRewindClick, onPriceClick });
   clickRef.current = { clickMode, onRewindClick, onPriceClick };
 
+  // ALL overlay repositioning funnels through this rAF-coalesced bump — one
+  // React render per frame, and never a setState in the same synchronous
+  // chain as the store update that caused it. Calling setOverlayTick
+  // directly from the data effect used to chain a nested update onto every
+  // clock tick, which at high autoplay speeds tripped React's
+  // maximum-update-depth guard.
+  const bumpOverlay = useCallback(() => {
+    if (overlayRaf.current) return;
+    overlayRaf.current = true;
+    requestAnimationFrame(() => {
+      overlayRaf.current = false;
+      setOverlayTick((t) => t + 1);
+    });
+  }, []);
+
   useEffect(() => {
     const el = containerRef.current!;
+    // Colors come from the CHART settings panel (concepts store, persisted,
+    // profile-saveable). The chart canvas itself is TRANSPARENT: the wrapper
+    // div carries the background color, which lets the session-box overlay
+    // slot between the two (z-1) and draw UNDER the candles.
+    const colors = useConcepts.getState().chartColors;
     const chart = createChart(el, {
       layout: {
-        background: { type: ColorType.Solid, color: '#0b0e14' },
-        textColor: '#8b93a7',
+        background: { type: ColorType.Solid, color: 'transparent' },
+        textColor: colors.text,
       },
       grid: {
-        vertLines: { color: '#161b26' },
-        horzLines: { color: '#161b26' },
+        vertLines: { color: gridColor(colors) },
+        horzLines: { color: gridColor(colors) },
       },
-      crosshair: { mode: CrosshairMode.Normal },
+      crosshair: {
+        mode: CrosshairMode.Normal,
+        vertLine: { color: colors.crosshair, labelBackgroundColor: '#2a2e39' },
+        horzLine: { color: colors.crosshair, labelBackgroundColor: '#2a2e39' },
+      },
       timeScale: {
         timeVisible: true,
         secondsVisible: false,
@@ -102,11 +135,14 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
     });
 
     const candles = chart.addSeries(CandlestickSeries, {
-      upColor: '#26a69a',
-      downColor: '#ef5350',
-      borderVisible: false,
-      wickUpColor: '#26a69a',
-      wickDownColor: '#ef5350',
+      upColor: colors.upBody,
+      downColor: colors.downBody,
+      borderVisible: true,
+      borderUpColor: colors.border,
+      borderDownColor: colors.border,
+      wickUpColor: colors.wick,
+      wickDownColor: colors.wick,
+      priceLineColor: colors.priceLine, // dotted current-price line
     });
 
     chart.subscribeClick((param) => {
@@ -118,17 +154,6 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
         if (price !== null) priceClick(price as number);
       }
     });
-
-    // Overlay repositioning coalesces to one React render per frame — a 1h
-    // step on the 1m chart fires 60 range-change callbacks otherwise.
-    const bumpOverlay = () => {
-      if (overlayRaf.current) return;
-      overlayRaf.current = true;
-      requestAnimationFrame(() => {
-        overlayRaf.current = false;
-        setOverlayTick((t) => t + 1);
-      });
-    };
 
     // Pan-left backfill for low timeframes + overlay reposition on pan/zoom.
     chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
@@ -179,6 +204,34 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
       priceLineMap.current.clear();
     };
   }, [instrument]);
+
+  // Live recolor: the chart is created once per instrument; color edits in
+  // the CHART panel (or a profile apply) restyle it in place.
+  useEffect(() => {
+    const chart = chartRef.current;
+    const series = candlesRef.current;
+    if (!chart || !series) return;
+    chart.applyOptions({
+      layout: { textColor: chartColors.text },
+      grid: {
+        vertLines: { color: gridColor(chartColors) },
+        horzLines: { color: gridColor(chartColors) },
+      },
+      crosshair: {
+        vertLine: { color: chartColors.crosshair },
+        horzLine: { color: chartColors.crosshair },
+      },
+    });
+    series.applyOptions({
+      upColor: chartColors.upBody,
+      downColor: chartColors.downBody,
+      borderUpColor: chartColors.border,
+      borderDownColor: chartColors.border,
+      wickUpColor: chartColors.wick,
+      wickDownColor: chartColors.wick,
+      priceLineColor: chartColors.priceLine,
+    });
+  }, [chartColors]);
 
   useEffect(() => {
     if (currentTime === null || !candlesRef.current) return;
@@ -235,7 +288,10 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
     //   ("6 bars right of the last bar"), correct whenever the data commits.
     const rewound = prevTimeRef.current !== null && currentTime < prevTimeRef.current;
     const tfSwitched = prevTfRef.current !== timeframe;
-    if (needsFullPaint.current || rewound || tfSwitched) {
+    // followTail: keep the newest candle pinned 6 bars from the right edge on
+    // EVERY advance — the user's "price always at a fixed spot" mode for fast
+    // playback and day jumps (toggle button next to ⇥).
+    if (needsFullPaint.current || rewound || tfSwitched || followTail) {
       // scrollToPosition(_, false) queues a base-RELATIVE right-offset
       // invalidation that LWC applies IN ORDER after the setData above —
       // correct whatever the new dataset's index space is. Never use
@@ -248,8 +304,8 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
     needsFullPaint.current = false;
     prevTimeRef.current = currentTime;
     prevTfRef.current = timeframe;
-    setOverlayTick((t) => t + 1);
-  }, [currentTime, timeframe, dataVersion]);
+    bumpOverlay(); // rAF-deferred: never a nested update on the clock tick
+  }, [currentTime, timeframe, dataVersion, followTail, bumpOverlay]);
 
   // Axis price lines for orders + position (traded instrument only).
   useEffect(() => {
@@ -309,8 +365,8 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
         );
       }
     }
-    setOverlayTick((t) => t + 1);
-  }, [workingOrders, position, tradingEnabled, schema]);
+    bumpOverlay();
+  }, [workingOrders, position, tradingEnabled, schema, bumpOverlay]);
 
   // ---- draggable chip overlay ----
 
@@ -480,20 +536,27 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
   }
 
   return (
-    <div className="relative h-full w-full">
+    // wrapper carries the canvas color; the chart itself is transparent so
+    // the session overlay (z-1) draws under the candles (chart div z-2)
+    <div className="relative h-full w-full" style={{ background: chartColors.background }}>
+      <SessionLayer
+        instrument={instrument}
+        chartRef={chartRef}
+        seriesRef={candlesRef}
+        geoRef={geoRef}
+        overlayTick={overlayTick}
+      />
       <div
         ref={containerRef}
-        className={`h-full w-full ${clickMode !== 'none' ? 'cursor-crosshair' : ''}`}
+        className={`relative z-[2] h-full w-full ${clickMode !== 'none' ? 'cursor-crosshair' : ''}`}
       />
-      {instrument === 'NQ' && (
-        <FVGLayer
-          instrument={instrument}
-          chartRef={chartRef}
-          seriesRef={candlesRef}
-          geoRef={geoRef}
-          overlayTick={overlayTick}
-        />
-      )}
+      <FVGLayer
+        instrument={instrument}
+        chartRef={chartRef}
+        seriesRef={candlesRef}
+        geoRef={geoRef}
+        overlayTick={overlayTick}
+      />
       <DrawingLayer
         instrument={instrument}
         chartRef={chartRef}
@@ -543,13 +606,26 @@ export default function ReplayChart({ instrument, tradingEnabled, clickMode, onR
             {ghost.text}
           </div>
         )}
-        <button
-          className="pointer-events-auto absolute bottom-16 right-20 rounded border border-slate-700 bg-slate-900/90 px-2 py-1 text-sm text-slate-300 hover:bg-slate-800"
-          title="Recenter on the current candle"
-          onClick={() => chartRef.current?.timeScale().scrollToPosition(6, false)}
-        >
-          ⇥
-        </button>
+        <div className="pointer-events-auto absolute bottom-16 right-20 flex gap-1">
+          <button
+            className={`rounded border px-2 py-1 text-sm ${
+              followTail
+                ? 'border-amber-500 bg-amber-950/80 text-amber-300'
+                : 'border-slate-700 bg-slate-900/90 text-slate-300 hover:bg-slate-800'
+            }`}
+            title="Follow price — keep the newest candle pinned at a fixed spot on every advance (fast playback / day jumps never leave the chart behind)"
+            onClick={() => useConcepts.getState().setFollowTail(!followTail)}
+          >
+            follow
+          </button>
+          <button
+            className="rounded border border-slate-700 bg-slate-900/90 px-2 py-1 text-sm text-slate-300 hover:bg-slate-800"
+            title="Recenter on the current candle"
+            onClick={() => chartRef.current?.timeScale().scrollToPosition(6, false)}
+          >
+            ⇥
+          </button>
+        </div>
       </div>
     </div>
   );

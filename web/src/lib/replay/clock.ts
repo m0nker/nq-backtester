@@ -87,7 +87,7 @@ export const useReplay = create<ReplayState>((set, get) => {
     endTs: null,
     timeframes: { NQ: '5m', ES: '5m' },
     focused: 'NQ',
-    stepSize: 'view',
+    stepSize: '1m', // default: fixed 1m steps, independent of the chart timeframe
     playing: false,
     speed: 5,
     dataVersion: 0,
@@ -212,7 +212,7 @@ export const useReplay = create<ReplayState>((set, get) => {
 
     reset: () => {
       clearTimer();
-      set({ currentTime: null, startTs: null, endTs: null, playing: false });
+      set({ currentTime: null, startTs: null, endTs: null, playing: false, stepSize: '1m' });
     },
   };
 });

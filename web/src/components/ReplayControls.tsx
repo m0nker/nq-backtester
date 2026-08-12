@@ -191,7 +191,7 @@ export default function ReplayControls({ rewindMode, setRewindMode }: Props) {
         setTimeframe('1m', inst);
       }
     }
-    if (stepSize !== 'view' && (stepSize === '1s' || isSubMinute(stepSize)) && !subOkNQ) setStepSize('view');
+    if (stepSize !== 'view' && (stepSize === '1s' || isSubMinute(stepSize)) && !subOkNQ) setStepSize('1m');
   }, [currentTime, timeframes, stepSize, subOkNQ, setTimeframe, setStepSize]);
 
   const btn =
