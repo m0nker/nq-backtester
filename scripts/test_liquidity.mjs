@@ -1,5 +1,6 @@
 // Unit-check the draws-on-liquidity core (web/src/lib/concepts/liquidity.ts):
-// level detection, sweep arming, the two timer rules, terminal invalidation.
+// level detection, sweep arming/RE-arming, the two timer rules, invalidation
+// (a death stands only until the next qualifying raid), trigger matching.
 // Run from repo root: node scripts/test_liquidity.mjs
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -9,10 +10,11 @@ import { writeFileSync } from 'node:fs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const test = `
 import {
-  foldSweep, freshSweepState, isArmed, levelLifespanSec, levelsAt, matchSweepTriggers,
-  sweptSet, triggerWindowSec,
+  MECH_TRIGGER_TFS, foldSweep, freshSweepState, isArmed, levelLifespanSec, levelsAt,
+  matchSweepTriggers, sweptSet, triggerWindowSec,
   type ArmedSweep, type DOLLevel, type LevelDataSource, type SweepRules, type SweepState,
 } from './src/lib/concepts/liquidity';
+import type { TriggerOutcome } from './src/lib/concepts/engine';
 import type { FVG } from './src/lib/concepts/fvg';
 import { etWallToUtc } from './src/lib/time/et';
 import type { Bar, Timeframe } from './src/lib/types';
@@ -28,8 +30,11 @@ function check(name: string, got: unknown, want: unknown) {
   if (!ok) failures++;
 }
 
+// resweepWindowSec = 30m (the shipped default) — every fixture below keeps its
+// raids inside it unless the test is specifically about the window expiring.
 const RULES = (p: Partial<SweepRules> = {}): SweepRules => ({
-  invalidationPts: 40, maxCandles: 6, maxMinutes: 20, slowestTriggerSec: 300, ...p,
+  invalidationPts: 40, maxCandles: 6, maxMinutes: 20, slowestTriggerSec: 300,
+  resweepWindowSec: 1800, ...p,
 });
 const lvl = (p: Partial<DOLLevel> = {}): DOLLevel => ({
   id: 'london:sellside:2025-01-02', kind: 'london', side: 'sellside',
@@ -73,7 +78,7 @@ const lvl = (p: Partial<DOLLevel> = {}): DOLLevel => ({
   check('buyside-arms', [up.sweptAt, up.wm], [w(9, 31), 22005]);
 }
 
-// ---- TIMER death: no inversion inside the lifespan -> dead, terminal ----
+// ---- TIMER death: no inversion inside the lifespan -> dead until re-swept ----
 {
   const L = lvl();
   const swept = foldSweep(L, freshSweepState(L), [bar(w(9, 31), 21940, 21945, 21895, 21930)], RULES(), w(9, 32));
@@ -84,9 +89,16 @@ const lvl = (p: Partial<DOLLevel> = {}): DOLLevel => ({
   // still inside the window -> alive
   const early = foldSweep(L, swept, [bar(w(9, 40), 21930, 21935, 21925, 21930)], RULES(), w(9, 41));
   check('timer-alive-inside', isArmed(early), true);
-  // TERMINAL: a deeper raid after death does NOT re-arm
-  const deeper = foldSweep(L, late, [bar(w(10, 10), 21930, 21935, 21880, 21890)], RULES(), w(10, 11));
-  check('no-rearm-after-timer', [deeper.sweptAt, deeper.deadAt !== null], [w(9, 31), true]);
+  // revised 2026-08-12: a deeper qualifying raid RE-ARMS a timed-out level
+  // (RETIMED 2026-08-12 from 10:10 to 09:58 — the resweep window now expires
+  // 30m after the FIRST sweep at 09:31, and this test is about the TIMER)
+  const deeper = foldSweep(L, late, [bar(w(9, 58), 21930, 21935, 21880, 21890)], RULES(), w(9, 59));
+  check('rearms-after-timer-death', [deeper.sweptAt, deeper.deadAt, deeper.firstSweptAt],
+    [w(9, 58), null, w(9, 31)]);
+  check('rearmed-is-armed', isArmed(deeper), true);
+  // ...but only a DEEPER one: a shallower raid leaves the death standing
+  const shallow = foldSweep(L, late, [bar(w(9, 58), 21930, 21935, 21897, 21930)], RULES(), w(9, 59));
+  check('shallow-raid-no-rearm', [shallow.sweptAt, shallow.deadAt], [w(9, 31), w(9, 31) + 1200]);
   // time passing with NO new bars still kills it (now argument)
   const byClock = foldSweep(L, swept, [], RULES(), w(10, 30));
   check('timer-kills-without-bars', byClock.deadAt, w(9, 31) + 1200);
@@ -102,21 +114,73 @@ const lvl = (p: Partial<DOLLevel> = {}): DOLLevel => ({
   check('distance-beyond-kills', beyond.deadAt, w(9, 35));
   const inside = foldSweep(L, swept, [bar(w(9, 35), 21930, 21935, 21870, 21930)], RULES(), w(9, 36));
   check('inside-band-survives', isArmed(inside), true);
-  // TERMINAL here too
+  // revised 2026-08-12: a run AWAY from the level kills the arming, and a
+  // later deeper raid inside the band re-arms it
+  const again = foldSweep(L, away, [bar(w(9, 45), 21930, 21935, 21875, 21890)], RULES(), w(9, 46));
+  check('rearms-after-distance-death', [again.sweptAt, again.deadAt], [w(9, 45), null]);
+  // a BREAKOUT is the death that stays dead: the watermark is now farther
+  // than invalidationPts from the level, so no deeper raid can qualify again
   const retry = foldSweep(L, beyond, [bar(w(9, 40), 21890, 21899, 21885, 21895)], RULES(), w(9, 41));
-  check('no-rearm-after-distance', isArmed(retry), false);
+  check('breakout-shallower-no-rearm', isArmed(retry), false);
+  const retryDeep = foldSweep(L, beyond, [bar(w(9, 40), 21830, 21835, 21810, 21815)], RULES(), w(9, 41));
+  check('breakout-deeper-no-rearm', [retryDeep.sweptAt, isArmed(retryDeep)], [w(9, 31), false]);
   // a raid that opens ALREADY out of band never arms in the first place
   const far = foldSweep(L, freshSweepState(L), [bar(w(9, 31), 21930, 21935, 21820, 21830)], RULES(), w(9, 32));
   check('out-of-band-never-arms', far.sweptAt, null);
+  // and it can never arm afterwards either — shallower prints are inside the
+  // watermark, deeper ones are even farther outside the band
+  const afterBreak = foldSweep(L, far, [
+    bar(w(9, 35), 21870, 21880, 21865, 21875), // back inside the band, above the wm
+    bar(w(9, 40), 21870, 21875, 21810, 21815), // deeper, but 90 pts past the level
+  ], RULES(), w(9, 41));
+  check('breakout-never-arms-later', afterBreak.sweptAt, null);
 }
 
-// ---- one arm per level, ever (no re-arm even while alive) ----
+// ---- a deeper raid while ARMED restarts the clock (revised 2026-08-12) ----
 {
   const L = lvl();
   const s1 = foldSweep(L, freshSweepState(L), [bar(w(9, 31), 21940, 21945, 21895, 21930)], RULES(), w(9, 32));
   const s2 = foldSweep(L, s1, [bar(w(9, 33), 21930, 21935, 21885, 21930)], RULES(), w(9, 34));
-  check('sweptAt-is-first-raid', s2.sweptAt, w(9, 31));
+  check('resweep-moves-sweptAt', [s2.sweptAt, s2.deadAt], [w(9, 33), null]);
+  // the resweep window's anchor stays on the FIRST raid, not the latest
+  check('firstSweptAt-anchors-first-raid', [s1.firstSweptAt, s2.firstSweptAt], [w(9, 31), w(9, 31)]);
   check('watermark-tracks-deepest', s2.wm, 21885);
+  // the 20m cap now runs from 09:33, not 09:31: alive at 09:52, dead at 09:54
+  check('deadline-restarts', isArmed(foldSweep(L, s2, [], RULES(), w(9, 52))), true);
+  check('deadline-restarts-death', foldSweep(L, s2, [], RULES(), w(9, 54)).deadAt, w(9, 33) + 1200);
+}
+
+// ---- RESWEEP VALIDITY WINDOW (added 2026-08-12) ----
+// After the FIRST sweep the level is a valid DOL for resweepWindowSec; past
+// that a deeper qualifying raid no longer re-arms it, only deepens its wm.
+{
+  const L = lvl();
+  const first = foldSweep(L, freshSweepState(L), [bar(w(9, 31), 21940, 21945, 21895, 21930)], RULES(), w(9, 32));
+  check('window-first-sweep-anchors', [first.sweptAt, first.firstSweptAt], [w(9, 31), w(9, 31)]);
+  // inside the 30m window (09:31 -> 10:01): a deeper raid re-arms as before
+  const inside = foldSweep(L, first, [bar(w(9, 51), 21930, 21935, 21885, 21930)], RULES(), w(9, 52));
+  check('window-inside-rearms', [inside.sweptAt, inside.deadAt, inside.firstSweptAt],
+    [w(9, 51), null, w(9, 31)]);
+  // OUTSIDE it: sweptAt/deadAt frozen, but the watermark still advances (a
+  // breakout has to be able to retire the level even after the window)
+  const late = foldSweep(L, first, [bar(w(10, 5), 21930, 21935, 21875, 21930)], RULES(), w(10, 6));
+  check('window-outside-no-rearm', [late.sweptAt, late.firstSweptAt], [w(9, 31), w(9, 31)]);
+  check('window-outside-advances-wm', late.wm, 21875);
+  // (the arming from 09:31 is long dead on the 20m cap by 10:06 — the point
+  // is that the 10:05 raid did not revive it)
+  check('window-outside-still-dead', [isArmed(late), late.deadAt], [false, w(9, 31) + 1200]);
+  // the boundary is inclusive
+  const edge = foldSweep(L, first, [bar(w(10, 1), 21930, 21935, 21885, 21930)], RULES(), w(10, 2));
+  check('window-boundary-inclusive', edge.sweptAt, w(10, 1));
+  const past = foldSweep(L, first, [bar(w(10, 2), 21930, 21935, 21885, 21930)], RULES(), w(10, 3));
+  check('window-boundary-exclusive-after', past.sweptAt, w(9, 31));
+
+  // ANCHORED AT THE FIRST SWEEP, not the latest: t0 = 09:31, resweep at
+  // 09:51 (inside), a third deeper raid at 10:11 — only 20m after the LAST
+  // re-arm but 40m after the first, so it must NOT re-arm.
+  const third = foldSweep(L, inside, [bar(w(10, 11), 21930, 21935, 21870, 21930)], RULES(), w(10, 12));
+  check('window-anchored-at-first-not-latest', [third.sweptAt, third.firstSweptAt, third.wm],
+    [w(9, 51), w(9, 31), 21870]);
 }
 
 // ---- matchSweepTriggers: per-TF deadline decides, not just the level ----
@@ -173,11 +237,57 @@ check('confirm-after-death-rejected',
 // inversion BEFORE the sweep never counts
 check('confirm-before-sweep',
   matchSweepTriggers({ ...mBase, sweeps: [sweep({ sweptAt: w(9, 40) })], triggers: [trigAt('1m', 36)] }).length, 0);
-// most recent qualifying raid is the primary
+// PRIMARY = the most EXTREME matched draw (revised 2026-08-12, supersedes
+// "most recent raid"): a leg that ran through LDN H into PDH is a raid on PDH.
 {
-  const older = sweep({ level: lvl({ id: 'pd:sellside:x', kind: 'pd', price: 21890, label: 'PDL' }), sweptAt: w(9, 30) });
-  const c = matchSweepTriggers({ ...mBase, sweeps: [older, sweep()], triggers: [trigAt('1m', 36)] });
-  check('primary-most-recent', c[0].dol?.label, 'LDN L');
+  // (a) two BUYSIDE levels swept on the SAME bar -> the higher one is the play
+  //     (the user's live case: LDN H 29427.75 run through into PDH 29479.50)
+  const ldnH = sweep({ level: lvl({ id: 'london:buyside:x', side: 'buyside', price: 29427.75, label: 'LDN H' }) });
+  const pdH = sweep({ level: lvl({ id: 'pd:buyside:x', kind: 'pd', side: 'buyside', price: 29479.5, label: 'PDH' }) });
+  const up = [
+    bar(w(9, 30), 29400, 29410, 29395, 29405),
+    bar(w(9, 31), 29405, 29500, 29400, 29450), // the raid through both; high = the stop
+    bar(w(9, 35), 29450, 29455, 29430, 29440),
+  ];
+  const c = matchSweepTriggers({
+    ...mBase, bars1m: up, sweeps: [ldnH, pdH],
+    triggers: [{ ...trigAt('1m', 36), dir: 'bull' as const }],
+  });
+  check('primary-most-extreme-buyside', [c.length, c[0].dol?.label, c[0].direction], [1, 'PDH', 'short']);
+  // order in the array must not decide it
+  const rev = matchSweepTriggers({
+    ...mBase, bars1m: up, sweeps: [pdH, ldnH],
+    triggers: [{ ...trigAt('1m', 36), dir: 'bull' as const }],
+  });
+  check('primary-extreme-order-independent', rev[0].dol?.label, 'PDH');
+}
+{
+  // (b) SELLSIDE, swept at different times: the London low at 09:30, then PDL
+  //     BELOW it at 09:31 with no trigger in between -> PDL is the condition
+  //     (this is the case the old most-recent rule happened to get right, and
+  //     it stays right — but now because PDL is the LOWER level)
+  const pdl = sweep({ level: lvl({ id: 'pd:sellside:x', kind: 'pd', price: 21890, label: 'PDL' }), sweptAt: w(9, 31) });
+  const ldn = sweep({ sweptAt: w(9, 30) }); // LDN L at 21900
+  const c = matchSweepTriggers({ ...mBase, sweeps: [ldn, pdl], triggers: [trigAt('1m', 36)] });
+  check('primary-most-extreme-sellside', c[0].dol?.label, 'PDL');
+  // ...and the LOWER level wins even when the shallower one was swept LATER
+  const lateLdn = sweep({ sweptAt: w(9, 33) });
+  check('primary-extreme-beats-recency',
+    matchSweepTriggers({ ...mBase, sweeps: [lateLdn, pdl], triggers: [trigAt('1m', 36)] })[0].dol?.label, 'PDL');
+}
+{
+  // (c) selection runs over the MATCHED set only: an extreme level that is
+  //     dead (or out of deadline) never wins — the nearer valid one is used
+  const deadPdl = sweep({
+    level: lvl({ id: 'pd:sellside:x', kind: 'pd', price: 21890, label: 'PDL' }), deadAt: w(9, 34),
+  });
+  check('primary-extreme-must-be-matched',
+    matchSweepTriggers({ ...mBase, sweeps: [deadPdl, sweep()], triggers: [trigAt('1m', 36)] })[0].dol?.label, 'LDN L');
+  const stalePdl = sweep({
+    level: lvl({ id: 'pd:sellside:x', kind: 'pd', price: 21890, label: 'PDL' }), sweptAt: w(9, 20),
+  }); // 09:20 + 6m (1m deadline) = 09:26 < the 09:36 confirm
+  check('primary-extreme-past-deadline-skipped',
+    matchSweepTriggers({ ...mBase, sweeps: [stalePdl, sweep()], triggers: [trigAt('1m', 36)] })[0].dol?.label, 'LDN L');
 }
 // execution window still gates
 check('sweep-outside-window',
@@ -187,6 +297,129 @@ check('sweep-outside-window',
   const blocker = mkGap({ tf: '5m', dir: 'bear', top: 21940, bottom: 21920, formedAt: w(9, 20), tappedAt: w(9, 33) });
   check('sweep-veto-higher-filled',
     matchSweepTriggers({ ...mBase, triggers: [trigAt('1m', 36)], blockers: [blocker] }).length, 0);
+  // a blocker a resweep retired stops vetoing (same machinery as the FVG bot)
+  check('sweep-cleared-blocker-passes',
+    matchSweepTriggers({ ...mBase, triggers: [trigAt('1m', 36)], blockers: [blocker],
+      clearedBlockers: new Set(['5m:' + w(9, 20)]) }).length, 1);
+  // diagnostics: the veto names the timeframe that owns the move
+  const dVeto: TriggerOutcome[] = [];
+  matchSweepTriggers({ ...mBase, triggers: [trigAt('1m', 36)], blockers: [blocker], diag: dVeto });
+  check('diag-vetoed', [dVeto.length, dVeto[0].result, dVeto[0].blockedBy], [1, 'vetoed', '5m']);
+}
+// diagnostics: a timing miss reports 'no-sweep', a clean match 'candidate'
+{
+  const dMiss: TriggerOutcome[] = [];
+  matchSweepTriggers({ ...mBase, triggers: [trigAt('1m', 38)], diag: dMiss });
+  check('diag-no-sweep', [dMiss.length, dMiss[0].result], [1, 'no-sweep']);
+  const dOk: TriggerOutcome[] = [];
+  matchSweepTriggers({ ...mBase, triggers: [trigAt('1m', 36)], diag: dOk });
+  check('diag-candidate', [dOk.length, dOk[0].result], [1, 'candidate']);
+  const dDupe: TriggerOutcome[] = [];
+  matchSweepTriggers({ ...mBase, triggers: [trigAt('1m', 36)], fired: new Set(['1m:' + w(9, 32) + ':long']), diag: dDupe });
+  check('diag-duplicate', [dDupe.length, dDupe[0].result], [1, 'duplicate']);
+  const dWin: TriggerOutcome[] = [];
+  matchSweepTriggers({ ...mBase, window: { startSec: 10 * 3600, endSec: 11 * 3600 }, triggers: [trigAt('1m', 36)], diag: dWin });
+  check('diag-window', [dWin.length, dWin[0].result], [1, 'window']);
+}
+// the mech model's trigger scan set — no sub-minute TFs
+check('mech-trigger-tfs', MECH_TRIGGER_TFS, ['1m', '2m', '3m', '4m', '5m']);
+
+// ---- MECH 2 (added 2026-08-12): Infinity timers + in-session arming ----
+// Its rules object is the same shape with the two timers at Infinity, so
+// triggerWindowSec/levelLifespanSec are Infinity and the DISTANCE rule in
+// foldSweep is the only death.
+const M2 = (p: Partial<SweepRules> = {}): SweepRules =>
+  RULES({ maxCandles: Number.POSITIVE_INFINITY, maxMinutes: Number.POSITIVE_INFINITY, ...p });
+{
+  // (JSON.stringify(Infinity) is "null", so compare identity explicitly)
+  check('m2-window-infinite', triggerWindowSec(M2(), 60) === Number.POSITIVE_INFINITY, true);
+  check('m2-lifespan-infinite', levelLifespanSec(M2()) === Number.POSITIVE_INFINITY, true);
+  // (a) no timer death: a sweep armed hours ago is still armed, and still
+  // matches a confirmation the mech model's 20m cap would have rejected
+  const L = lvl();
+  const swept = foldSweep(L, freshSweepState(L), [bar(w(9, 31), 21940, 21945, 21895, 21930)], M2(), w(9, 32));
+  const hoursLater = foldSweep(L, swept, [bar(w(12, 0), 21930, 21935, 21925, 21930)], M2(), w(13, 0));
+  check('m2-no-timer-death', [hoursLater.sweptAt, hoursLater.deadAt], [w(9, 31), null]);
+  check('m2-clock-alone-never-kills', foldSweep(L, swept, [], M2(), w(16, 0)).deadAt, null);
+  check('m2-late-trigger-matches',
+    matchSweepTriggers({ ...mBase, rules: M2(), triggers: [trigAt('1m', 59)] }).length, 1);
+  // ...while mech-model's 1m deadline (6m from 09:31) rejects the same one
+  check('mech-late-trigger-rejected',
+    matchSweepTriggers({ ...mBase, triggers: [trigAt('1m', 59)] }).length, 0);
+  // the DISTANCE rule still kills under Infinity timers
+  const away = foldSweep(L, swept, [bar(w(9, 35), 21930, 21980, 21925, 21975)], M2(), w(9, 36));
+  check('m2-distance-still-kills', away.deadAt, w(9, 35));
+  const beyond = foldSweep(L, swept, [bar(w(9, 35), 21895, 21900, 21830, 21840)], M2(), w(9, 36));
+  check('m2-breakout-still-kills', beyond.deadAt, w(9, 35));
+  // ...and a deeper qualifying raid still re-arms after a distance death
+  const again = foldSweep(L, away, [bar(w(9, 45), 21930, 21935, 21875, 21890)], M2(), w(9, 46));
+  check('m2-rearms-after-distance-death', [again.sweptAt, again.deadAt], [w(9, 45), null]);
+  // the RESWEEP WINDOW is NOT a timer, so mech-2 honours it too: a finite
+  // window applies even under Infinity maxCandles/maxMinutes
+  const m2Late = foldSweep(L, swept, [bar(w(10, 5), 21930, 21935, 21875, 21930)], M2(), w(10, 6));
+  check('m2-window-outside-no-rearm', [m2Late.sweptAt, m2Late.firstSweptAt, m2Late.wm],
+    [w(9, 31), w(9, 31), 21875]);
+  // ...and with no timer to kill it, the ORIGINAL arming is simply still alive
+  check('m2-window-outside-keeps-original-arming', isArmed(m2Late), true);
+  const m2Inside = foldSweep(L, swept, [bar(w(9, 55), 21930, 21935, 21875, 21930)], M2(), w(9, 56));
+  check('m2-window-inside-rearms', [m2Inside.sweptAt, m2Inside.firstSweptAt], [w(9, 55), w(9, 31)]);
+}
+// (b) armFromSessionOpen: only a sweep at/after 09:30 ET of the
+// CONFIRMATION's trading day can back a candidate
+{
+  const m2Base = { ...mBase, rules: M2(), armFromSessionOpen: true };
+  check('m2-in-session-sweep-accepted',
+    matchSweepTriggers({ ...m2Base, triggers: [trigAt('1m', 36)] }).length, 1);
+  const overnight = [sweep({ sweptAt: w(3, 15) })]; // 03:15 ET raid, still armed
+  check('m2-premarket-sweep-rejected',
+    matchSweepTriggers({ ...m2Base, sweeps: overnight, triggers: [trigAt('1m', 36)] }).length, 0);
+  // the same overnight sweep IS accepted without the flag (mech-model)
+  check('m2-premarket-ok-without-flag',
+    matchSweepTriggers({ ...mBase, rules: M2(), sweeps: overnight, triggers: [trigAt('1m', 36)] }).length, 1);
+  // a stale overnight sweep reads as 'no-sweep' in diag — by design
+  const dPre: TriggerOutcome[] = [];
+  matchSweepTriggers({ ...m2Base, sweeps: overnight, triggers: [trigAt('1m', 36)], diag: dPre });
+  check('m2-premarket-diag-no-sweep', [dPre.length, dPre[0].result], [1, 'no-sweep']);
+  // 09:29:xx is still out (the boundary is 09:30 sharp, inclusive)
+  check('m2-0929-rejected',
+    matchSweepTriggers({ ...m2Base, sweeps: [sweep({ sweptAt: w(9, 29) })], triggers: [trigAt('1m', 36)] }).length, 0);
+  check('m2-0930-accepted',
+    matchSweepTriggers({ ...m2Base, sweeps: [sweep({ sweptAt: w(9, 30) })], triggers: [trigAt('1m', 36)] }).length, 1);
+  // (d) RESWEEP BOOKKEEPING under mech-2's rules: the shared cleared-blocker
+  // machinery must work here exactly as it does for the FVG bot — a blocker
+  // a resweep retired stops vetoing (it re-arms as a blocker upstream, once
+  // price penetrates it deeper than it had been filled).
+  const blocker = mkGap({ tf: '5m', dir: 'bear', top: 21940, bottom: 21920, formedAt: w(9, 20), tappedAt: w(9, 33) });
+  check('m2-veto-higher-filled',
+    matchSweepTriggers({ ...m2Base, triggers: [trigAt('1m', 36)], blockers: [blocker] }).length, 0);
+  check('m2-cleared-blocker-passes',
+    matchSweepTriggers({ ...m2Base, triggers: [trigAt('1m', 36)], blockers: [blocker],
+      clearedBlockers: new Set(['5m:' + w(9, 20)]) }).length, 1);
+}
+// (c) an OVERNIGHT raid's watermark forces the in-session raid to go deeper
+// before it can (re)arm — the exact analog of the FVG bot's "a premarket push
+// sets the level an in-session tap must beat".
+// (RETIMED 2026-08-12: the premarket raid was at 06:15, which the 30m resweep
+// window now puts far out of reach of the 09:35 in-session one. Moved to
+// 09:20 — still premarket, so the armFromSessionOpen assertions below are
+// unchanged, but inside the window so the re-arm is what's being tested.)
+{
+  const L = lvl(); // formedAt = 05:00 (London close), so the raid is at 09:20
+  const overnight = foldSweep(L, freshSweepState(L), [bar(w(9, 20), 21920, 21925, 21885, 21915)], M2(), w(9, 21));
+  check('m2-overnight-sets-watermark', [overnight.sweptAt, overnight.wm], [w(9, 20), 21885]);
+  // an in-session raid that only reaches 21890 is INSIDE the overnight
+  // watermark: sweptAt does not move, so there is still no in-session sweep
+  const shallow = foldSweep(L, overnight, [bar(w(9, 35), 21930, 21935, 21890, 21930)], M2(), w(9, 36));
+  check('m2-shallow-in-session-no-rearm', shallow.sweptAt, w(9, 20));
+  check('m2-shallow-still-rejected',
+    matchSweepTriggers({ ...mBase, rules: M2(), armFromSessionOpen: true,
+      sweeps: [sweep({ sweptAt: shallow.sweptAt! })], triggers: [trigAt('1m', 40)] }).length, 0);
+  // beating it re-arms, and the fresh sweptAt is in-session -> tradeable
+  const deeper = foldSweep(L, overnight, [bar(w(9, 35), 21930, 21935, 21880, 21930)], M2(), w(9, 36));
+  check('m2-deeper-in-session-rearms', [deeper.sweptAt, deeper.deadAt, deeper.wm], [w(9, 35), null, 21880]);
+  check('m2-deeper-now-tradeable',
+    matchSweepTriggers({ ...mBase, rules: M2(), armFromSessionOpen: true,
+      sweeps: [sweep({ sweptAt: deeper.sweptAt! })], triggers: [trigAt('1m', 40)] }).length, 1);
 }
 check('sweep-fired-dedupe',
   matchSweepTriggers({ ...mBase, triggers: [trigAt('1m', 36)], fired: new Set(['1m:' + w(9, 32) + ':long']) }).length, 0);

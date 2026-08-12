@@ -248,6 +248,7 @@ export type TriggerResult =
   | 'vetoed' // a filled same-or-higher trigger TF gap owns this move
   | 'no-bias' // no live bias entry in that direction
   | 'no-condition' // no armed condition FVG aligned at the confirmation
+  | 'no-sweep' // mech model: no armed sweep of the aligned side inside its deadline
   | 'geometry'; // stop on the wrong side of the estimated entry
 
 export interface TriggerOutcome {

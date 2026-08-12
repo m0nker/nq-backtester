@@ -1,5 +1,8 @@
 // Mechanical draws on liquidity (DOL) — the condition side of the MECH MODEL
-// bot, and a chart overlay concept. Pure module: callers feed bars/candles.
+// and MECH 2 bots, and a chart overlay concept. Pure module: callers feed
+// bars/candles. (added 2026-08-12: 'mech-2' runs the same code with Infinity
+// timers and `armFromSessionOpen`, so distance is its only death — see
+// botStore's rulesOf and matchSweepTriggers below.)
 //
 // Level catalog at any time (9 toggleable categories):
 //  - session H/L pairs from fixed ET windows, most recent COMPLETED window
@@ -9,11 +12,20 @@
 //  - swing H/L on 1h / 4h / 1D that aren't already one of the above
 // A high is BUYSIDE liquidity, a low is SELLSIDE.
 //
-// Sweep logic (locked 2026-08-01): a print strictly beyond a level SWEEPS it
+// Sweep logic (revised 2026-08-12 — supersedes the 2026-08-01 "arms at most
+// once, death is terminal" lock): a print strictly beyond a level SWEEPS it
 // — sweeping sellside (a low) arms LONGS, sweeping buyside (a high) arms
-// SHORTS. A level arms AT MOST ONCE and invalidation is TERMINAL: it can
-// never re-arm. (The leg that swept it can of course become a NEW level once
-// it confirms as a swing — that's a different level with its own identity.)
+// SHORTS. A QUALIFYING RAID is a print beyond the level's watermark whose
+// raid extreme is still within `invalidationPts` of the level. The FIRST
+// qualifying raid arms the level and starts the RESWEEP VALIDITY WINDOW
+// (`resweepWindowSec`, user spec 2026-08-12): a later qualifying raid re-arms
+// — `sweptAt` moves to that bar, the deadline restarts and any prior death is
+// erased — ONLY while it lands within `resweepWindowSec` of that FIRST sweep.
+// The window is anchored at the first raid, NOT the latest, so a chain of
+// deeper raids cannot walk it forward indefinitely. Once it passes, the level
+// is no longer a valid DOL for this cycle: deeper raids only deepen the
+// watermark, and whatever arming is already standing just lives out its
+// normal deaths.
 // Three ways an armed sweep dies:
 //  - TIMER, per trigger timeframe: the inversion must land within
 //    `maxCandles` candles OF THAT TIMEFRAME after the sweep (6 candles = 90s
@@ -24,17 +36,29 @@
 //  - DISTANCE: price trading farther than `invalidationPts` from the level
 //    in either direction — beyond it (the raid became a breakout) or away
 //    from it (the reversal ran without a trigger).
+// A death stands only until the next qualifying raid. The one death that IS
+// effectively permanent needs no extra code: a BREAKOUT pushes the watermark
+// more than `invalidationPts` past the level, and any deeper raid is farther
+// still, so nothing can qualify again.
 // The level itself dies once even the SLOWEST enabled trigger TF is out of
 // time; the precise per-TF deadline is enforced at match time.
+//
+// A resweep is not recorded in SweepState — callers detect it by comparing
+// states across a fold (`prev.sweptAt !== null && state.sweptAt > prev.sweptAt`)
+// so the state stays a pure function of the bars it has seen.
 
 import { bucketEnd } from '../replay/aggregate';
 import { etOffsetSec, etWallToUtc } from '../time/et';
 import { TF_SECONDS, isSessionTf, type Bar, type Timeframe } from '../types';
 import {
+  gapKey,
   inExecutionWindow,
+  sessionOpenOf,
   type BiasDirection,
   type CandidateDraft,
   type ExecutionWindow,
+  type TriggerOutcome,
+  type TriggerResult,
 } from './engine';
 import type { FVG } from './fvg';
 
@@ -75,8 +99,12 @@ export interface DOLLevel {
 
 export interface SweepState {
   wm: number; // deepest print beyond the level (== price while unswept)
-  sweptAt: number | null; // 1m bar t of the arming sweep (null = never armed)
-  deadAt: number | null; // invalidation time; non-null is TERMINAL
+  sweptAt: number | null; // 1m bar t of the MOST RECENT arming sweep (null = never armed)
+  deadAt: number | null; // invalidation time; cleared by the next qualifying raid
+  // 1m bar t of the level's FIRST arming sweep — the resweep window's anchor
+  // (added 2026-08-12). Never reset: once the level has been swept, that
+  // moment is what dates the whole cycle, however many resweeps follow.
+  firstSweptAt: number | null;
 }
 
 // How long an armed sweep stays tradeable, per the two timer rules.
@@ -85,11 +113,16 @@ export interface SweepRules {
   maxCandles: number; // candles of the trigger TF allowed to produce the inversion
   maxMinutes: number; // absolute cap from the sweep; overrides the above
   slowestTriggerSec: number; // largest ENABLED trigger TF, for whole-level death
+  // Seconds after the FIRST sweep during which a deeper qualifying raid may
+  // still re-arm the level (added 2026-08-12). Independent of the timers —
+  // mech-2 has none and still honours this.
+  resweepWindowSec: number;
 }
 
 export const DEFAULT_DOL_INVALIDATION_PTS = 40;
 export const DEFAULT_SWEEP_MAX_CANDLES = 6;
 export const DEFAULT_SWEEP_MAX_MINUTES = 20;
+export const DEFAULT_RESWEEP_WINDOW_MINUTES = 30;
 
 // Seconds a trigger on `tf` has after the sweep (candle rule ∧ minute cap).
 export function triggerWindowSec(rules: SweepRules, tfSec: number): number {
@@ -258,9 +291,10 @@ export function levelsAt(src: LevelDataSource, upTo: number, gen = 0): DOLLevel[
   return out;
 }
 
-// Fold bars into a level's sweep state. A level arms at most once, and
-// invalidation (timer, minute cap, or distance) is terminal — `deadAt`
-// records WHEN so a trigger that confirmed before it still counts.
+// Fold bars into a level's sweep state. Every qualifying raid (re)arms it
+// (revised 2026-08-12); invalidation (timer, minute cap, or distance) stands
+// until the next one — `deadAt` records WHEN so a trigger that confirmed
+// before the death still counts.
 export function foldSweep(
   level: DOLLevel,
   state: SweepState,
@@ -268,7 +302,7 @@ export function foldSweep(
   rules: SweepRules,
   now: number,
 ): SweepState {
-  let { wm, sweptAt, deadAt } = state;
+  let { wm, sweptAt, deadAt, firstSweptAt } = state;
   const buy = level.side === 'buyside';
   const lifespan = levelLifespanSec(rules);
   for (const bar of bars) {
@@ -287,18 +321,37 @@ export function foldSweep(
         deadAt = bar.t; // ran away from the level, or blew through it
       }
     }
-    // arms only on the FIRST qualifying raid, and never after any death
-    if (sweptAt === null && deadAt === null && beyondWm && raidIsSweep) sweptAt = bar.t;
+    // A qualifying raid (re)arms — a deeper raid restarts the deadline and
+    // revives a level the timer or distance rule had killed. Ordered after
+    // the death checks so a bar that both strays and raids deeper ends the
+    // advance ARMED: the fresh raid is the state the model trades.
+    //
+    // RESWEEP VALIDITY WINDOW (added 2026-08-12): only the FIRST raid arms
+    // unconditionally. A later one re-arms only within `resweepWindowSec` of
+    // that first sweep — past it the level is spent for this cycle and a
+    // deeper raid changes nothing but the watermark (which MUST still
+    // advance below, or a breakout could never retire the level).
+    if (beyondWm && raidIsSweep) {
+      if (firstSweptAt === null) {
+        firstSweptAt = bar.t;
+        sweptAt = bar.t;
+        deadAt = null;
+      } else if (bar.t <= firstSweptAt + rules.resweepWindowSec) {
+        sweptAt = bar.t;
+        deadAt = null;
+      }
+    }
     if (beyondWm) wm = depth;
   }
   if (sweptAt !== null && deadAt === null && now > sweptAt + lifespan) deadAt = sweptAt + lifespan;
-  return { wm, sweptAt, deadAt };
+  return { wm, sweptAt, deadAt, firstSweptAt };
 }
 
 export const freshSweepState = (level: DOLLevel): SweepState => ({
   wm: level.price,
   sweptAt: null,
   deadAt: null,
+  firstSweptAt: null,
 });
 
 export const isArmed = (s: SweepState): boolean => s.sweptAt !== null && s.deadAt === null;
@@ -364,11 +417,18 @@ export interface ArmedSweep {
 // trigger-TF ordering for the veto (session TFs never appear as triggers)
 const tfRank = (tf: Timeframe): number => (isSessionTf(tf) ? 0 : TF_SECONDS[tf]);
 
+// The mech model's trigger scan set (user spec 2026-08-12: "check 5m, 4m, 3m,
+// 2m, 1m"). Sub-minute inversions are not a rebalance trigger for this model,
+// so they're excluded even when the session has them enabled for the FVG bot.
+export const MECH_TRIGGER_TFS: readonly Timeframe[] = ['1m', '2m', '3m', '4m', '5m'];
+
 // Rule-3 assembly for the mech model: an IFVG inversion confirms against an
 // armed sweep of the ALIGNED side — sweeping sellside (a low) hunts longs,
 // sweeping buyside (a high) hunts shorts. No bias input: the sweep IS the
 // directional read. Trigger-side mechanics (execution window, filled-gap
-// veto across same-or-higher trigger TFs, dedupe) match the FVG model.
+// veto across same-or-higher trigger TFs, resweep-cleared blockers, dedupe)
+// match the FVG model — that veto is what makes "the HIGHEST-TF IFVG in the
+// leg triggers" mechanical (revised 2026-08-12).
 export function matchSweepTriggers(opts: {
   triggers: FVG[];
   sweeps: ArmedSweep[];
@@ -377,6 +437,19 @@ export function matchSweepTriggers(opts: {
   fired: ReadonlySet<string>;
   window?: ExecutionWindow;
   blockers?: FVG[];
+  // Blockers a RESWEEP retired (gapKey set) — same machinery as the FVG
+  // model: a deeper raid stales the triggers that were in play, so the gaps
+  // vetoing them stop vetoing until price drives deeper into them.
+  clearedBlockers?: ReadonlySet<string>;
+  // In-session arming (added 2026-08-12 for 'mech-2'): only a sweep at/after
+  // 09:30 ET of the CONFIRMATION's trading day can back a candidate — the
+  // exact analog of the FVG model's session-tap rule, and it composes with
+  // the watermark the same way: an overnight raid deepens `wm`, so the
+  // in-session raid that (re)arms has to beat it, just as a premarket push
+  // sets the level an in-session tap must penetrate beyond.
+  armFromSessionOpen?: boolean;
+  // optional diagnostics sink — every considered inversion appends one entry
+  diag?: TriggerOutcome[];
 }): CandidateDraft[] {
   const out: CandidateDraft[] = [];
   for (const trig of opts.triggers) {
@@ -384,22 +457,32 @@ export function matchSweepTriggers(opts: {
     const confirmTs = trig.invertedAt;
     const direction: BiasDirection = trig.dir === 'bear' ? 'long' : 'short';
     const candidateId = `${trig.tf}:${trig.formedAt}:${direction}`;
-    if (opts.fired.has(candidateId)) continue;
-    if (!inExecutionWindow(confirmTs, opts.window)) continue;
+    const note = (result: TriggerResult, blockedBy?: Timeframe) => {
+      opts.diag?.push({ tf: trig.tf, formedAt: trig.formedAt, direction, confirmTs, result, blockedBy });
+    };
+    if (opts.fired.has(candidateId)) {
+      note('duplicate');
+      continue;
+    }
+    if (!inExecutionWindow(confirmTs, opts.window)) {
+      note('window');
+      continue;
+    }
 
-    if (
-      opts.blockers?.some(
-        (b) =>
-          !(b.tf === trig.tf && b.formedAt === trig.formedAt) &&
-          b.dir === trig.dir &&
-          tfRank(b.tf) >= tfRank(trig.tf) &&
-          b.formedAt <= confirmTs &&
-          b.tappedAt !== null &&
-          b.tappedAt <= confirmTs &&
-          (b.invertedAt === null || b.invertedAt > confirmTs) &&
-          (b.expiredAt === null || b.expiredAt > confirmTs),
-      )
-    ) {
+    const blocker = opts.blockers?.find(
+      (b) =>
+        !(b.tf === trig.tf && b.formedAt === trig.formedAt) &&
+        !opts.clearedBlockers?.has(gapKey(b)) &&
+        b.dir === trig.dir &&
+        tfRank(b.tf) >= tfRank(trig.tf) &&
+        b.formedAt <= confirmTs &&
+        b.tappedAt !== null &&
+        b.tappedAt <= confirmTs &&
+        (b.invertedAt === null || b.invertedAt > confirmTs) &&
+        (b.expiredAt === null || b.expiredAt > confirmTs),
+    );
+    if (blocker) {
+      note('vetoed', blocker.tf);
       continue;
     }
 
@@ -408,16 +491,38 @@ export function matchSweepTriggers(opts: {
     // inversion that confirmed before the death.
     const deadlineSec = triggerWindowSec(opts.rules, tfRank(trig.tf));
     const wantSide: DOLSide = direction === 'long' ? 'sellside' : 'buyside';
+    // With Infinity timers (mech-2) the deadline test is vacuous and the
+    // distance rule in foldSweep is the only thing that kills an arming.
+    const armFrom = opts.armFromSessionOpen ? sessionOpenOf(confirmTs) : -Infinity;
     const matched = opts.sweeps.filter(
       (s) =>
         s.level.side === wantSide &&
+        s.sweptAt >= armFrom &&
         s.sweptAt <= confirmTs &&
         confirmTs <= s.sweptAt + deadlineSec &&
         (s.deadAt === null || confirmTs <= s.deadAt),
     );
-    if (matched.length === 0) continue;
-    // primary = the most recent raid — the sweep this reversal is answering
-    const primary = matched.reduce((a, b) => (b.sweptAt > a.sweptAt ? b : a));
+    if (matched.length === 0) {
+      // A stale overnight sweep reads as "no armed sweep" BY DESIGN: under
+      // `armFromSessionOpen` the raid exists but cannot back a candidate, and
+      // the diag vocabulary has no separate reason for it.
+      note('no-sweep');
+      continue;
+    }
+    // primary = the most EXTREME matched draw (revised 2026-08-12, supersedes
+    // "the most recent raid"): a leg that ran through LDN H into PDH is a raid
+    // on PDH, so the deepest liquidity the move reached is the draw the
+    // candidate anchors on — highest price for shorts (buyside), lowest for
+    // longs (sellside). It also settles the sequential case: sweep the London
+    // low, then take out PDL below it with no trigger in between, and PDL is
+    // the condition. Selection runs over `matched` ONLY, so a level that is
+    // dead or past its deadline can never win however extreme it is. Tied
+    // prices are practically impossible; reduce's first-wins is the tiebreak.
+    // `stop` below still measures from primary.sweptAt — the raid-extreme
+    // window follows whichever draw was chosen.
+    const primary = matched.reduce((a, b) =>
+      (wantSide === 'buyside' ? b.level.price > a.level.price : b.level.price < a.level.price) ? b : a,
+    );
 
     // stop = raid extreme: lowest low (long) / highest high (short) from the
     // sweep bar through confirmation — includes the sweep wick itself
@@ -428,8 +533,15 @@ export function matchSweepTriggers(opts: {
       if (bar.t < primary.sweptAt || bar.t >= confirmTs) continue;
       stop = direction === 'long' ? Math.min(stop, bar.l) : Math.max(stop, bar.h);
     }
-    if (!Number.isFinite(stop) || entryEst === null) continue;
-    if (direction === 'long' ? stop >= entryEst : stop <= entryEst) continue;
+    if (!Number.isFinite(stop) || entryEst === null) {
+      note('geometry');
+      continue;
+    }
+    if (direction === 'long' ? stop >= entryEst : stop <= entryEst) {
+      note('geometry');
+      continue;
+    }
+    note('candidate');
 
     out.push({
       candidateId,

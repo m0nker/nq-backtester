@@ -24,6 +24,7 @@ const RESULT_LABEL: Record<TriggerResult, string> = {
   vetoed: 'vetoed',
   'no-bias': 'no bias',
   'no-condition': 'no armed condition',
+  'no-sweep': 'no armed sweep',
   geometry: 'bad stop geometry',
 };
 const RESULT_TONE: Record<TriggerResult, string> = {
@@ -33,6 +34,7 @@ const RESULT_TONE: Record<TriggerResult, string> = {
   vetoed: 'text-amber-300',
   'no-bias': 'text-rose-300',
   'no-condition': 'text-rose-300',
+  'no-sweep': 'text-rose-300',
   geometry: 'text-slate-500',
 };
 
@@ -86,7 +88,9 @@ export default function BotScopePanel({ onClose }: { onClose: () => void }) {
     window.addEventListener('pointercancel', done);
   };
 
-  const mech = botId === 'mech-model';
+  // both DOL bots show sweeps instead of conditions and have no bias at all
+  // (added 2026-08-12 with 'mech-2')
+  const mech = botId === 'mech-model' || botId === 'mech-2';
   const liveBias = biases.filter((b) => b.deadAt === null);
 
   return (

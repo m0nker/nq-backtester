@@ -2,7 +2,9 @@
 // A session's config stores { mode: 'bot', botId }; legacy bot sessions
 // (created before the registry) have mode 'bot' with no botId and resolve
 // to the FVG strategy. Adding a bot = adding an entry here plus wiring its
-// engine in botStore (today all ids run the FVG engine).
+// engine in botStore (revised 2026-08-12: two engines now — the FVG
+// condition/arming path, and the DOL sweep path shared by 'mech-model' and
+// 'mech-2'; botStore's `isDolBot` is what routes between them).
 
 export interface BotDef {
   id: string;
@@ -22,6 +24,12 @@ export const BOTS: BotDef[] = [
     name: 'Mech Model',
     description:
       'Draws on liquidity: session H/L (Asia, London, NY AM/PM), previous day/week H/L and HTF swings. Sweeping sellside arms longs, buyside arms shorts; same IFVG trigger entry. Armed sweeps invalidate when price strays too far from the level (distance set in the BOT panel).',
+  },
+  {
+    id: 'mech-2',
+    name: 'Mech 2',
+    description:
+      "The FVG strategy's execution with a swept draw on liquidity as the condition: only sweeps at/after 09:30 ET of the current trading day arm, and the sweep side sets the direction (sellside → longs, buyside → shorts; no bias). IFVG trigger across every enabled timeframe with the same filled-gap veto. No inversion deadline — an armed sweep dies only when price strays past the distance you set from the level.",
   },
 ];
 

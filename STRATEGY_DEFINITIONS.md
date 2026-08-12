@@ -313,3 +313,173 @@ end / jump end) — fine for browsing, not for a faithful auto backtest; run tho
    arms, and a trigger matching several conditions still fires one candidate with the highest-TF
    condition as primary.
 4. 30s IFVGs (brief mentions them) — possible only where 1s data exists; excluded from v1.
+
+---
+
+## 6. The Mech Model (revised 2026-08-12)
+
+A **second bot**, selectable at session creation (`mech-model`), sharing the trigger machinery of
+§3 but replacing rules 1–2 entirely. Everything in §3b (session modes, sizing, one-position gate,
+prompt, fill fidelity) applies unchanged.
+
+### 6.1 Theory
+
+The model catches the **rebalance after a high-timeframe draw on liquidity is hit** — *not* a full
+reversal. Price runs a significant pool (a session/PD/PW high or low, or an HTF swing), the
+liquidity is taken, and the move back into the range is the trade. Consequences the rules encode:
+
+- the **sweep is the directional read** — there is no bias input at all (rule 1 does not exist
+  here); sweeping **sellside** (a low) hunts **longs**, **buyside** (a high) hunts **shorts**;
+- targets are **near**, and **runners are not the default** — without a clear reason for
+  continuation the trade is a rebalance, so the 1R exit of §3 stands;
+- a rebalance is a *short-lived* opportunity: an armed sweep that produces no trigger inside its
+  deadline is not tradeable later at the same price (see the timers below).
+
+### 6.2 Entry rules
+
+**Condition — a sweep of significant liquidity.** The level catalog is 9 toggleable categories:
+session H/L for Asia (20:00–24:00 ET), London (02:00–05:00), NY AM (09:30–11:00), NY PM
+(13:00–16:00) — each the most recent **completed** window; previous trading **day** and **week**
+H/L; and confirmed 5-bar-fractal swing H/L on 1h / 4h / 1D that aren't already one of the above.
+
+- A **qualifying raid** is a print strictly beyond the level's watermark (its deepest prior
+  excursion) whose **raid extreme** is within the configurable **invalidation distance**
+  (default 40 pts) of the level. Judging the raid extreme alone, rather than the bar's whole
+  range, keeps a wide reversal candle — exactly the shape this model wants — from invalidating
+  its own sweep.
+- **Every qualifying raid inside the resweep window (re)arms the level (revised 2026-08-12,
+  supersedes the 2026-08-01 "arms once, death is terminal" lock).** This is deliberately the
+  **same resweep semantics as the FVG model's condition tap** (§3 rule 2 / the 2026-08-06 resweep
+  lock): a deeper raid means the raid the bot was trading is stale, so
+  - `sweptAt` moves to the new raid and the inversion deadline **restarts**,
+  - any prior death is **erased** — a re-swept level comes back,
+  - the trigger gaps that were in play are **staled**: the resweep **retires the blockers** of the
+    direction the sweep arms (a sellside resweep retires the *bear* blockers, since longs come
+    from bear gaps inverting). A retired blocker vetoes again only once price drives **deeper**
+    into it than it had been filled when it was cleared — identical to the FVG model's rule.
+- **Resweep validity window (added 2026-08-12, user spec).** Resweeps are valid only within a
+  configurable countdown (**default 30 min**) that starts at the level's **FIRST** qualifying raid
+  — anchored there, **not** at the latest re-arm, so a chain of deeper raids cannot walk the
+  window forward indefinitely. Once it passes, **the level is no longer a valid DOL** for this
+  cycle: a deeper raid still deepens the watermark (a breakout must always be able to retire the
+  level) but **cannot re-arm** it, and whatever arming is already standing just lives out its
+  normal deaths. A raid at exactly first-sweep + window still counts (inclusive boundary).
+- **Three deaths** of an armed sweep:
+
+  | Death | Rule |
+  |---|---|
+  | **Timer (per trigger TF)** | the inversion must land within `maxCandles` candles **of that trigger's own timeframe** after the sweep (default 6 → 6m on 1m, 30m on 5m). |
+  | **Minute cap** | an absolute ceiling from the sweep (default 20 min) overriding the per-TF timer wherever it is shorter — 6 candles + 20 min gives 5m only 4 candles, while 3m is untouched (6×3 < 20). |
+  | **Distance** | price trading farther than the invalidation distance from the level in either direction — beyond it (the raid became a breakout) or away from it (the move ran without a trigger). |
+
+  A death is **not terminal**: it stands only until the next qualifying raid *inside the resweep
+  window*. The one permanent exit is a **breakout** — once the watermark sits more than the
+  invalidation distance past the level, no deeper raid can ever qualify again. (The leg that swept the level can of course become
+  a **new** level once it confirms as a swing; that is a different level with its own identity.)
+- Distance and timer checks only consider bars **after** the arming bar, so the sweep candle's own
+  excursion cannot kill the state it just created.
+- A **taken trade** retires every armed sweep of that side (mirror of §3 rule 2's rule 6) — the
+  *raid* is spent, not the level: a later deeper qualifying raid re-arms it, exactly as the FVG
+  model's untouched watermarks let a condition re-arm after a trade.
+
+**Trigger — the highest-TF IFVG in the leg.** Scanned on **5m, 4m, 3m, 2m, 1m** only (no
+sub-minute TFs for this model; the per-TF toggles still apply, narrowed to this set). An IFVG
+inversion confirms against an armed sweep of the **aligned** side whose per-TF deadline has not
+passed, with the confirmation close inside the **execution window** (§3 "Time window", same
+per-session setting).
+
+- "Highest-TF IFVG **of the leg**" is enforced mechanically by the **filled-gap veto** of §3 rule
+  3 — an inversion on TF X is suppressed while any same-direction, active, *filled* gap on a
+  same-or-higher trigger TF is still in play — plus the **cleared-blocker** rule above, so a
+  resweep restarts the hierarchy instead of leaving the leg's old blockers standing forever.
+- When several TFs confirm on the same close, the **higher timeframe** is the reference
+  (candidates are ordered confirmation-time ascending, then trigger TF descending).
+- **Dedup** is per IFVG, as in §3.
+- **Which swept draw the candidate anchors on (revised 2026-08-12, supersedes "the most recent
+  raid"):** when several armed sweeps of the aligned side qualify for the same inversion, the
+  **most extreme** one is the play — the **highest** level price for shorts (buyside), the
+  **lowest** for longs (sellside). A leg that ran through LDN H into PDH is a raid on **PDH**,
+  whether the two were taken on the same bar or in sequence (sweep the London low, then take PDL
+  below it with no trigger in between → PDL is the condition). The choice is made **only among
+  the sweeps that already qualified** on side, timing, deadline and (Mech 2) session, so a dead
+  or out-of-deadline extreme level never wins.
+- **Stop** = the **raid extreme**: lowest low (long) / highest high (short) from the **chosen
+  draw's** sweep bar through the confirmation, including the sweep wick itself. **Target** = 1R.
+- Diagnostics: every considered inversion records an outcome — `candidate`, `duplicate`,
+  `window`, `vetoed` (with the blocking TF), **`no-sweep`** (no armed sweep of the aligned side
+  inside its deadline — this model's stand-in for `no-bias`/`no-condition`), or `geometry` — and
+  the bot scope panel shows the latest per timeframe.
+
+### 6.3 Deferred, not implemented
+
+- **Targeting an untapped 5m/15m FVG.** The user's revision describes taking the rebalance
+  *toward* an unfilled 5m/15m gap as the draw. This is **documented only** — the engine does not
+  look for it, does not require it, and does not use it to set targets (which stay 1R). It becomes
+  either a confluence gate or a target rule once the plain model has been felt.
+- Runner management / continuation reasons: out of scope, same as §3's trade-management line.
+- **Rewind caveat (implementation, not spec):** cleared-blocker state is not reconstructed on
+  rewind for this model — the resweeps that retired blockers aren't replayed, so blockers resume
+  standing. Conservative by choice: after a rewind the bot vetoes rather than over-fires.
+
+---
+
+## 7. Mech 2 (added 2026-08-12)
+
+A **third bot** (`mech-2`), selectable at session creation. It is the **FVG strategy's execution
+with the condition swapped**: everything §3 rule 3 does — trigger scan, filled-gap veto,
+cleared-blocker resweep rule, dedup, stop/target geometry, execution window — is unchanged, and
+the thing that has to be true before a trigger counts is a **swept draw on liquidity** instead of
+a tapped condition FVG. §3b (session modes, sizing, one-position gate, prompt, fill fidelity)
+applies unchanged. It shares the level catalog, sweep/re-sweep machinery and the "spent raid"
+rule of §6.2 — read that section first; what follows is only where Mech 2 differs.
+
+### 7.1 What it takes from the Mech Model
+
+- The **level catalog** (9 toggleable categories) and the **qualifying raid** definition: a print
+  strictly beyond the level's watermark whose raid extreme is within the invalidation distance.
+- **Every qualifying raid (re)arms**, `sweptAt` moves to the new raid, any prior death is erased,
+  and the **resweep retires the blockers** of the direction the sweep arms — the same
+  cleared-blocker bookkeeping as the FVG model, so a retired blocker vetoes again only once price
+  drives deeper into it than it had been filled when it was cleared.
+- The **resweep validity window** (added 2026-08-12, default 30 min from the level's **first**
+  qualifying raid). This is **not** one of the timers §7.2 removes — it dates the *level* as a
+  draw, not the trigger — so Mech 2 honours it in full: past the window a deeper raid only
+  deepens the watermark and the level is no longer a valid DOL. With no timer to kill it, an
+  arming already standing when the window closes simply stays armed until the distance rule
+  takes it.
+- **The most extreme swept draw of the aligned side is the play** — highest level price for
+  shorts, lowest for longs — chosen among the sweeps that already qualified (§6.2 trigger rules).
+- **Direction comes from the sweep side** — sellside (a low) hunts **longs**, buyside (a high)
+  hunts **shorts**. There is **no bias input** (rule 1 does not exist here either).
+- A **taken trade** retires every armed sweep of that side; the level survives and a later deeper
+  qualifying raid re-arms it.
+- **Stop** = the raid extreme from the sweep bar through the confirmation (including the sweep
+  wick); **target** = 1R.
+
+### 7.2 What is different
+
+- **In-session arming (the FVG bot's session-tap rule, applied to the sweep).** Only a raid at or
+  after **09:30 ET of the confirmation's trading day** can back a candidate — an overnight or
+  premarket sweep is not tradeable, exactly as an overnight condition tap does not arm (§3 rule 2).
+  The **watermark composes with it the same way it does for the FVG bot**: an overnight raid
+  deepens the level's watermark, so the in-session raid that (re)arms has to go **deeper than the
+  overnight one** — the mirror image of "a premarket push sets the level an in-session tap must
+  beat". A sweep rejected for being out of session is reported as **`no-sweep`** in the
+  diagnostics; there is no separate reason code for it.
+- **No timer of any kind.** The per-TF candle deadline and the absolute minute cap of §6.2 do not
+  apply — an armed sweep lives indefinitely. The **distance rule is the only death**: price
+  trading farther than the invalidation distance from the level in either direction, beyond it
+  (the raid became a breakout) or away from it (the move ran without a trigger). A death still
+  stands only until the next qualifying raid *inside the resweep window*, and a breakout is still
+  the one permanent exit. The BOT panel therefore shows no deadline inputs for this bot — only
+  the distance and the resweep window.
+- **Trigger scan = the full enabled trigger-TF list (15s–5m)**, as in §3 rule 3 — *not* the
+  5m–1m narrowing the Mech Model applies. The per-TF toggles are the whole story.
+- **Candidate ordering** is the FVG bot's: confirmation time ascending, with no trigger-TF
+  tiebreak. (The filled-gap veto already decides which timeframe owns the move.)
+
+### 7.3 Deferred, not implemented
+
+- Same as §6.3: no untapped-5m/15m-gap targeting, no runner management, and the same **rewind
+  caveat** — cleared-blocker state is not reconstructed on rewind, so after a rewind the bot
+  vetoes rather than over-fires.

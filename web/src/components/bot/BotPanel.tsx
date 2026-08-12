@@ -11,8 +11,8 @@ import BotScopePanel from '@/components/bot/BotScopePanel';
 import { useBot, type CandidateAction } from '@/lib/concepts/botStore';
 import type { RiskMode } from '@/lib/concepts/engine';
 import { TRIGGER_TFS_ALL } from '@/lib/concepts/fvg';
-import { DOL_KINDS } from '@/lib/concepts/liquidity';
-import { TF_SECONDS, isSessionTf } from '@/lib/types';
+import { DOL_KINDS, MECH_TRIGGER_TFS } from '@/lib/concepts/liquidity';
+import { TF_SECONDS, isSessionTf, type SessionTf, type Timeframe } from '@/lib/types';
 import { useReplay } from '@/lib/replay/clock';
 
 const fmtDaySec = (sec: number) =>
@@ -29,6 +29,17 @@ const fmtDur = (sec: number) => {
   return m === 0 ? `${s}s` : s === 0 ? `${m}m` : `${m}m${s}s`;
 };
 
+// Hover-only help: the settings panel used to carry every explanation as a
+// visible paragraph — now each lives behind an ⓘ next to its section.
+const Info = ({ text }: { text: string }) => (
+  <span
+    title={text}
+    className="ml-1 inline-flex h-3.5 w-3.5 cursor-help items-center justify-center rounded-full border border-slate-600 font-serif text-[9px] italic text-slate-500 hover:border-slate-400 hover:text-slate-300"
+  >
+    i
+  </span>
+);
+
 const ACTION_LABELS: Record<CandidateAction, string> = {
   'prompt-trade': 'Prompt me — Take places the trade',
   'label-only': 'Prompt me — label only, no trades',
@@ -41,6 +52,7 @@ export default function BotPanel() {
   const dolInvalidationPts = useBot((s) => s.dolInvalidationPts);
   const sweepMaxCandles = useBot((s) => s.sweepMaxCandles);
   const sweepMaxMinutes = useBot((s) => s.sweepMaxMinutes);
+  const resweepWindowMinutes = useBot((s) => s.resweepWindowMinutes);
   const dolKinds = useBot((s) => s.dolKinds);
   const gapMaxAgeCandles = useBot((s) => s.gapMaxAgeCandles);
   const conditionLookbackCandles = useBot((s) => s.conditionLookbackCandles);
@@ -67,7 +79,11 @@ export default function BotPanel() {
 
   if (!active) return null;
 
+  // `dol` = the sweep-condition family (no bias, DOL settings); `mech` = the
+  // timer-bearing mech model specifically — mech-2 has no deadline at all
+  // (added 2026-08-12), so its inputs must not appear.
   const mech = botId === 'mech-model';
+  const dol = mech || botId === 'mech-2';
   const liveCount = biases.filter((b) => b.deadAt === null).length;
   const add = () => {
     const p = parseFloat(until);
@@ -102,7 +118,7 @@ export default function BotPanel() {
         title="Bot settings — bias, active time, candidate action, risk"
         onClick={() => setOpen(!open)}
       >
-        {mech ? 'Mech ▾' : 'Bot ▾'}
+        {mech ? 'Mech ▾' : dol ? 'Mech 2 ▾' : 'Bot ▾'}
       </button>
       <span className="text-slate-500">
         {action === 'prompt-trade' ? 'prompt & trade' : action === 'label-only' ? 'label only' : 'auto-trade all'}
@@ -112,14 +128,14 @@ export default function BotPanel() {
         {riskSummary}
         {hopWindows ? ' · hop' : ''}
         {' · '}
-        {mech
+        {dol
           ? `±${dolInvalidationPts} pts · ${armedCount} swept`
           : (liveCount ? `${liveCount} bias` : 'no bias — dormant') + ` · ${armedCount} armed`}
       </span>
 
       <span className="mx-1 h-4 w-px bg-slate-700" />
 
-      {!mech && biases.map((b) => (
+      {!dol && biases.map((b) => (
         <span
           key={b.id}
           className={`flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono ${
@@ -166,7 +182,7 @@ export default function BotPanel() {
 
       {open && (
         <div className="absolute left-2 top-full z-50 mt-1 w-[21rem] rounded-lg border border-slate-700 bg-[#0d1119] p-3 shadow-2xl">
-          {mech && (
+          {dol && (
             <>
               <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
                 Draws on liquidity — tradeable
@@ -187,9 +203,14 @@ export default function BotPanel() {
                   </button>
                 ))}
               </div>
-
+            </>
+          )}
+          {/* the deadline is mech-model ONLY — mech 2 has no timer at all */}
+          {mech && (
+            <>
               <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
                 Sweep → inversion deadline
+                <Info text="After a sweep, the IFVG must invert within that many candles of the trigger's own timeframe; the minute ceiling overrides it wherever it lands first (*). Missing the deadline kills that ARMING, not the level: a deeper re-sweep of the same level re-arms it (restarting the deadline) and stales the triggers that were in play. Only a breakout — price beyond the invalidation distance past the level — retires it for good." />
               </div>
               <div className="mb-1 flex items-center gap-2">
                 <input
@@ -212,8 +233,9 @@ export default function BotPanel() {
                 <span className="text-slate-500">min</span>
               </div>
               <div className="mb-1 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[10px]">
+                {/* preview only the TFs the mech scan actually runs (1m–5m) */}
                 {triggerTfs
-                  .filter((tf) => !isSessionTf(tf))
+                  .filter((tf): tf is Exclude<Timeframe, SessionTf> => !isSessionTf(tf) && MECH_TRIGGER_TFS.includes(tf))
                   .sort((a, b) => TF_SECONDS[a] - TF_SECONDS[b])
                   .map((tf) => {
                     const raw = sweepMaxCandles * TF_SECONDS[tf];
@@ -226,17 +248,15 @@ export default function BotPanel() {
                     );
                   })}
               </div>
-              <p className="mb-3 text-[11px] leading-snug text-slate-600">
-                After a sweep, the IFVG must invert within that many candles{' '}
-                <em>of the trigger&apos;s own timeframe</em>; the minute ceiling overrides it
-                wherever it lands first (*). Miss the deadline and the level is dead for good —
-                no re-arming, though the leg that swept it can become a new swing level.
-              </p>
-
-              <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
+            </>
+          )}
+          {dol && (
+            <>
+              <div className="mb-1 mt-2 text-[10px] uppercase tracking-wide text-slate-500">
                 Distance invalidation
+                <Info text="Kills an armed sweep when price strays farther than this from the level — beyond it (breakout) or away from it (the reversal ran without a trigger). For Mech 2 it is the ONLY invalidation (that bot has no deadline). Direction comes from the sweep: sellside → longs, buyside → shorts (no bias needed)." />
               </div>
-              <div className="mb-1 flex items-center gap-2">
+              <div className="mb-3 flex items-center gap-2">
                 <input
                   type="number"
                   min={5}
@@ -247,15 +267,25 @@ export default function BotPanel() {
                 />
                 <span className="text-slate-500">pts from the level</span>
               </div>
-              <p className="mb-3 text-[11px] leading-snug text-slate-600">
-                Also kills an armed sweep when price strays farther than this from the level —
-                beyond it (breakout) or away from it (the reversal ran without a trigger).
-                Direction comes from the sweep: sellside → longs, buyside → shorts (no bias
-                needed).
-              </p>
+              {/* added 2026-08-12: the level's own shelf life as a draw */}
+              <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
+                Resweep window
+                <Info text="After a level's FIRST sweep, deeper re-sweeps re-arm it only within this window — the countdown is anchored at that first raid, not the latest one. Once it passes the level is spent: further raids only deepen its watermark, and nothing re-arms it. (A breakout — price beyond the invalidation distance past the level — already retires it regardless.)" />
+              </div>
+              <div className="mb-3 flex items-center gap-2">
+                <input
+                  type="number"
+                  min={1}
+                  step={5}
+                  className="w-20 rounded bg-slate-800 px-2 py-1 font-mono"
+                  value={resweepWindowMinutes}
+                  onChange={(e) => useBot.getState().setResweepWindowMinutes(+e.target.value)}
+                />
+                <span className="text-slate-500">min after first sweep</span>
+              </div>
             </>
           )}
-          {!mech && (<>
+          {!dol && (<>
           <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Bias</div>
           <div className="mb-3 flex items-center gap-1">
             <div className="flex overflow-hidden rounded border border-slate-700">
@@ -350,6 +380,7 @@ export default function BotPanel() {
 
           <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
             Candle distances
+            <Info text="A gap stops being considered once it is this many of its OWN timeframe's candles old — 25 on 5m is ~2h, on 4h is ~4 days. The lookbacks bound how far back each scan searches and are floored at the expiry + 10, so a short lookback can never silently cut the expiry short." />
           </div>
           <div className="mb-1 flex items-center gap-2">
             <input
@@ -388,14 +419,11 @@ export default function BotPanel() {
             />
             <span className="flex-1 text-slate-500">trigger scan lookback</span>
           </div>
-          <p className="mb-3 text-[11px] leading-snug text-slate-600">
-            A gap stops being considered once it is this many of its OWN timeframe&apos;s candles
-            old — 25 on 5m is ~2h, on 4h is ~4 days. The lookbacks bound how far back each scan
-            searches and are floored at the expiry + 10, so a short lookback can never silently
-            cut the expiry short.
-          </p>
 
-          <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Risk sizing</div>
+          <div className="mb-1 mt-2 text-[10px] uppercase tracking-wide text-slate-500">
+            Risk sizing
+            <Info text="%/$ modes size to the nearest 0.1 contract (0.1 NQ ≈ 1 MNQ, min 0.1) from the stop distance; % uses the current balance." />
+          </div>
           <div className="mb-3 flex items-center gap-2">
             <select
               className="flex-1 rounded bg-slate-800 px-2 py-1"
@@ -418,10 +446,6 @@ export default function BotPanel() {
               {risk.mode === 'contracts' ? 'ct' : risk.mode === 'percent' ? '%' : '$'}
             </span>
           </div>
-          <p className="mb-2 text-[11px] leading-snug text-slate-600">
-            %/$ modes size to the nearest 0.1 contract (0.1 NQ ≈ 1 MNQ, min 0.1) from the stop
-            distance; % uses the current balance.
-          </p>
 
           <div className="mb-1 flex items-center gap-2">
             <input
@@ -441,23 +465,20 @@ export default function BotPanel() {
               value={maxContracts}
               onChange={(e) => useBot.getState().setSizeGuard('maxContracts', +e.target.value)}
             />
-            <span className="flex-1 text-slate-500">max contracts</span>
+            <span className="flex-1 text-slate-500">
+              max contracts
+              <Info text="Size is proportional to 1/stop-distance, so a stop that price has already reached by entry time would otherwise produce an enormous position. Candidates whose stop is nearer than the minimum are skipped outright, and the contract ceiling is a last-resort backstop." />
+            </span>
           </div>
-          <p className="mb-3 text-[11px] leading-snug text-amber-600/80">
-            Size is proportional to 1/stop-distance, so a stop that price has already reached by
-            entry time would otherwise produce an enormous position. Candidates whose stop is
-            nearer than the minimum are skipped outright, and the contract ceiling is a
-            last-resort backstop.
-          </p>
 
-          <label className="mb-1.5 flex cursor-pointer items-center gap-2 text-slate-300">
+          <label className="mb-1.5 mt-2 flex cursor-pointer items-center gap-2 text-slate-300">
             <input
               type="checkbox"
               checked={onePosition}
               onChange={(e) => useBot.getState().setOnePosition(e.target.checked)}
             />
             1 position at a time
-            <span className="text-slate-600">(dormant until flat with no working orders)</span>
+            <Info text="Dormant until flat with no working orders" />
           </label>
           <label className="flex cursor-pointer items-center gap-2 text-slate-300">
             <input
@@ -466,7 +487,7 @@ export default function BotPanel() {
               onChange={(e) => useBot.getState().setHopWindows(e.target.checked)}
             />
             Auto-jump between active windows
-            <span className="text-slate-600">(skips ahead when idle outside the window)</span>
+            <Info text="Skips ahead when idle outside the window" />
           </label>
         </div>
       )}
