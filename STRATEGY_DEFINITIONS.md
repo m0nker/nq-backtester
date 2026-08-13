@@ -366,13 +366,16 @@ H/L; and confirmed 5-bar-fractal swing H/L on 1h / 4h / 1D that aren't already o
     reported case where one candle simultaneously reswept a draw, tapped deeper into a standing
     blocker and inverted a trigger: the clear used to be marked at the end-of-advance penetration,
     which swallowed the candle's own fresh tap and let the trigger fire.
-- **Resweep validity window (added 2026-08-12, user spec).** Resweeps are valid only within a
-  configurable countdown (**default 30 min**) that starts at the level's **FIRST** qualifying raid
-  — anchored there, **not** at the latest re-arm, so a chain of deeper raids cannot walk the
-  window forward indefinitely. Once it passes, **the level is no longer a valid DOL** for this
-  cycle: a deeper raid still deepens the watermark (a breakout must always be able to retire the
-  level) but **cannot re-arm** it, and whatever arming is already standing just lives out its
-  normal deaths. A raid at exactly first-sweep + window still counts (inclusive boundary).
+- **Resweep validity window = the level's tradeable lifetime (added 2026-08-12, user spec;
+  tightened same day after a live edge case).** The window is a configurable countdown (**default
+  30 min**) that starts at the level's **FIRST** qualifying raid — anchored there, **not** at the
+  latest re-arm, so a chain of deeper raids cannot walk the window forward indefinitely. Once it
+  passes, **the level is dead as a DOL, permanently**: a deeper raid still deepens the watermark
+  (a breakout must always be able to retire the level) but cannot re-arm it, and **a
+  still-standing arming dies at the window end** — it does not live on past it. (The edge case:
+  under Mech 2's no-timer rules, a London-high arming from ~09:56 backed a trigger at 12:04; with
+  the first sweep at 09:45, the whole level must be spent by 10:15.) A raid at exactly
+  first-sweep + window still counts (inclusive boundary).
 - **Three deaths** of an armed sweep:
 
   | Death | Rule |

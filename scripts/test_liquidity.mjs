@@ -334,13 +334,17 @@ const M2 = (p: Partial<SweepRules> = {}): SweepRules =>
   // (JSON.stringify(Infinity) is "null", so compare identity explicitly)
   check('m2-window-infinite', triggerWindowSec(M2(), 60) === Number.POSITIVE_INFINITY, true);
   check('m2-lifespan-infinite', levelLifespanSec(M2()) === Number.POSITIVE_INFINITY, true);
-  // (a) no timer death: a sweep armed hours ago is still armed, and still
-  // matches a confirmation the mech model's 20m cap would have rejected
+  // (a) no PER-ARMING timer: within the resweep window, hours of clock alone
+  // can't kill a mech-2 arming the way the mech model's 20m cap would — but
+  // the RESWEEP WINDOW is the level's whole tradeable lifetime (revised
+  // 2026-08-12, user edge case: a 09:56 arming must not back a 12:04
+  // trigger), so past firstSweptAt + window the arming dies AT the window end
   const L = lvl();
   const swept = foldSweep(L, freshSweepState(L), [bar(w(9, 31), 21940, 21945, 21895, 21930)], M2(), w(9, 32));
   const hoursLater = foldSweep(L, swept, [bar(w(12, 0), 21930, 21935, 21925, 21930)], M2(), w(13, 0));
-  check('m2-no-timer-death', [hoursLater.sweptAt, hoursLater.deadAt], [w(9, 31), null]);
-  check('m2-clock-alone-never-kills', foldSweep(L, swept, [], M2(), w(16, 0)).deadAt, null);
+  check('m2-arming-dies-at-window-end', [hoursLater.sweptAt, hoursLater.deadAt], [w(9, 31), w(10, 1)]);
+  check('m2-clock-kills-at-window-end-only', foldSweep(L, swept, [], M2(), w(16, 0)).deadAt, w(10, 1));
+  check('m2-alive-inside-window', foldSweep(L, swept, [], M2(), w(9, 55)).deadAt, null);
   check('m2-late-trigger-matches',
     matchSweepTriggers({ ...mBase, rules: M2(), triggers: [trigAt('1m', 59)] }).length, 1);
   // ...while mech-model's 1m deadline (6m from 09:31) rejects the same one
@@ -359,8 +363,9 @@ const M2 = (p: Partial<SweepRules> = {}): SweepRules =>
   const m2Late = foldSweep(L, swept, [bar(w(10, 5), 21930, 21935, 21875, 21930)], M2(), w(10, 6));
   check('m2-window-outside-no-rearm', [m2Late.sweptAt, m2Late.firstSweptAt, m2Late.wm],
     [w(9, 31), w(9, 31), 21875]);
-  // ...and with no timer to kill it, the ORIGINAL arming is simply still alive
-  check('m2-window-outside-keeps-original-arming', isArmed(m2Late), true);
+  // ...and the original arming is dead too — the window end is terminal for
+  // the whole level (revised 2026-08-12)
+  check('m2-window-outside-arming-dead', [isArmed(m2Late), m2Late.deadAt], [false, w(10, 1)]);
   const m2Inside = foldSweep(L, swept, [bar(w(9, 55), 21930, 21935, 21875, 21930)], M2(), w(9, 56));
   check('m2-window-inside-rearms', [m2Inside.sweptAt, m2Inside.firstSweptAt], [w(9, 55), w(9, 31)]);
 }

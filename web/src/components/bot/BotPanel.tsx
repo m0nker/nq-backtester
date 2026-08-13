@@ -271,7 +271,7 @@ export default function BotPanel() {
               {/* added 2026-08-12: the level's own shelf life as a draw */}
               <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
                 Resweep window
-                <Info text="After a level's FIRST sweep, deeper re-sweeps re-arm it only within this window — the countdown is anchored at that first raid, not the latest one. Once it passes the level is spent: further raids only deepen its watermark, and nothing re-arms it. (A breakout — price beyond the invalidation distance past the level — already retires it regardless.)" />
+                <Info text="The level's whole tradeable lifetime, counted from its FIRST sweep (not the latest re-sweep). Inside it, deeper re-sweeps re-arm the level; when it ends, the level dies for good — a standing arming expires right there, and further raids only deepen the watermark. (A breakout — price beyond the invalidation distance past the level — retires it regardless.)" />
               </div>
               <div className="mb-3 flex items-center gap-2">
                 <input

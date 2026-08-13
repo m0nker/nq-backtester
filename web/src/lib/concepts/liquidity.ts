@@ -23,9 +23,9 @@
 // erased — ONLY while it lands within `resweepWindowSec` of that FIRST sweep.
 // The window is anchored at the first raid, NOT the latest, so a chain of
 // deeper raids cannot walk it forward indefinitely. Once it passes, the level
-// is no longer a valid DOL for this cycle: deeper raids only deepen the
-// watermark, and whatever arming is already standing just lives out its
-// normal deaths.
+// is dead as a DOL for good (revised 2026-08-12): deeper raids only deepen
+// the watermark, and a still-standing arming dies AT the window end — it does
+// not live on past it.
 // Three ways an armed sweep dies:
 //  - TIMER, per trigger timeframe: the inversion must land within
 //    `maxCandles` candles OF THAT TIMEFRAME after the sweep (6 candles = 90s
@@ -295,6 +295,12 @@ export function levelsAt(src: LevelDataSource, upTo: number, gen = 0): DOLLevel[
 // (revised 2026-08-12); invalidation (timer, minute cap, or distance) stands
 // until the next one — `deadAt` records WHEN so a trigger that confirmed
 // before the death still counts.
+//
+// The resweep window is the level's whole TRADEABLE LIFETIME (revised
+// 2026-08-12, user edge case): once `firstSweptAt + resweepWindowSec`
+// passes, not only can nothing re-arm — a still-standing arming DIES there
+// too. Without this, a Mech 2 arming (no timer) from the open could back a
+// trigger hours later off a level long since spent.
 export function foldSweep(
   level: DOLLevel,
   state: SweepState,
@@ -305,6 +311,11 @@ export function foldSweep(
   let { wm, sweptAt, deadAt, firstSweptAt } = state;
   const buy = level.side === 'buyside';
   const lifespan = levelLifespanSec(rules);
+  // life end from a given arming: the per-arming timer ∧ the whole-level
+  // window from the FIRST sweep (Infinity timers make the window the only
+  // clock — the mech-2 case)
+  const lifeEnd = (armedAt: number): number =>
+    Math.min(armedAt + lifespan, (firstSweptAt ?? armedAt) + rules.resweepWindowSec);
   for (const bar of bars) {
     if (bar.t < level.formedAt) continue;
     const depth = buy ? bar.h : bar.l; // how far this bar raided past the level
@@ -316,7 +327,7 @@ export function foldSweep(
     // Straying is measured only on bars AFTER the arming one, so the sweep
     // candle's own excursion can't kill the state it just created.
     if (sweptAt !== null && deadAt === null && bar.t > sweptAt) {
-      if (bar.t + 60 > sweptAt + lifespan) deadAt = sweptAt + lifespan; // out of time
+      if (bar.t + 60 > lifeEnd(sweptAt)) deadAt = lifeEnd(sweptAt); // out of time
       else if (bar.h > level.price + rules.invalidationPts || bar.l < level.price - rules.invalidationPts) {
         deadAt = bar.t; // ran away from the level, or blew through it
       }
@@ -343,7 +354,7 @@ export function foldSweep(
     }
     if (beyondWm) wm = depth;
   }
-  if (sweptAt !== null && deadAt === null && now > sweptAt + lifespan) deadAt = sweptAt + lifespan;
+  if (sweptAt !== null && deadAt === null && now > lifeEnd(sweptAt)) deadAt = lifeEnd(sweptAt);
   return { wm, sweptAt, deadAt, firstSweptAt };
 }
 
