@@ -165,9 +165,15 @@ export const useTrading = create<TradingState>((set, get) => {
         if ('stopPrice' in spec) {
           const riskPts = (intent.price - spec.stopPrice) * dir;
           if (riskPts > 0) {
+            // absolute-TP form pins the TP AT its price whatever the fill —
+            // expressed as fill-relative points, spawnBracket's arithmetic
+            // reproduces the exact price (a fill already beyond the target
+            // yields a limit behind the market, which exits at the next bar:
+            // the target was reached, take it)
+            const tpPts = 'tpPrice' in spec ? (spec.tpPrice - intent.price) * dir : spec.rr * riskPts;
             spawnBracket(entrySide, increase, intent.price, {
               stopLossPts: riskPts,
-              takeProfitPts: spec.rr * riskPts,
+              takeProfitPts: tpPts,
             }, barTs);
           } else {
             // entry filled at/beyond the stop (gap-through): still protect —

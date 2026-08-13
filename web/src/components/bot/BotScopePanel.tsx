@@ -25,6 +25,7 @@ const RESULT_LABEL: Record<TriggerResult, string> = {
   'no-bias': 'no bias',
   'no-condition': 'no armed condition',
   'no-sweep': 'no armed sweep',
+  'no-target': 'no unfilled 5m/15m target',
   geometry: 'bad stop geometry',
 };
 const RESULT_TONE: Record<TriggerResult, string> = {
@@ -35,6 +36,7 @@ const RESULT_TONE: Record<TriggerResult, string> = {
   'no-bias': 'text-rose-300',
   'no-condition': 'text-rose-300',
   'no-sweep': 'text-rose-300',
+  'no-target': 'text-rose-300',
   geometry: 'text-slate-500',
 };
 
@@ -224,6 +226,37 @@ export default function BotScopePanel({ onClose }: { onClose: () => void }) {
                 </div>
               ))}
             </div>
+          )}
+
+          {/* the unfilled 5m/15m draw each side would rebalance into (mech bots) */}
+          {mech && scope.targets && (
+            <>
+              <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
+                Targets — unfilled 5m/15m
+              </div>
+              <div className="mb-2 flex flex-col gap-0.5 font-mono">
+                {([
+                  ['long', scope.targets.long] as const,
+                  ['short', scope.targets.short] as const,
+                ]).map(([side, t]) => (
+                  <div key={side} className="flex items-center justify-between">
+                    <span className={side === 'long' ? 'text-emerald-300' : 'text-rose-300'}>
+                      {side === 'long' ? '▲ longs' : '▼ shorts'}
+                    </span>
+                    {t ? (
+                      <>
+                        <span className="text-slate-400">
+                          {t.tf} @ {t.tp.toFixed(2)}
+                        </span>
+                        <span className="text-slate-500">{t.ageMin}m old</span>
+                      </>
+                    ) : (
+                      <span className="text-slate-500">none within window</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </>
           )}
 
           {/* per-timeframe trigger scan */}

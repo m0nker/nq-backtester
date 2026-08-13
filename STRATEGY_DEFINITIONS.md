@@ -331,7 +331,9 @@ liquidity is taken, and the move back into the range is the trade. Consequences 
 - the **sweep is the directional read** — there is no bias input at all (rule 1 does not exist
   here); sweeping **sellside** (a low) hunts **longs**, **buyside** (a high) hunts **shorts**;
 - targets are **near**, and **runners are not the default** — without a clear reason for
-  continuation the trade is a rebalance, so the 1R exit of §3 stands;
+  continuation the trade is a rebalance, so the exit is the nearest **unfilled 5m/15m gap** the
+  move can rebalance into (§6.3, user spec 2026-08-12; this supersedes the 1R exit of §3 for both
+  mech bots);
 - a rebalance is a *short-lived* opportunity: an armed sweep that produces no trigger inside its
   deadline is not tradeable later at the same price (see the timers below).
 
@@ -357,6 +359,13 @@ H/L; and confirmed 5-bar-fractal swing H/L on 1h / 4h / 1D that aren't already o
     direction the sweep arms (a sellside resweep retires the *bear* blockers, since longs come
     from bear gaps inverting). A retired blocker vetoes again only once price drives **deeper**
     into it than it had been filled when it was cleared — identical to the FVG model's rule.
+    **A resweep retires only the vetoes that were standing BEFORE it (user decision
+    2026-08-12).** The retirement mark is the blocker's penetration as of the moment the resweep
+    bar opens, and a penetration deeper than that **at or after** the resweep bar re-establishes
+    the veto — *including on the resweep bar itself and inside the same advance*. This fixes the
+    reported case where one candle simultaneously reswept a draw, tapped deeper into a standing
+    blocker and inverted a trigger: the clear used to be marked at the end-of-advance penetration,
+    which swallowed the candle's own fresh tap and let the trigger fire.
 - **Resweep validity window (added 2026-08-12, user spec).** Resweeps are valid only within a
   configurable countdown (**default 30 min**) that starts at the level's **FIRST** qualifying raid
   — anchored there, **not** at the latest re-arm, so a chain of deeper raids cannot walk the
@@ -404,18 +413,39 @@ per-session setting).
   the sweeps that already qualified** on side, timing, deadline and (Mech 2) session, so a dead
   or out-of-deadline extreme level never wins.
 - **Stop** = the **raid extreme**: lowest low (long) / highest high (short) from the **chosen
-  draw's** sweep bar through the confirmation, including the sweep wick itself. **Target** = 1R.
+  draw's** sweep bar through the confirmation, including the sweep wick itself. **Target** = the
+  unfilled 5m/15m gap edge of §6.3 — **required**: no valid target, no candidate.
 - Diagnostics: every considered inversion records an outcome — `candidate`, `duplicate`,
   `window`, `vetoed` (with the blocking TF), **`no-sweep`** (no armed sweep of the aligned side
-  inside its deadline — this model's stand-in for `no-bias`/`no-condition`), or `geometry` — and
-  the bot scope panel shows the latest per timeframe.
+  inside its deadline — this model's stand-in for `no-bias`/`no-condition`), **`no-target`** (no
+  unfilled 5m/15m gap to rebalance into, §6.3), or `geometry` — and the bot scope panel shows the
+  latest per timeframe.
 
-### 6.3 Deferred, not implemented
+### 6.3 Target — an unfilled 5m/15m FVG (user spec 2026-08-12)
 
-- **Targeting an untapped 5m/15m FVG.** The user's revision describes taking the rebalance
-  *toward* an unfilled 5m/15m gap as the draw. This is **documented only** — the engine does not
-  look for it, does not require it, and does not use it to set targets (which stay 1R). It becomes
-  either a confluence gate or a target rule once the plain model has been felt.
+**A mech candidate REQUIRES a target.** Both mech bots take the rebalance *toward* an **UNFILLED**
+5m or 15m FVG of the **opposite polarity**: longs need a **bearish** one, shorts a **bullish** one.
+This replaces the 1R target of §6.2 / §3 "Execution" for these bots — the FVG strategy keeps 1R.
+
+- **Unfilled is absolute.** The gap must never have been tapped — *no print inside it, ever*. Any
+  mitigation (or inversion, or expiry) disqualifies it: a filled gap is spent liquidity, not a draw.
+- **TP = the gap's NEAR edge** — the **bottom** of the bearish gap for a long, the **top** of the
+  bullish gap for a short. It is an **absolute price**, not an R multiple.
+- **Closest valid edge wins**, across both timeframes: if the nearest 5m bottom is closer to the
+  entry than the nearest 15m bottom, the 5m is the target; two 5m gaps in a row → the closer one.
+- The edge must be on the **profit side** of the entry (bottom > entry for longs, top < entry for
+  shorts); an edge at or past the entry does not qualify.
+- **Age window.** The gap must have **formed** within `targetGapMaxAgeMinutes` (**default 60**, per
+  bot setting, both mech bots) of the confirmation: `formedAt >= confirmTs - X*60`.
+- **No valid target → no candidate.** The rejection is reported as **`no-target`** in the
+  diagnostics and on the bot scope panel, which also shows the current closest valid target per
+  side (timeframe, edge price, age) so the gate is visible before a trigger fires.
+- Implementation note: target trades use the fully absolute bracket form (`stopPrice` +
+  `tpPrice`), so the TP limit sits exactly AT the gap edge regardless of the entry fill. An entry
+  that gaps through the edge exits at the next bar — the target was reached.
+
+### 6.3b Deferred, not implemented
+
 - Runner management / continuation reasons: out of scope, same as §3's trade-management line.
 - **Rewind caveat (implementation, not spec):** cleared-blocker state is not reconstructed on
   rewind for this model — the resweeps that retired blockers aren't replayed, so blockers resume
@@ -454,7 +484,7 @@ rule of §6.2 — read that section first; what follows is only where Mech 2 dif
 - A **taken trade** retires every armed sweep of that side; the level survives and a later deeper
   qualifying raid re-arms it.
 - **Stop** = the raid extreme from the sweep bar through the confirmation (including the sweep
-  wick); **target** = 1R.
+  wick); **target** = the unfilled 5m/15m gap edge of §6.3 (required — no target, no trade).
 
 ### 7.2 What is different
 
@@ -478,8 +508,9 @@ rule of §6.2 — read that section first; what follows is only where Mech 2 dif
 - **Candidate ordering** is the FVG bot's: confirmation time ascending, with no trigger-TF
   tiebreak. (The filled-gap veto already decides which timeframe owns the move.)
 
-### 7.3 Deferred, not implemented
+### 7.3 Target, and what is deferred
 
-- Same as §6.3: no untapped-5m/15m-gap targeting, no runner management, and the same **rewind
-  caveat** — cleared-blocker state is not reconstructed on rewind, so after a rewind the bot
-  vetoes rather than over-fires.
+- **The unfilled 5m/15m target of §6.3 applies in full** — same polarity rule, same closest-edge
+  choice across 5m and 15m, same `targetGapMaxAgeMinutes` window, same "no target, no trade".
+- Deferred, same as §6.3b: no runner management, and the same **rewind caveat** — cleared-blocker
+  state is not reconstructed on rewind, so after a rewind the bot vetoes rather than over-fires.

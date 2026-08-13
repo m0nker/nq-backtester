@@ -10,8 +10,8 @@ import { writeFileSync } from 'node:fs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const test = `
 import {
-  MECH_TRIGGER_TFS, foldSweep, freshSweepState, isArmed, levelLifespanSec, levelsAt,
-  matchSweepTriggers, sweptSet, triggerWindowSec,
+  DEFAULT_TARGET_GAP_MAX_AGE_MINUTES, MECH_TRIGGER_TFS, TARGET_TFS, foldSweep, freshSweepState,
+  isArmed, levelLifespanSec, levelsAt, matchSweepTriggers, pickTarget, sweptSet, triggerWindowSec,
   type ArmedSweep, type DOLLevel, type LevelDataSource, type SweepRules, type SweepState,
 } from './src/lib/concepts/liquidity';
 import type { TriggerOutcome } from './src/lib/concepts/engine';
@@ -423,6 +423,76 @@ const M2 = (p: Partial<SweepRules> = {}): SweepRules =>
 }
 check('sweep-fired-dedupe',
   matchSweepTriggers({ ...mBase, triggers: [trigAt('1m', 36)], fired: new Set(['1m:' + w(9, 32) + ':long']) }).length, 0);
+
+// ---- the unfilled 5m/15m TARGET (user spec 2026-08-12) ----
+// Both mech bots REQUIRE one: an UNFILLED 5m/15m gap of the OPPOSITE polarity,
+// formed inside the age window, whose NEAR edge is on the profit side. TP is
+// that edge; the closest valid edge across both TFs wins. No target -> no
+// candidate ('no-target'). mBase's long fixture confirms at 09:36 with
+// entryEst 21938, so a long's targets are BEAR gaps with bottom > 21938.
+check('target-tfs', TARGET_TFS, ['5m', '15m']);
+check('target-default-age', DEFAULT_TARGET_GAP_MAX_AGE_MINUTES, 60);
+{
+  const tgt = (tf: Timeframe, top: number, bottom: number, mi: number, p: Partial<FVG> = {}) =>
+    mkGap({ tf, dir: 'bear' as const, top, bottom, formedAt: w(9, mi), ...p });
+  const t5 = tgt('5m', 21980, 21960, 30); // edge 21960
+  const t15 = tgt('15m', 21970, 21950, 25); // edge 21950 — closer to 21938
+  const t5near = tgt('5m', 21962, 21945, 32); // edge 21945 — closest of all
+  const AGE = 3600;
+  const pick = (gaps: FVG[], direction: 'long' | 'short' = 'long', entry = 21938, maxAgeSec = AGE) =>
+    pickTarget({ gaps, direction, entry, at: w(9, 36), maxAgeSec });
+
+  // (a) closest edge wins ACROSS timeframes, in either array order
+  check('target-closest-across-tfs', [pick([t5, t15])?.tf, pick([t5, t15])?.tp], ['15m', 21950]);
+  check('target-closest-order-independent', pick([t15, t5])?.tf, '15m');
+  check('target-5m-can-beat-15m', [pick([t5near, t15])?.tf, pick([t5near, t15])?.tp], ['5m', 21945]);
+  // (b) closest among two gaps on the SAME timeframe
+  check('target-closest-same-tf', pick([t5, t5near])?.tp, 21945);
+  // (c) a tapped / mitigated gap is disqualified outright
+  check('target-tapped-excluded', pick([{ ...t15, tappedAt: w(9, 30) }, t5])?.tf, '5m');
+  check('target-tapped-later-still-ok', pick([{ ...t15, tappedAt: w(9, 50) }, t5])?.tf, '15m');
+  check('target-inverted-excluded', pick([{ ...t15, invertedAt: w(9, 34) }, t5])?.tf, '5m');
+  check('target-expired-excluded', pick([{ ...t15, expiredAt: w(9, 34) }, t5])?.tf, '5m');
+  // (d) age cutoff: a gap formed before confirmTs - maxAge is out
+  const stale = mkGap({ tf: '15m', dir: 'bear' as const, top: 21970, bottom: 21950, formedAt: w(8, 0) });
+  check('target-too-old-excluded', pick([stale, t5])?.tf, '5m');
+  check('target-age-boundary-inclusive', pick([tgt('15m', 21970, 21950, 30)], 'long', 21938, 360)?.tf, '15m');
+  check('target-age-boundary-past', pick([tgt('15m', 21970, 21950, 29)], 'long', 21938, 360), null);
+  check('target-formed-after-confirm-excluded', pick([tgt('15m', 21970, 21950, 40)]), null);
+  // (e) the edge must be on the PROFIT side of the entry
+  check('target-below-entry-excluded', pick([tgt('5m', 21935, 21900, 30)]), null);
+  check('target-edge-at-entry-excluded', pick([tgt('5m', 21960, 21938, 30)]), null);
+  // (f) wrong polarity / wrong timeframe never qualify
+  check('target-wrong-polarity-excluded', pick([{ ...t15, dir: 'bull' as const }]), null);
+  check('target-wrong-tf-excluded', pick([tgt('30m', 21970, 21950, 25)]), null);
+  // (g) SHORT mirror: bull gaps, TP at the TOP, closest below the entry
+  {
+    const b30 = mkGap({ tf: '5m', dir: 'bull' as const, top: 21930, bottom: 21900, formedAt: w(9, 30) });
+    const b15 = mkGap({ tf: '15m', dir: 'bull' as const, top: 21910, bottom: 21880, formedAt: w(9, 30) });
+    check('target-short-picks-top-edge', [pick([b15, b30], 'short')?.tf, pick([b15, b30], 'short')?.tp], ['5m', 21930]);
+    check('target-short-above-entry-excluded',
+      pick([mkGap({ tf: '5m', dir: 'bull' as const, top: 21950, bottom: 21940, formedAt: w(9, 30) })], 'short'), null);
+  }
+
+  // (h) end to end through matchSweepTriggers
+  const tOpts = (gaps: FVG[]) => ({ gaps, maxAgeSec: AGE });
+  {
+    const c = matchSweepTriggers({ ...mBase, triggers: [trigAt('1m', 36)], targets: tOpts([t5, t15]) });
+    check('target-candidate-carries-edge',
+      [c.length, c[0].target?.tf, c[0].target?.tp, c[0].target?.formedAt], [1, '15m', 21950, w(9, 25)]);
+  }
+  // no valid target -> NO candidate, reported as 'no-target'
+  {
+    const dNone: TriggerOutcome[] = [];
+    const c = matchSweepTriggers({ ...mBase, triggers: [trigAt('1m', 36)], targets: tOpts([]), diag: dNone });
+    check('no-target-no-candidate', [c.length, dNone[0].result], [0, 'no-target']);
+    const dOld: TriggerOutcome[] = [];
+    matchSweepTriggers({ ...mBase, triggers: [trigAt('1m', 36)], targets: tOpts([stale]), diag: dOld });
+    check('no-target-when-only-stale', dOld[0].result, 'no-target');
+  }
+  // omitting the option leaves the old behaviour (and the FVG bot) untouched
+  check('targets-optional', matchSweepTriggers({ ...mBase, triggers: [trigAt('1m', 36)] })[0].target, undefined);
+}
 
 // ---- level catalog: session windows pick the most recent COMPLETED one ----
 {

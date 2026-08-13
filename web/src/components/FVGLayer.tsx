@@ -374,6 +374,10 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
           ? [{ z: pendingCandidate.condition, color: '#f5b942', label: `COND ${pendingCandidate.condition.tf}` }]
           : []),
         { z: pendingCandidate.ifvg, color: '#38bdf8', label: `IFVG ${pendingCandidate.ifvg.tf}` },
+        // the unfilled 5m/15m gap the mech bots rebalance into (2026-08-12)
+        ...(pendingCandidate.target
+          ? [{ z: pendingCandidate.target, color: '#34d399', label: `TARGET ${pendingCandidate.target.tf}` }]
+          : []),
       ];
       for (const m of marks) {
         const xL = toX(m.z.bT);

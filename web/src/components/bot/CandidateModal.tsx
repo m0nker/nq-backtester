@@ -72,6 +72,8 @@ export default function CandidateModal() {
   const long = pending.direction === 'long';
   const risk = Math.abs(pending.entryEst - pending.stop);
   const targetEst = pending.entryEst + (long ? risk : -risk);
+  // implied R of an absolute target edge: (tp − entry) / (entry − stop)
+  const targetR = pending.target ? (pending.target.tp - pending.entryEst) / (long ? risk : -risk) : 0;
   const zone = (top: number, bottom: number) => `${bottom.toFixed(2)} – ${top.toFixed(2)}`;
   const submit = (decision: 'take' | 'marginal' | 'skip') => {
     submitDecision(decision, notes.trim());
@@ -149,10 +151,21 @@ export default function CandidateModal() {
           <span className="text-slate-500">stop (swing {long ? 'low' : 'high'})</span>
           <span className="text-rose-300">{pending.stop.toFixed(2)}</span>
         </div>
-        <div className="flex justify-between">
-          <span className="text-slate-500">target (1R) ≈</span>
-          <span className="text-emerald-300">{targetEst.toFixed(2)}</span>
-        </div>
+        {/* mech bots target an unfilled 5m/15m gap's near edge (2026-08-12);
+            the FVG bot keeps the 1R target */}
+        {pending.target ? (
+          <div className="flex justify-between">
+            <span className="text-slate-500">target ({pending.target.tf} gap)</span>
+            <span className="text-emerald-300">
+              {pending.target.tp.toFixed(2)} ({targetR.toFixed(1)}R)
+            </span>
+          </div>
+        ) : (
+          <div className="flex justify-between">
+            <span className="text-slate-500">target (1R) ≈</span>
+            <span className="text-emerald-300">{targetEst.toFixed(2)}</span>
+          </div>
+        )}
         <div className="flex justify-between">
           <span className="text-slate-500">risk</span>
           <span>

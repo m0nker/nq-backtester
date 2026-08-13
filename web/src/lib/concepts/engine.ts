@@ -249,6 +249,7 @@ export type TriggerResult =
   | 'no-bias' // no live bias entry in that direction
   | 'no-condition' // no armed condition FVG aligned at the confirmation
   | 'no-sweep' // mech model: no armed sweep of the aligned side inside its deadline
+  | 'no-target' // mech bots: no unfilled 5m/15m gap to target (see liquidity.ts pickTarget)
   | 'geometry'; // stop on the wrong side of the estimated entry
 
 export interface TriggerOutcome {
@@ -287,6 +288,95 @@ export function standingVeto(
   return hit ? hit.tf : null;
 }
 
+// ---- resweep-cleared blockers (pure bookkeeping, extracted 2026-08-12) ----
+// How deep price has driven into a gap, as an absolute price: the highest
+// high for a bear zone (it fills upward), the lowest low for a bull one.
+// Used as the re-arm watermark for a resweep-cleared blocker — it must be
+// penetrated FURTHER than this to start vetoing again. The caller decides
+// which bars count (the gap's life, a pre-resweep slice, ...); with no bars
+// the answer is the gap's near edge, i.e. "never penetrated".
+export function penetrationOf(g: FVG, bars: Bar[]): number {
+  let ext = g.dir === 'bear' ? -Infinity : Infinity;
+  for (const b of bars) ext = g.dir === 'bear' ? Math.max(ext, b.h) : Math.min(ext, b.l);
+  return Number.isFinite(ext) ? ext : g.dir === 'bear' ? g.bottom : g.top;
+}
+export function penetratedBeyond(g: FVG, mark: number, bars: Bar[]): boolean {
+  return bars.some((b) => (g.dir === 'bear' ? b.h > mark : b.l < mark));
+}
+
+// The cleared-blockers map after one advance: gapKey -> the penetration mark
+// a retired blocker must be driven beyond before it vetoes again.
+//
+// Ordering bug fixed 2026-08-12 (user-reported). This bookkeeping used to run
+// "retire on resweep" LAST, unconditionally, so ONE candle that simultaneously
+// reswept a draw AND tapped deeper into a standing blocker retired that
+// blocker with a mark equal to the penetration INCLUDING its own fresh tap —
+// the resweep-clear beat the tap and the trigger fired.
+//
+// New rule (user decision 2026-08-12): **a resweep retires only vetoes that
+// were standing BEFORE it.** The mark is the penetration as of the moment the
+// resweep bar opens, and any penetration deeper than that AT OR AFTER the
+// resweep bar re-establishes the veto — including inside the same advance.
+//
+// `bars` must span the pool gaps' lives up to `now` (each gap is clipped to
+// its own formation below). Passing the whole window rather than just the new
+// bars does not change step (2): a stored mark is already the deepest
+// penetration reached when the entry was written, so only later bars can beat
+// it.
+export function updateClearedBlockers(opts: {
+  cleared: Record<string, number>;
+  pool: FVG[];
+  resweeps: { dir: FVGDir; at: number }[]; // one per resweep seen this advance
+  bars: Bar[];
+  now: number;
+}): Record<string, number> {
+  const bars = opts.bars.filter((b) => b.t <= opts.now);
+  const lifeOf = (g: FVG) => bars.filter((b) => b.t >= g.formedAt - 60);
+  const byKey = new Map(opts.pool.map((g) => [gapKey(g), g]));
+  const next: Record<string, number> = {};
+
+  for (const [key, mark] of Object.entries(opts.cleared)) {
+    const g = byKey.get(key);
+    if (!g) continue; // (1) the gap left the pool (expired / out of lookback)
+    // (2) RE-ARM: price has now driven deeper than it had when retired
+    if (penetratedBeyond(g, mark, lifeOf(g))) continue;
+    next[key] = mark;
+  }
+
+  // A direction that reswept more than once this advance is dated by its
+  // LATEST raid — that is the resweep whose "standing before" applies.
+  const latest = new Map<FVGDir, number>();
+  for (const r of opts.resweeps) {
+    const cur = latest.get(r.dir);
+    if (cur === undefined || r.at > cur) latest.set(r.dir, r.at);
+  }
+
+  for (const g of opts.pool) {
+    const at = latest.get(g.dir);
+    if (at === undefined) continue; // (3) direction wasn't reswept
+    if (g.tappedAt === null || g.invertedAt !== null || g.expiredAt !== null) continue;
+    const key = gapKey(g);
+    if (next[key] !== undefined) continue; // already cleared: keep the older mark
+    const life = lifeOf(g);
+    const mark = penetrationOf(
+      g,
+      life.filter((b) => b.t < at),
+    );
+    // (4) a fresh tap at/after the resweep bar re-establishes the veto
+    if (
+      penetratedBeyond(
+        g,
+        mark,
+        life.filter((b) => b.t >= at),
+      )
+    ) {
+      continue;
+    }
+    next[key] = mark;
+  }
+  return next;
+}
+
 // A draft carries ONE condition shape: `condition` (armed FVG — the FVG
 // strategy) or `dol` (swept draw on liquidity — the mech model).
 export interface CandidateDraft {
@@ -299,6 +389,10 @@ export interface CandidateDraft {
   ifvg: { tf: Timeframe; top: number; bottom: number; formedAt: number; bT: number };
   stop: number;
   entryEst: number;
+  // MECH BOTS ONLY (added 2026-08-12): the unfilled 5m/15m gap this candidate
+  // targets — `tp` is its near edge, an ABSOLUTE price, not an R multiple.
+  // Absent on FVG-strategy drafts, which keep the 1R target.
+  target?: { tf: Timeframe; top: number; bottom: number; formedAt: number; bT: number; tp: number };
   biasId?: string; // FVG strategy only — the mech model derives direction from the sweep
 }
 

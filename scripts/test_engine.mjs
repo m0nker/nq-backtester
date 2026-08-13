@@ -8,7 +8,7 @@ import { writeFileSync } from 'node:fs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const test = `
 import {
-  armingRef, biasAliveAt, firstInsidePrint, gapKey, inExecutionWindow, isFullyMitigated, matchTriggers, refBreached, resweepBreached, resweepRef, scanForTap, sessionOpenOf, sizeContracts, standingVeto, updateBiasDeaths, wouldInvert,
+  armingRef, biasAliveAt, firstInsidePrint, gapKey, inExecutionWindow, isFullyMitigated, matchTriggers, penetratedBeyond, penetrationOf, refBreached, resweepBreached, resweepRef, scanForTap, sessionOpenOf, sizeContracts, standingVeto, updateBiasDeaths, updateClearedBlockers, wouldInvert,
   type BiasEntry, type TriggerOutcome,
 } from './src/lib/concepts/engine';
 import type { FVG } from './src/lib/concepts/fvg';
@@ -381,6 +381,83 @@ check('trigger-not-self-blocked', matchTriggers({ ...base, blockers: [trigger] }
     standingVeto('1m', 'bear', pool, w(9, 45)),
     standingVeto('1m', 'bear', pool, w(9, 45), new Set([gapKey(pool[0])])),
   ], ['5m', null]);
+}
+
+// ---- cleared-blocker bookkeeping: a resweep retires only vetoes that were
+// standing BEFORE it (user decision 2026-08-12) ----
+//
+// THE BUG THIS FIXES (user-reported, live): the old botStore.onAdvance ran the
+// retire-on-resweep step LAST and unconditionally, marking each blocker with
+// its penetration AS OF THE END OF THE ADVANCE. One candle that simultaneously
+// (a) reswept a draw, (b) tapped deeper into a standing trigger-TF blocker and
+// (c) inverted a trigger therefore retired that blocker with a mark that
+// already included its own fresh tap — the resweep-clear beat the tap and the
+// trigger fired. Case 'resweep-same-bar-tap-holds-veto' below is exactly that
+// candle: OLD semantics produced { '5m:<9:20>': 21932 } (cleared, veto off);
+// the new rule produces {} (veto holds).
+{
+  const blk = mkGap({ tf: '5m', dir: 'bear', top: 21940, bottom: 21920, formedAt: w(9, 20), tappedAt: w(9, 25) });
+  const key = gapKey(blk); // '5m:<9:20>'
+  const shallow = bar(w(9, 25), 21918, 21925, 21915, 21920); // penetrates to 21925
+  const deepPre = bar(w(9, 38), 21920, 21932, 21915, 21930); // deeper, BEFORE the resweep
+  const atRes = bar(w(9, 40), 21920, 21932, 21915, 21930); // deeper, ON the resweep bar
+  const shallowRes = bar(w(9, 40), 21920, 21922, 21915, 21918); // resweep bar, no deeper tap
+  const afterRes = bar(w(9, 42), 21920, 21934, 21915, 21930); // deeper, AFTER the resweep
+  const bearResweep = [{ dir: 'bear' as const, at: w(9, 40) }];
+  const run = (o: Partial<Parameters<typeof updateClearedBlockers>[0]>) =>
+    updateClearedBlockers({ cleared: {}, pool: [blk], resweeps: [], bars: [], now: w(9, 45), ...o });
+
+  // the raw penetration helpers
+  check('penetration-bear-is-highest-high', penetrationOf(blk, [shallow, deepPre]), 21932);
+  check('penetration-empty-is-near-edge', penetrationOf(blk, []), 21920);
+  check('penetration-bull-is-lowest-low',
+    penetrationOf(mkGap({ tf: '5m', dir: 'bull', top: 21940, bottom: 21920, formedAt: w(9, 20) }), [shallow, deepPre]), 21915);
+  check('penetrated-beyond', [penetratedBeyond(blk, 21925, [deepPre]), penetratedBeyond(blk, 21932, [deepPre])], [true, false]);
+
+  // (a) staled by a resweep with NO later penetration -> cleared, marked at
+  //     the penetration standing before the resweep bar
+  check('resweep-clears-standing-veto',
+    run({ resweeps: bearResweep, bars: [shallow, shallowRes] }), { [key]: 21925 });
+  // (b) THE SCREENSHOT CASE: the resweep bar ITSELF taps deeper -> veto holds
+  check('resweep-same-bar-tap-holds-veto',
+    run({ resweeps: bearResweep, bars: [shallow, atRes] }), {});
+  // ...and a deeper tap on a LATER bar of the same advance holds it too
+  check('resweep-later-tap-holds-veto',
+    run({ resweeps: bearResweep, bars: [shallow, shallowRes, afterRes] }), {});
+  // (c) penetration BEFORE the resweep bar only -> cleared, marked at it
+  check('resweep-earlier-tap-still-clears',
+    run({ resweeps: bearResweep, bars: [shallow, deepPre, shallowRes] }), { [key]: 21932 });
+  // (d) a cleared blocker price later drives deeper into -> RE-ARMED (dropped)
+  check('cleared-blocker-rearms-on-deeper',
+    run({ cleared: { [key]: 21925 }, bars: [bar(w(9, 44), 21920, 21930, 21915, 21925)] }), {});
+  check('cleared-blocker-survives-shallower',
+    run({ cleared: { [key]: 21925 }, bars: [bar(w(9, 44), 21920, 21924, 21915, 21922)] }), { [key]: 21925 });
+  // an entry whose gap left the pool is dropped
+  check('cleared-entry-dropped-with-gap', run({ cleared: { [key]: 21925 }, pool: [] }), {});
+  // an already-cleared blocker keeps its OLD mark; the resweep doesn't re-mark it
+  check('resweep-keeps-existing-mark',
+    run({ cleared: { [key]: 21930 }, resweeps: bearResweep, bars: [shallow, shallowRes] }), { [key]: 21930 });
+  // LATEST resweep of the direction dates the cut: the 09:38 tap is before the
+  // 09:40 raid, so it belongs to the retired veto rather than re-establishing it
+  check('resweep-latest-time-wins',
+    run({ resweeps: [{ dir: 'bear' as const, at: w(9, 35) }, ...bearResweep], bars: [shallow, deepPre, shallowRes] }),
+    { [key]: 21932 });
+  // only gaps IN PLAY are retired, and only of the reswept direction
+  check('untapped-blocker-not-retired',
+    run({ pool: [{ ...blk, tappedAt: null }], resweeps: bearResweep, bars: [shallow, shallowRes] }), {});
+  check('inverted-blocker-not-retired',
+    run({ pool: [{ ...blk, invertedAt: w(9, 30) }], resweeps: bearResweep, bars: [shallow, shallowRes] }), {});
+  check('expired-blocker-not-retired',
+    run({ pool: [{ ...blk, expiredAt: w(9, 30) }], resweeps: bearResweep, bars: [shallow, shallowRes] }), {});
+  check('other-direction-not-retired',
+    run({ pool: [{ ...blk, dir: 'bull' as const }], resweeps: bearResweep, bars: [shallow, shallowRes] }), {});
+  // pre-formation bars never count toward the mark (each gap is clipped to its life)
+  check('pre-formation-bars-ignored',
+    run({ resweeps: bearResweep, bars: [bar(w(9, 0), 21990, 22000, 21980, 21990), shallow, shallowRes] }),
+    { [key]: 21925 });
+  // bars after the "now" bound are ignored
+  check('bars-after-now-ignored',
+    run({ resweeps: bearResweep, bars: [shallow, shallowRes, afterRes], now: w(9, 41) }), { [key]: 21925 });
 }
 
 // ---- fully mitigated gaps stay usable as conditions (2026-08-06) ----

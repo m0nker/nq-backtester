@@ -134,7 +134,12 @@ export function deriveState(events: SessionEvent[]): EngineState {
               if ('stopPrice' in bracket) {
                 riskPts = (p.price - bracket.stopPrice) * dir;
                 slPrice = bracket.stopPrice;
-                tpPrice = riskPts > 0 ? p.price + dir * bracket.rr * riskPts : undefined;
+                tpPrice =
+                  'tpPrice' in bracket
+                    ? bracket.tpPrice // absolute-TP form: the edge, exactly
+                    : riskPts > 0
+                      ? p.price + dir * bracket.rr * riskPts
+                      : undefined;
               } else {
                 riskPts = bracket.stopLossPts;
                 slPrice = p.price - dir * bracket.stopLossPts;

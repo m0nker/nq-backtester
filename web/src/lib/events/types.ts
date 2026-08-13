@@ -11,7 +11,11 @@ export type OrderType = 'market' | 'limit' | 'stop';
 //    after the fill — never a full advance behind it.
 export type BracketSpec =
   | { stopLossPts: number; takeProfitPts: number }
-  | { stopPrice: number; rr: number };
+  | { stopPrice: number; rr: number }
+  // fully absolute (added 2026-08-12): SL and TP both pinned at prices —
+  // mech target-gap trades, where the TP must sit AT the gap edge regardless
+  // of entry slip
+  | { stopPrice: number; tpPrice: number };
 
 export type FillKind = 'market_next_open' | 'limit_touch' | 'stop_trigger';
 

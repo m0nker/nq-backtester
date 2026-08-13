@@ -60,7 +60,7 @@ import {
   type TriggerOutcome,
   type TriggerResult,
 } from './engine';
-import type { FVG } from './fvg';
+import type { FVG, FVGDir } from './fvg';
 
 export type DOLSide = 'buyside' | 'sellside';
 export type DOLKind =
@@ -422,6 +422,54 @@ const tfRank = (tf: Timeframe): number => (isSessionTf(tf) ? 0 : TF_SECONDS[tf])
 // so they're excluded even when the session has them enabled for the FVG bot.
 export const MECH_TRIGGER_TFS: readonly Timeframe[] = ['1m', '2m', '3m', '4m', '5m'];
 
+// ---- the unfilled 5m/15m target (user spec 2026-08-12) ----
+// Both mech bots REQUIRE a target: an UNFILLED gap of the OPPOSITE polarity on
+// 5m or 15m — longs need a bearish one, shorts a bullish one. "Unfilled" is
+// absolute: any print inside it, ever, disqualifies it (a mitigated gap is
+// spent liquidity, not a draw). TP is the gap's NEAR edge — the bottom of the
+// bearish gap for a long, the top of the bullish gap for a short — and the
+// chosen gap is whichever valid edge sits CLOSEST to the entry across both
+// timeframes. The gap must also have formed recently (`maxAgeSec`, the
+// `targetGapMaxAgeMinutes` setting) and its edge must be on the PROFIT side of
+// the entry. No valid target -> no candidate ('no-target').
+export const TARGET_TFS: readonly Timeframe[] = ['5m', '15m'];
+export const DEFAULT_TARGET_GAP_MAX_AGE_MINUTES = 60;
+
+export interface TargetGap {
+  tf: Timeframe;
+  top: number;
+  bottom: number;
+  formedAt: number;
+  bT: number;
+  tp: number; // the near edge — an ABSOLUTE price, not an R multiple
+}
+
+export function pickTarget(opts: {
+  gaps: FVG[];
+  direction: BiasDirection;
+  entry: number;
+  at: number; // the confirmation (or, for the scope panel, the clock)
+  maxAgeSec: number;
+}): TargetGap | null {
+  const { entry, at } = opts;
+  const long = opts.direction === 'long';
+  const wantDir: FVGDir = long ? 'bear' : 'bull';
+  let best: TargetGap | null = null;
+  for (const g of opts.gaps) {
+    if (!TARGET_TFS.includes(g.tf) || g.dir !== wantDir) continue;
+    if (g.formedAt > at || g.formedAt < at - opts.maxAgeSec) continue; // age window
+    if (g.tappedAt !== null && g.tappedAt <= at) continue; // ANY mitigation disqualifies
+    if (g.invertedAt !== null && g.invertedAt <= at) continue; // (implied by the tap test)
+    if (g.expiredAt !== null && g.expiredAt <= at) continue;
+    const tp = long ? g.bottom : g.top;
+    if (long ? tp <= entry : tp >= entry) continue; // must be on the profit side
+    if (best === null || Math.abs(tp - entry) < Math.abs(best.tp - entry)) {
+      best = { tf: g.tf, top: g.top, bottom: g.bottom, formedAt: g.formedAt, bT: g.bT, tp };
+    }
+  }
+  return best;
+}
+
 // Rule-3 assembly for the mech model: an IFVG inversion confirms against an
 // armed sweep of the ALIGNED side — sweeping sellside (a low) hunts longs,
 // sweeping buyside (a high) hunts shorts. No bias input: the sweep IS the
@@ -448,6 +496,11 @@ export function matchSweepTriggers(opts: {
   // in-session raid that (re)arms has to beat it, just as a premarket push
   // sets the level an in-session tap must penetrate beyond.
   armFromSessionOpen?: boolean;
+  // The unfilled-5m/15m-gap target (user spec 2026-08-12). When provided, a
+  // candidate REQUIRES one: `gaps` is the 5m/15m condition-gap pool at the
+  // confirmation and `maxAgeSec` the formation-age window. Omitted (tests /
+  // the FVG bot's path) the rule doesn't apply and the 1R target stands.
+  targets?: { gaps: FVG[]; maxAgeSec: number };
   // optional diagnostics sink — every considered inversion appends one entry
   diag?: TriggerOutcome[];
 }): CandidateDraft[] {
@@ -541,6 +594,23 @@ export function matchSweepTriggers(opts: {
       note('geometry');
       continue;
     }
+    // The target is a REQUIREMENT, not a decoration: no unfilled 5m/15m gap of
+    // the opposite polarity within the age window and on the profit side means
+    // there is nothing to rebalance into, so there is no trade.
+    let target: TargetGap | null = null;
+    if (opts.targets) {
+      target = pickTarget({
+        gaps: opts.targets.gaps,
+        direction,
+        entry: entryEst,
+        at: confirmTs,
+        maxAgeSec: opts.targets.maxAgeSec,
+      });
+      if (!target) {
+        note('no-target');
+        continue;
+      }
+    }
     note('candidate');
 
     out.push({
@@ -548,6 +618,7 @@ export function matchSweepTriggers(opts: {
       direction,
       confirmTs,
       otherConditions: [],
+      ...(target ? { target } : {}),
       dol: {
         kind: primary.level.kind,
         side: primary.level.side,

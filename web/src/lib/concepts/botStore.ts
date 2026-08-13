@@ -18,7 +18,7 @@ import { getBarsInWindow, lastVisibleBar, sources } from '../data/barSource';
 import { updateSessionConfig } from '../data/sessions';
 import { appendEvent, getEvents, getSessionId } from '../events/eventLog';
 import type { SessionEvent } from '../events/types';
-import { TF_SECONDS, isSessionTf, type Bar, type Timeframe } from '../types';
+import { TF_SECONDS, isSessionTf, type Timeframe } from '../types';
 import { useReplay } from '../replay/clock';
 import { etWallToUtc, tradingDateOf } from '../time/et';
 import { deriveState } from '../trading/engine';
@@ -34,11 +34,13 @@ import {
   gapKey,
   isFullyMitigated,
   matchTriggers,
+  penetrationOf,
   refBreached,
   scanForTap,
   sessionOpenOf,
   sizeContracts,
   updateBiasDeaths,
+  updateClearedBlockers,
   type ArmedCondition,
   type BiasEntry,
   type BiasDirection,
@@ -54,13 +56,16 @@ import {
   DEFAULT_RESWEEP_WINDOW_MINUTES,
   DEFAULT_SWEEP_MAX_CANDLES,
   DEFAULT_SWEEP_MAX_MINUTES,
+  DEFAULT_TARGET_GAP_MAX_AGE_MINUTES,
   MECH_TRIGGER_TFS,
+  TARGET_TFS,
   foldSweep,
   freshSweepState,
   isArmed,
   isDOLKind,
   levelsAt,
   matchSweepTriggers,
+  pickTarget,
   rebuildSweeps,
   type ArmedSweep,
   type DOLKind,
@@ -160,6 +165,7 @@ export interface BotSettings {
   sweepMaxCandles: number; // candles (of each trigger TF) allowed to invert (mech-model only)
   sweepMaxMinutes: number; // absolute ceiling from the sweep; overrides the above (mech-model only)
   resweepWindowMinutes: number; // resweeps re-arm only this long after the FIRST sweep
+  targetGapMaxAgeMinutes: number; // a target 5m/15m gap must have formed this recently
   dolKinds: DOLKind[]; // which draw-on-liquidity categories can be traded
   // ---- candle-distance bounds (both bots) ----
   gapMaxAgeCandles: number; // a gap expires this many candles of ITS OWN tf after forming
@@ -181,6 +187,7 @@ const DEFAULT_SETTINGS: BotSettings = {
   sweepMaxCandles: DEFAULT_SWEEP_MAX_CANDLES,
   sweepMaxMinutes: DEFAULT_SWEEP_MAX_MINUTES,
   resweepWindowMinutes: DEFAULT_RESWEEP_WINDOW_MINUTES,
+  targetGapMaxAgeMinutes: DEFAULT_TARGET_GAP_MAX_AGE_MINUTES,
   dolKinds: [...ALL_DOL_KINDS],
   gapMaxAgeCandles: DEFAULT_GAP_MAX_AGE,
   conditionLookbackCandles: CONDITION_LOOKBACK,
@@ -215,6 +222,7 @@ function loadSettings(): BotSettings {
       sweepMaxCandles: posNum(p.sweepMaxCandles, DEFAULT_SWEEP_MAX_CANDLES),
       sweepMaxMinutes: posNum(p.sweepMaxMinutes, DEFAULT_SWEEP_MAX_MINUTES),
       resweepWindowMinutes: posNum(p.resweepWindowMinutes, DEFAULT_RESWEEP_WINDOW_MINUTES),
+      targetGapMaxAgeMinutes: posNum(p.targetGapMaxAgeMinutes, DEFAULT_TARGET_GAP_MAX_AGE_MINUTES),
       dolKinds: validDolKinds(p.dolKinds),
       gapMaxAgeCandles: posNum(p.gapMaxAgeCandles, DEFAULT_GAP_MAX_AGE),
       conditionLookbackCandles: posNum(p.conditionLookbackCandles, CONDITION_LOOKBACK),
@@ -246,6 +254,7 @@ function persistSettings(s: BotSettings) {
       sweepMaxCandles: s.sweepMaxCandles,
       sweepMaxMinutes: s.sweepMaxMinutes,
       resweepWindowMinutes: s.resweepWindowMinutes,
+      targetGapMaxAgeMinutes: s.targetGapMaxAgeMinutes,
       dolKinds: s.dolKinds,
       gapMaxAgeCandles: s.gapMaxAgeCandles,
       conditionLookbackCandles: s.conditionLookbackCandles,
@@ -267,6 +276,7 @@ const currentSettings = (s: {
   sweepMaxCandles: number;
   sweepMaxMinutes: number;
   resweepWindowMinutes: number;
+  targetGapMaxAgeMinutes: number;
   dolKinds: DOLKind[];
   gapMaxAgeCandles: number;
   conditionLookbackCandles: number;
@@ -284,6 +294,7 @@ const currentSettings = (s: {
   sweepMaxCandles: s.sweepMaxCandles,
   sweepMaxMinutes: s.sweepMaxMinutes,
   resweepWindowMinutes: s.resweepWindowMinutes,
+  targetGapMaxAgeMinutes: s.targetGapMaxAgeMinutes,
   dolKinds: s.dolKinds,
   gapMaxAgeCandles: s.gapMaxAgeCandles,
   conditionLookbackCandles: s.conditionLookbackCandles,
@@ -310,6 +321,7 @@ function settingsFromConfig(config: Record<string, unknown> | undefined): BotSet
     sweepMaxCandles: posNum(config.sweepMaxCandles, local.sweepMaxCandles),
     sweepMaxMinutes: posNum(config.sweepMaxMinutes, local.sweepMaxMinutes),
     resweepWindowMinutes: posNum(config.resweepWindowMinutes, local.resweepWindowMinutes),
+    targetGapMaxAgeMinutes: posNum(config.targetGapMaxAgeMinutes, local.targetGapMaxAgeMinutes),
     dolKinds: config.dolKinds !== undefined ? validDolKinds(config.dolKinds) : local.dolKinds,
     gapMaxAgeCandles: posNum(config.gapMaxAgeCandles, local.gapMaxAgeCandles),
     conditionLookbackCandles: posNum(config.conditionLookbackCandles, local.conditionLookbackCandles),
@@ -326,18 +338,11 @@ export interface ArmedState {
   reswept: boolean; // the resweep already fired for this arming
 }
 
-// How deep price has driven into a gap, as an absolute price: the highest
-// high for a bear zone (it fills upward), the lowest low for a bull one.
-// Used as the re-arm watermark for a resweep-cleared blocker — it must be
-// penetrated FURTHER than this to start vetoing again.
-const penetrationOf = (g: FVG, upTo: number): number => {
-  const bars = getBarsInWindow(g.formedAt - 60, upTo);
-  let ext = g.dir === 'bear' ? -Infinity : Infinity;
-  for (const b of bars) ext = g.dir === 'bear' ? Math.max(ext, b.h) : Math.min(ext, b.l);
-  return Number.isFinite(ext) ? ext : g.dir === 'bear' ? g.bottom : g.top;
-};
-const penetratedBeyond = (g: FVG, mark: number, bars: Bar[]): boolean =>
-  bars.some((b) => (g.dir === 'bear' ? b.h > mark : b.l < mark));
+// Data-bound wrapper over engine.penetrationOf: how deep price has driven
+// into a gap over its whole life up to `upTo`. (The bookkeeping itself is the
+// pure engine.updateClearedBlockers — extracted 2026-08-12.)
+const penetrationAt = (g: FVG, upTo: number): number =>
+  penetrationOf(g, getBarsInWindow(g.formedAt - 60, upTo));
 
 // ---- live scope (what the bot is looking at RIGHT NOW) ----
 // Rebuilt every advance so the UI can answer "there's a 1m IFVG on my screen,
@@ -366,6 +371,13 @@ export interface ScopeSweep {
   side: 'buyside' | 'sellside';
   sweptAt: number;
 }
+// The closest valid unfilled 5m/15m target per side, for the scope panel
+// (mech bots only — null for the FVG strategy, which targets 1R).
+export interface ScopeTarget {
+  tf: Timeframe;
+  tp: number; // near edge = where the TP would sit
+  ageMin: number; // minutes since the gap formed
+}
 export interface BotScope {
   at: number; // market time this snapshot describes
   dormant: 'position' | null; // one-position gate: not scanning at all
@@ -373,6 +385,7 @@ export interface BotScope {
   sweeps: ScopeSweep[]; // armed draws on liquidity (mech bots)
   inPlay: ScopeZone[]; // trigger-TF gaps that could still invert into a setup
   triggers: ScopeTrigger[];
+  targets: { long: ScopeTarget | null; short: ScopeTarget | null } | null;
 }
 
 interface BotState {
@@ -405,6 +418,7 @@ interface BotState {
   sweepMaxCandles: number; // mech-model: candles per trigger TF to invert
   sweepMaxMinutes: number; // mech-model: absolute minute ceiling from the sweep
   resweepWindowMinutes: number; // mech bots: how long resweeps stay valid after the first sweep
+  targetGapMaxAgeMinutes: number; // mech bots: max age of the unfilled 5m/15m target gap
   dolKinds: DOLKind[]; // mech bots: tradeable draw-on-liquidity categories
   gapMaxAgeCandles: number; // gap expiry, in candles of its own timeframe
   conditionLookbackCandles: number;
@@ -425,6 +439,7 @@ interface BotState {
   setSweepMaxCandles: (v: number) => void;
   setSweepMaxMinutes: (v: number) => void;
   setResweepWindowMinutes: (v: number) => void;
+  setTargetGapMaxAgeMinutes: (v: number) => void;
   toggleDolKind: (k: DOLKind) => void;
   setScanBound: (k: 'gapMaxAgeCandles' | 'conditionLookbackCandles' | 'triggerLookbackCandles', v: number) => void;
   setSizeGuard: (k: 'minStopPts' | 'maxContracts', v: number) => void;
@@ -472,10 +487,17 @@ const triggerGapsAt = (upTo: number, tfs: Timeframe[], b: ScanBounds): FVG[] => 
   return out;
 };
 
-const conditionGapsAt = (upTo: number, b: ScanBounds = DEFAULT_BOUNDS): FVG[] => {
+// Condition-timeframe gap pool. `tfs` narrows it — the mech bots reuse this
+// same clock-clipped, windowed machinery for the 5m/15m TARGET scan (added
+// 2026-08-12) rather than growing a second gap pipeline.
+const conditionGapsAt = (
+  upTo: number,
+  b: ScanBounds = DEFAULT_BOUNDS,
+  tfs: readonly Timeframe[] = CONDITION_TFS,
+): FVG[] => {
   const look = effLookback(b.condLookback, b.maxAge);
   const out: FVG[] = [];
-  for (const tf of CONDITION_TFS) {
+  for (const tf of tfs) {
     out.push(
       ...computeFVGs(sources.NQ.getRecentCandles(upTo, tf, look + 5), tf, upTo, {
         lookbackCandles: look,
@@ -595,6 +617,24 @@ const firedFromEvents = (events: SessionEvent[]): Record<string, number> => {
   return fired;
 };
 
+// The closest valid target per side AT `to`, judged against the last visible
+// close (the stand-in for the entry the panel can't know yet). Returns null
+// for non-mech sessions — those keep the 1R target and have no TARGETS row.
+const targetScopeAt = (
+  to: number,
+  maxAgeSec: number,
+  bounds: ScanBounds,
+): BotScope['targets'] => {
+  const entry = lastVisibleBar(to)?.c;
+  if (entry === undefined) return { long: null, short: null };
+  const gaps = conditionGapsAt(to, bounds, TARGET_TFS);
+  const pick = (direction: BiasDirection): ScopeTarget | null => {
+    const t = pickTarget({ gaps, direction, entry, at: to, maxAgeSec });
+    return t ? { tf: t.tf, tp: t.tp, ageMin: Math.max(0, Math.round((to - t.formedAt) / 60)) } : null;
+  };
+  return { long: pick('long'), short: pick('short') };
+};
+
 // Scope snapshot WITHOUT running a trigger match — used at begin/resume/
 // rewind so the panel is populated the moment a session opens, instead of
 // looking broken until the first advance. onAdvance builds the richer
@@ -606,12 +646,14 @@ function snapshotScope(
   triggerTfs: Timeframe[],
   dormant: 'position' | null,
   bounds: ScanBounds,
+  targets: BotScope['targets'] = null,
 ): BotScope {
   const pool: FVG[] = dormant ? [] : triggerGapsAt(to, triggerTfs, bounds);
   return {
     at: to,
     dormant,
     sweeps,
+    targets,
     conditions: conditions
       .filter(({ gap }) => gap.invertedAt === null && gap.expiredAt === null)
       .map(({ gap, armedAt }) => ({
@@ -655,7 +697,7 @@ const clearedFromArming = (
   for (const g of triggerGapsAt(upTo, triggerTfs, bounds)) {
     if (!dirs.has(g.dir)) continue;
     if (g.tappedAt === null || g.invertedAt !== null || g.expiredAt !== null) continue;
-    out[gapKey(g)] = penetrationOf(g, upTo);
+    out[gapKey(g)] = penetrationAt(g, upTo);
   }
   return out;
 };
@@ -688,6 +730,8 @@ export const useBot = create<BotState>((set, get) => {
       condition: draft.condition,
       otherConditions: draft.otherConditions,
       dol: draft.dol,
+      // NOTE: draft.target is not logged — the candidate_shown payload shape
+      // lives in events/types.ts, outside this change's scope.
       ifvg: draft.ifvg,
       stop: draft.stop,
       entryEst: draft.entryEst,
@@ -764,8 +808,18 @@ export const useBot = create<BotState>((set, get) => {
     // Backstop: even a correct stop distance shouldn't be able to produce a
     // position this book can't survive if the stop gaps.
     const qty = Math.min(sized, s.maxContracts);
+    // TP: 1R for the FVG bot; the TARGET GAP'S NEAR EDGE for a mech draft
+    // that carries one (user spec 2026-08-12) — placed through the fully
+    // absolute bracket form, so the TP sits AT the edge whatever the entry
+    // fill does.
+    if (draft.target && (draft.target.tp - entryRef) * dir <= 0) {
+      console.warn(
+        `bot: skipping ${draft.candidateId} — target ${draft.target.tp} is no longer beyond the entry`,
+      );
+      return false;
+    }
     // absolute-stop bracket: the fill pipeline spawns the SL (swing extreme)
-    // + 1R-TP OCO legs at the entry fill itself, so they're live for every
+    // + TP OCO legs at the entry fill itself, so they're live for every
     // bar after it — the old post-advance leg placement left the stop blind
     // for a whole advance (the oversized-loss bug).
     appendEvent('order_placed', now(), {
@@ -773,7 +827,9 @@ export const useBot = create<BotState>((set, get) => {
       side: draft.direction === 'long' ? 'buy' : 'sell',
       type: 'market',
       qty,
-      bracket: { stopPrice: roundToTick(draft.stop), rr: 1 },
+      bracket: draft.target
+        ? { stopPrice: roundToTick(draft.stop), tpPrice: roundToTick(draft.target.tp) }
+        : { stopPrice: roundToTick(draft.stop), rr: 1 },
     });
     refreshTrading();
     unarmAligned(draft.direction);
@@ -842,6 +898,7 @@ export const useBot = create<BotState>((set, get) => {
     sweepMaxCandles: DEFAULT_SWEEP_MAX_CANDLES,
     sweepMaxMinutes: DEFAULT_SWEEP_MAX_MINUTES,
     resweepWindowMinutes: DEFAULT_RESWEEP_WINDOW_MINUTES,
+    targetGapMaxAgeMinutes: DEFAULT_TARGET_GAP_MAX_AGE_MINUTES,
     dolKinds: [...ALL_DOL_KINDS],
     gapMaxAgeCandles: DEFAULT_GAP_MAX_AGE,
     conditionLookbackCandles: CONDITION_LOOKBACK,
@@ -875,6 +932,7 @@ export const useBot = create<BotState>((set, get) => {
         sweepMaxCandles: settings.sweepMaxCandles,
         sweepMaxMinutes: settings.sweepMaxMinutes,
         resweepWindowMinutes: settings.resweepWindowMinutes,
+        targetGapMaxAgeMinutes: settings.targetGapMaxAgeMinutes,
         dolKinds: settings.dolKinds,
         gapMaxAgeCandles: settings.gapMaxAgeCandles,
         conditionLookbackCandles: settings.conditionLookbackCandles,
@@ -901,6 +959,7 @@ export const useBot = create<BotState>((set, get) => {
               trigTfsOf({ botId, triggerTfs: settings.triggerTfs }),
               null,
               bounds,
+              dol ? targetScopeAt(t, settings.targetGapMaxAgeMinutes * 60, bounds) : null,
             )
           : null,
       });
@@ -933,6 +992,7 @@ export const useBot = create<BotState>((set, get) => {
         sweepMaxCandles: settings.sweepMaxCandles,
         sweepMaxMinutes: settings.sweepMaxMinutes,
         resweepWindowMinutes: settings.resweepWindowMinutes,
+        targetGapMaxAgeMinutes: settings.targetGapMaxAgeMinutes,
         dolKinds: settings.dolKinds,
         gapMaxAgeCandles: settings.gapMaxAgeCandles,
         conditionLookbackCandles: settings.conditionLookbackCandles,
@@ -966,6 +1026,7 @@ export const useBot = create<BotState>((set, get) => {
           trigTfsOf({ botId, triggerTfs: settings.triggerTfs }),
           null,
           bounds,
+          dol ? targetScopeAt(upTo, settings.targetGapMaxAgeMinutes * 60, bounds) : null,
         ),
       });
     },
@@ -1009,6 +1070,13 @@ export const useBot = create<BotState>((set, get) => {
     setSweepMaxCandles: (v) => applyMechSetting({ sweepMaxCandles: Math.round(v) }),
     setSweepMaxMinutes: (v) => applyMechSetting({ sweepMaxMinutes: v }),
     setResweepWindowMinutes: (v) => applyMechSetting({ resweepWindowMinutes: v }),
+    // Target age only decides which gaps qualify at the NEXT trigger — no
+    // sweep state depends on it, so no rebuild.
+    setTargetGapMaxAgeMinutes: (v) => {
+      if (!Number.isFinite(v) || v <= 0) return;
+      set({ targetGapMaxAgeMinutes: v });
+      persistSettings(currentSettings(get()));
+    },
     toggleDolKind: (k) => {
       const cur = get().dolKinds;
       const next = cur.includes(k) ? cur.filter((x) => x !== k) : [...cur, k];
@@ -1119,8 +1187,10 @@ export const useBot = create<BotState>((set, get) => {
       // own formation).
       const sessionOpen = sessionOpenOf(to);
       const armed: Record<string, ArmedState> = {};
-      // directions whose blockers a resweep retired on this advance
-      const resweptDirs = new Set<FVG['dir']>();
+      // Resweeps seen on this advance, WITH the bar time each happened on
+      // (2026-08-12): a resweep only retires the vetoes standing before it, so
+      // the bookkeeping needs the moment, not just the direction.
+      const resweeps: { dir: FVG['dir']; at: number }[] = [];
       const watermarks: Record<string, number> = {};
       const sweeps: Record<string, SweepState> = {};
       const conditions: ArmedCondition[] = [];
@@ -1148,7 +1218,8 @@ export const useBot = create<BotState>((set, get) => {
             state.sweptAt !== null &&
             state.sweptAt > prev.sweptAt
           ) {
-            resweptDirs.add(level.side === 'sellside' ? 'bear' : 'bull');
+            // the re-arm's new sweptAt IS the resweep bar
+            resweeps.push({ dir: level.side === 'sellside' ? 'bear' : 'bull', at: state.sweptAt });
           }
           // A sweep that DIED inside this advance still counts for an
           // inversion that confirmed before the death, so it goes into the
@@ -1188,9 +1259,12 @@ export const useBot = create<BotState>((set, get) => {
               // every trigger that was in play is stale. Edge-triggered — one
               // per arming, else a fixed reference would re-clear on every bar
               // below it and nothing could ever re-arm.
-              const hit =
-                !prev.reswept && newBars.some((b) => resweepBreached(g.dir, prev.swept, b));
-              if (hit) resweptDirs.add(g.dir === 'bull' ? 'bear' : 'bull');
+              // the resweep bar is the FIRST new bar that breaches — its time
+              // is what dates the cleared-blocker cut (2026-08-12)
+              const hit = prev.reswept
+                ? undefined
+                : newBars.find((b) => resweepBreached(g.dir, prev.swept, b));
+              if (hit) resweeps.push({ dir: g.dir === 'bull' ? 'bear' : 'bull', at: hit.t });
               armed[key] = hit ? { ...prev, reswept: true } : prev;
             }
           } else if (scan.armedBar) {
@@ -1237,28 +1311,21 @@ export const useBot = create<BotState>((set, get) => {
         for (const g of pool) {
           if (g.invertedAt !== null && g.invertedAt > from && g.invertedAt <= to) triggers.push(g);
         }
-        // Resweep bookkeeping, in this order:
-        //  1. drop entries whose gap is gone (expired / out of lookback);
-        //  2. RE-ARM any cleared blocker price has now driven deeper than it
-        //     had reached when it was retired (the user's "same logic as
-        //     re-arming a filled condition");
-        //  3. retire the blockers of any direction reswept on THIS advance —
-        //     done last so a gap cleared now isn't re-armed by the same bars.
-        const byKey = new Map(pool.map((g) => [gapKey(g), g]));
-        const next: Record<string, number> = {};
-        for (const [key, mark] of Object.entries(clearedTriggers)) {
-          const g = byKey.get(key);
-          if (!g) continue; // (1)
-          if (penetratedBeyond(g, mark, newBars)) continue; // (2)
-          next[key] = mark;
-        }
-        for (const g of pool) {
-          if (!resweptDirs.has(g.dir)) continue; // (3)
-          if (g.tappedAt === null || g.invertedAt !== null || g.expiredAt !== null) continue;
-          const key = gapKey(g);
-          if (next[key] === undefined) next[key] = penetrationOf(g, to);
-        }
-        clearedTriggers = next;
+        // Resweep bookkeeping — pure, in engine.updateClearedBlockers (moved
+        // there 2026-08-12 along with the ordering fix: a resweep now retires
+        // only the vetoes standing BEFORE it, so a fresh tap on or after the
+        // resweep bar re-establishes the veto inside the same advance).
+        // The bar window has to span the pool gaps' lives, not just this
+        // advance, because the marks are life-wide penetrations.
+        let earliest = Infinity;
+        for (const g of pool) earliest = Math.min(earliest, g.formedAt);
+        clearedTriggers = updateClearedBlockers({
+          cleared: clearedTriggers,
+          pool,
+          resweeps,
+          bars: Number.isFinite(earliest) ? getBarsInWindow(earliest - 60, to) : [],
+          now: to,
+        });
 
         const common = {
           triggers,
@@ -1274,6 +1341,13 @@ export const useBot = create<BotState>((set, get) => {
             sweeps: armedSweeps,
             rules: rulesOf(s),
             clearedBlockers,
+            // the unfilled 5m/15m target is a REQUIREMENT for both mech bots
+            // (user spec 2026-08-12) — same clock-clipped, windowed gap
+            // machinery the FVG bot's conditions come from
+            targets: {
+              gaps: conditionGapsAt(to, boundsOf(s), TARGET_TFS),
+              maxAgeSec: s.targetGapMaxAgeMinutes * 60,
+            },
             // mech-2 only (added 2026-08-12): the FVG bot's session-tap rule,
             // applied to the sweep — an overnight raid can't back a candidate
             armFromSessionOpen: s.botId === 'mech-2',
@@ -1308,6 +1382,8 @@ export const useBot = create<BotState>((set, get) => {
       const scope: BotScope = {
         at: to,
         dormant,
+        // mech bots only: the closest valid unfilled 5m/15m target per side
+        targets: dol ? targetScopeAt(to, s.targetGapMaxAgeMinutes * 60, boundsOf(s)) : null,
         sweeps: armedSweeps.map((a) => ({
           label: a.level.label,
           price: a.level.price,
@@ -1448,6 +1524,7 @@ export const useBot = create<BotState>((set, get) => {
           trigTfsOf(s),
           null,
           bounds,
+          dol ? targetScopeAt(to, s.targetGapMaxAgeMinutes * 60, bounds) : null,
         ),
         fired: Object.fromEntries(Object.entries(s.fired).filter(([, ts]) => ts <= to)),
         pending: s.pending && s.pending.confirmTs > to ? null : s.pending,

@@ -53,6 +53,7 @@ export default function BotPanel() {
   const sweepMaxCandles = useBot((s) => s.sweepMaxCandles);
   const sweepMaxMinutes = useBot((s) => s.sweepMaxMinutes);
   const resweepWindowMinutes = useBot((s) => s.resweepWindowMinutes);
+  const targetGapMaxAgeMinutes = useBot((s) => s.targetGapMaxAgeMinutes);
   const dolKinds = useBot((s) => s.dolKinds);
   const gapMaxAgeCandles = useBot((s) => s.gapMaxAgeCandles);
   const conditionLookbackCandles = useBot((s) => s.conditionLookbackCandles);
@@ -282,6 +283,22 @@ export default function BotPanel() {
                   onChange={(e) => useBot.getState().setResweepWindowMinutes(+e.target.value)}
                 />
                 <span className="text-slate-500">min after first sweep</span>
+              </div>
+              {/* added 2026-08-12: the unfilled 5m/15m gap the trade targets */}
+              <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
+                Target gap max age
+                <Info text="Both mech bots REQUIRE a target: an UNFILLED (never tapped — any mitigation disqualifies it) 5m or 15m FVG of the opposite polarity — longs need a bearish one, shorts a bullish one. The take-profit is that gap's near edge (bottom for longs, top for shorts), choosing whichever valid edge across 5m and 15m sits CLOSEST to the entry and on the profit side. The gap must have FORMED within this many minutes of the confirmation; if nothing qualifies there is no candidate at all (diagnostic: 'no unfilled 5m/15m target')." />
+              </div>
+              <div className="mb-3 flex items-center gap-2">
+                <input
+                  type="number"
+                  min={1}
+                  step={5}
+                  className="w-20 rounded bg-slate-800 px-2 py-1 font-mono"
+                  value={targetGapMaxAgeMinutes}
+                  onChange={(e) => useBot.getState().setTargetGapMaxAgeMinutes(+e.target.value)}
+                />
+                <span className="text-slate-500">min since the gap formed</span>
               </div>
             </>
           )}
