@@ -19,6 +19,9 @@ export default function CandidateModal() {
   const pending = useBot((s) => s.pending);
   const queue = useBot((s) => s.queue);
   const action = useBot((s) => s.action);
+  // The floor is a SETTING, not a property of the draft — read it here rather
+  // than carrying a copy on every candidate (2026-08-14).
+  const minRR = useBot((s) => s.minRR);
   const submitDecision = useBot((s) => s.submitDecision);
   const qty = useTrading((s) => s.qty);
   const [notes, setNotes] = useState('');
@@ -152,12 +155,16 @@ export default function CandidateModal() {
           <span className="text-rose-300">{pending.stop.toFixed(2)}</span>
         </div>
         {/* mech bots target an unfilled 5m/15m gap's near edge (2026-08-12);
-            the FVG bot keeps the 1R target */}
+            the FVG bot keeps the 1R target. A STRETCHED target (2026-08-14)
+            sat below the min-RR floor: the TP is minRR × R off the fill and
+            the edge only moves the stop to break-even. */}
         {pending.target ? (
           <div className="flex justify-between">
             <span className="text-slate-500">target ({pending.target.tf} gap)</span>
             <span className="text-emerald-300">
-              {pending.target.tp.toFixed(2)} ({targetR.toFixed(1)}R)
+              {pending.target.mode === 'stretched'
+                ? `min ${minRR}R · BE @ ${pending.target.tp.toFixed(2)}`
+                : `${pending.target.tp.toFixed(2)} (${targetR.toFixed(1)}R)`}
             </span>
           </div>
         ) : (

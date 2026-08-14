@@ -392,7 +392,18 @@ export interface CandidateDraft {
   // MECH BOTS ONLY (added 2026-08-12): the unfilled 5m/15m gap this candidate
   // targets — `tp` is its near edge, an ABSOLUTE price, not an R multiple.
   // Absent on FVG-strategy drafts, which keep the 1R target.
-  target?: { tf: Timeframe; top: number; bottom: number; formedAt: number; bT: number; tp: number };
+  // `mode` is the min-RR floor of the 2026-08-14 spec: 'edge' = the TP sits AT
+  // `tp`; 'stretched' = the edge was closer than minRR × R, so the TP is minRR
+  // × R off the actual fill and `tp` is the BREAK-EVEN TRIGGER instead.
+  target?: {
+    tf: Timeframe;
+    top: number;
+    bottom: number;
+    formedAt: number;
+    bT: number;
+    tp: number;
+    mode: 'edge' | 'stretched';
+  };
   biasId?: string; // FVG strategy only — the mech model derives direction from the sweep
 }
 

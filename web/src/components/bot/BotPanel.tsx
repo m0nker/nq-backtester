@@ -54,6 +54,8 @@ export default function BotPanel() {
   const sweepMaxMinutes = useBot((s) => s.sweepMaxMinutes);
   const resweepWindowMinutes = useBot((s) => s.resweepWindowMinutes);
   const targetGapMaxAgeMinutes = useBot((s) => s.targetGapMaxAgeMinutes);
+  const enforceMinRR = useBot((s) => s.enforceMinRR);
+  const minRR = useBot((s) => s.minRR);
   const dolKinds = useBot((s) => s.dolKinds);
   const gapMaxAgeCandles = useBot((s) => s.gapMaxAgeCandles);
   const conditionLookbackCandles = useBot((s) => s.conditionLookbackCandles);
@@ -300,6 +302,25 @@ export default function BotPanel() {
                 />
                 <span className="text-slate-500">min since the gap formed</span>
               </div>
+              {/* added 2026-08-14: the min-RR floor on that target */}
+              <label className="mb-3 flex cursor-pointer items-center gap-2 text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={enforceMinRR}
+                  onChange={(e) => useBot.getState().setEnforceMinRR(e.target.checked)}
+                />
+                min RR
+                <input
+                  type="number"
+                  min={0.1}
+                  step={0.1}
+                  disabled={!enforceMinRR}
+                  className="w-16 rounded bg-slate-800 px-2 py-1 font-mono disabled:opacity-40"
+                  value={minRR}
+                  onChange={(e) => useBot.getState().setMinRR(+e.target.value)}
+                />
+                <Info text="A floor on the target's reward:risk. When the chosen gap edge is closer than this multiple of the stop distance, the take-profit is STRETCHED to minRR × R off the actual fill instead of sitting at the edge — and the edge becomes the BREAK-EVEN trigger: the first print at or beyond it moves the stop-loss to the entry fill. At or above the floor nothing changes (TP at the edge). Off = always the edge, whatever the ratio. The break-even watch is in memory only: resuming a session with the trade already open will not re-arm it." />
+              </label>
             </>
           )}
           {!dol && (<>

@@ -53,6 +53,7 @@ import { CONDITION_TFS, TRIGGER_TFS_ALL, computeFVGs, type FVG } from './fvg';
 import {
   ALL_DOL_KINDS,
   DEFAULT_DOL_INVALIDATION_PTS,
+  DEFAULT_MIN_RR,
   DEFAULT_RESWEEP_WINDOW_MINUTES,
   DEFAULT_SWEEP_MAX_CANDLES,
   DEFAULT_SWEEP_MAX_MINUTES,
@@ -166,6 +167,10 @@ export interface BotSettings {
   sweepMaxMinutes: number; // absolute ceiling from the sweep; overrides the above (mech-model only)
   resweepWindowMinutes: number; // resweeps re-arm only this long after the FIRST sweep
   targetGapMaxAgeMinutes: number; // a target 5m/15m gap must have formed this recently
+  // min-RR floor on that target (user spec 2026-08-14): under it the TP is
+  // stretched to minRR × R and the gap edge becomes the break-even trigger
+  enforceMinRR: boolean;
+  minRR: number;
   dolKinds: DOLKind[]; // which draw-on-liquidity categories can be traded
   // ---- candle-distance bounds (both bots) ----
   gapMaxAgeCandles: number; // a gap expires this many candles of ITS OWN tf after forming
@@ -188,6 +193,8 @@ const DEFAULT_SETTINGS: BotSettings = {
   sweepMaxMinutes: DEFAULT_SWEEP_MAX_MINUTES,
   resweepWindowMinutes: DEFAULT_RESWEEP_WINDOW_MINUTES,
   targetGapMaxAgeMinutes: DEFAULT_TARGET_GAP_MAX_AGE_MINUTES,
+  enforceMinRR: true,
+  minRR: DEFAULT_MIN_RR,
   dolKinds: [...ALL_DOL_KINDS],
   gapMaxAgeCandles: DEFAULT_GAP_MAX_AGE,
   conditionLookbackCandles: CONDITION_LOOKBACK,
@@ -223,6 +230,8 @@ function loadSettings(): BotSettings {
       sweepMaxMinutes: posNum(p.sweepMaxMinutes, DEFAULT_SWEEP_MAX_MINUTES),
       resweepWindowMinutes: posNum(p.resweepWindowMinutes, DEFAULT_RESWEEP_WINDOW_MINUTES),
       targetGapMaxAgeMinutes: posNum(p.targetGapMaxAgeMinutes, DEFAULT_TARGET_GAP_MAX_AGE_MINUTES),
+      enforceMinRR: p.enforceMinRR ?? true,
+      minRR: posNum(p.minRR, DEFAULT_MIN_RR),
       dolKinds: validDolKinds(p.dolKinds),
       gapMaxAgeCandles: posNum(p.gapMaxAgeCandles, DEFAULT_GAP_MAX_AGE),
       conditionLookbackCandles: posNum(p.conditionLookbackCandles, CONDITION_LOOKBACK),
@@ -255,6 +264,8 @@ function persistSettings(s: BotSettings) {
       sweepMaxMinutes: s.sweepMaxMinutes,
       resweepWindowMinutes: s.resweepWindowMinutes,
       targetGapMaxAgeMinutes: s.targetGapMaxAgeMinutes,
+      enforceMinRR: s.enforceMinRR,
+      minRR: s.minRR,
       dolKinds: s.dolKinds,
       gapMaxAgeCandles: s.gapMaxAgeCandles,
       conditionLookbackCandles: s.conditionLookbackCandles,
@@ -277,6 +288,8 @@ const currentSettings = (s: {
   sweepMaxMinutes: number;
   resweepWindowMinutes: number;
   targetGapMaxAgeMinutes: number;
+  enforceMinRR: boolean;
+  minRR: number;
   dolKinds: DOLKind[];
   gapMaxAgeCandles: number;
   conditionLookbackCandles: number;
@@ -295,6 +308,8 @@ const currentSettings = (s: {
   sweepMaxMinutes: s.sweepMaxMinutes,
   resweepWindowMinutes: s.resweepWindowMinutes,
   targetGapMaxAgeMinutes: s.targetGapMaxAgeMinutes,
+  enforceMinRR: s.enforceMinRR,
+  minRR: s.minRR,
   dolKinds: s.dolKinds,
   gapMaxAgeCandles: s.gapMaxAgeCandles,
   conditionLookbackCandles: s.conditionLookbackCandles,
@@ -322,6 +337,8 @@ function settingsFromConfig(config: Record<string, unknown> | undefined): BotSet
     sweepMaxMinutes: posNum(config.sweepMaxMinutes, local.sweepMaxMinutes),
     resweepWindowMinutes: posNum(config.resweepWindowMinutes, local.resweepWindowMinutes),
     targetGapMaxAgeMinutes: posNum(config.targetGapMaxAgeMinutes, local.targetGapMaxAgeMinutes),
+    enforceMinRR: typeof config.enforceMinRR === 'boolean' ? config.enforceMinRR : local.enforceMinRR,
+    minRR: posNum(config.minRR, local.minRR),
     dolKinds: config.dolKinds !== undefined ? validDolKinds(config.dolKinds) : local.dolKinds,
     gapMaxAgeCandles: posNum(config.gapMaxAgeCandles, local.gapMaxAgeCandles),
     conditionLookbackCandles: posNum(config.conditionLookbackCandles, local.conditionLookbackCandles),
@@ -419,6 +436,15 @@ interface BotState {
   sweepMaxMinutes: number; // mech-model: absolute minute ceiling from the sweep
   resweepWindowMinutes: number; // mech bots: how long resweeps stay valid after the first sweep
   targetGapMaxAgeMinutes: number; // mech bots: max age of the unfilled 5m/15m target gap
+  enforceMinRR: boolean; // mech bots: apply the min-RR floor to that target
+  minRR: number; // mech bots: the floor itself (1 = the "1:1")
+  // Armed break-even watch for a STRETCHED target trade (user spec
+  // 2026-08-14): the first print at/beyond `edge` after entry moves the stop
+  // to the fill. IN-MEMORY ONLY — not an event, so resuming a session mid-
+  // position does NOT re-arm it (the trade then runs on its original stop).
+  // `placedAt` is the order's market time, so a rewind before the entry can
+  // drop the watch the way the reducer drops the order.
+  beWatch: { edge: number; direction: BiasDirection; placedAt: number } | null;
   dolKinds: DOLKind[]; // mech bots: tradeable draw-on-liquidity categories
   gapMaxAgeCandles: number; // gap expiry, in candles of its own timeframe
   conditionLookbackCandles: number;
@@ -440,6 +466,8 @@ interface BotState {
   setSweepMaxMinutes: (v: number) => void;
   setResweepWindowMinutes: (v: number) => void;
   setTargetGapMaxAgeMinutes: (v: number) => void;
+  setEnforceMinRR: (v: boolean) => void;
+  setMinRR: (v: number) => void;
   toggleDolKind: (k: DOLKind) => void;
   setScanBound: (k: 'gapMaxAgeCandles' | 'conditionLookbackCandles' | 'triggerLookbackCandles', v: number) => void;
   setSizeGuard: (k: 'minStopPts' | 'maxContracts', v: number) => void;
@@ -808,11 +836,16 @@ export const useBot = create<BotState>((set, get) => {
     // Backstop: even a correct stop distance shouldn't be able to produce a
     // position this book can't survive if the stop gaps.
     const qty = Math.min(sized, s.maxContracts);
-    // TP: 1R for the FVG bot; the TARGET GAP'S NEAR EDGE for a mech draft
-    // that carries one (user spec 2026-08-12) — placed through the fully
-    // absolute bracket form, so the TP sits AT the edge whatever the entry
-    // fill does.
-    if (draft.target && (draft.target.tp - entryRef) * dir <= 0) {
+    // TP: 1R for the FVG bot; for a mech draft carrying a target (user spec
+    // 2026-08-12) the GAP EDGE in 'edge' mode — the fully absolute bracket
+    // form, so the TP sits AT the edge whatever the entry fill does — or
+    // minRR × R in 'stretched' mode (user spec 2026-08-14), which MUST be
+    // priced off the actual fill: it is a ratio, not a level.
+    const stretched = draft.target?.mode === 'stretched';
+    // Only 'edge' mode can be invalidated by price: there the edge IS the TP.
+    // In 'stretched' mode the edge is just the break-even trigger, and the TP
+    // sits minRR × R beyond the fill by construction.
+    if (draft.target && !stretched && (draft.target.tp - entryRef) * dir <= 0) {
       console.warn(
         `bot: skipping ${draft.candidateId} — target ${draft.target.tp} is no longer beyond the entry`,
       );
@@ -822,16 +855,28 @@ export const useBot = create<BotState>((set, get) => {
     // + TP OCO legs at the entry fill itself, so they're live for every
     // bar after it — the old post-advance leg placement left the stop blind
     // for a whole advance (the oversized-loss bug).
-    appendEvent('order_placed', now(), {
+    const placedAt = now();
+    appendEvent('order_placed', placedAt, {
       orderId: bid(),
       side: draft.direction === 'long' ? 'buy' : 'sell',
       type: 'market',
       qty,
       bracket: draft.target
-        ? { stopPrice: roundToTick(draft.stop), tpPrice: roundToTick(draft.target.tp) }
+        ? stretched
+          ? { stopPrice: roundToTick(draft.stop), rr: s.minRR }
+          : { stopPrice: roundToTick(draft.stop), tpPrice: roundToTick(draft.target.tp) }
         : { stopPrice: roundToTick(draft.stop), rr: 1 },
     });
     refreshTrading();
+    // The stretched trade's edge lives on as the BREAK-EVEN TRIGGER — onAdvance
+    // watches for the first print at/beyond it. Any other placement clears the
+    // watch, so a stale one can never attach to the trade that follows.
+    set({
+      beWatch:
+        stretched && draft.target
+          ? { edge: draft.target.tp, direction: draft.direction, placedAt }
+          : null,
+    });
     unarmAligned(draft.direction);
     return true;
   };
@@ -899,6 +944,9 @@ export const useBot = create<BotState>((set, get) => {
     sweepMaxMinutes: DEFAULT_SWEEP_MAX_MINUTES,
     resweepWindowMinutes: DEFAULT_RESWEEP_WINDOW_MINUTES,
     targetGapMaxAgeMinutes: DEFAULT_TARGET_GAP_MAX_AGE_MINUTES,
+    enforceMinRR: true,
+    minRR: DEFAULT_MIN_RR,
+    beWatch: null,
     dolKinds: [...ALL_DOL_KINDS],
     gapMaxAgeCandles: DEFAULT_GAP_MAX_AGE,
     conditionLookbackCandles: CONDITION_LOOKBACK,
@@ -933,6 +981,9 @@ export const useBot = create<BotState>((set, get) => {
         sweepMaxMinutes: settings.sweepMaxMinutes,
         resweepWindowMinutes: settings.resweepWindowMinutes,
         targetGapMaxAgeMinutes: settings.targetGapMaxAgeMinutes,
+        enforceMinRR: settings.enforceMinRR,
+        minRR: settings.minRR,
+        beWatch: null,
         dolKinds: settings.dolKinds,
         gapMaxAgeCandles: settings.gapMaxAgeCandles,
         conditionLookbackCandles: settings.conditionLookbackCandles,
@@ -993,6 +1044,9 @@ export const useBot = create<BotState>((set, get) => {
         sweepMaxMinutes: settings.sweepMaxMinutes,
         resweepWindowMinutes: settings.resweepWindowMinutes,
         targetGapMaxAgeMinutes: settings.targetGapMaxAgeMinutes,
+        enforceMinRR: settings.enforceMinRR,
+        minRR: settings.minRR,
+        beWatch: null,
         dolKinds: settings.dolKinds,
         gapMaxAgeCandles: settings.gapMaxAgeCandles,
         conditionLookbackCandles: settings.conditionLookbackCandles,
@@ -1032,7 +1086,7 @@ export const useBot = create<BotState>((set, get) => {
     },
 
     deactivate: () => {
-      set({ active: false, scope: null, biases: [], armed: {}, clearedTriggers: {}, watermarks: {}, sweeps: {}, fired: {}, pending: null, queue: [] });
+      set({ active: false, scope: null, biases: [], armed: {}, clearedTriggers: {}, watermarks: {}, sweeps: {}, fired: {}, pending: null, queue: [], beWatch: null });
     },
 
     setAction: (a) => {
@@ -1075,6 +1129,18 @@ export const useBot = create<BotState>((set, get) => {
     setTargetGapMaxAgeMinutes: (v) => {
       if (!Number.isFinite(v) || v <= 0) return;
       set({ targetGapMaxAgeMinutes: v });
+      persistSettings(currentSettings(get()));
+    },
+    // The min-RR floor applies at the NEXT candidate assembly (and, for the
+    // ratio itself, at placement): a live beWatch keeps the edge it was armed
+    // with, since that trade's bracket is already in the book.
+    setEnforceMinRR: (v) => {
+      set({ enforceMinRR: v });
+      persistSettings(currentSettings(get()));
+    },
+    setMinRR: (v) => {
+      if (!Number.isFinite(v) || v <= 0) return;
+      set({ minRR: v });
       persistSettings(currentSettings(get()));
     },
     toggleDolKind: (k) => {
@@ -1288,6 +1354,30 @@ export const useBot = create<BotState>((set, get) => {
         }
       }
 
+      // 2b. BREAK-EVEN management for a stretched-target trade (user spec
+      // 2026-08-14). Runs here, after the condition sections, because the
+      // trading store's clock subscription is registered first: the fills for
+      // THIS advance are already in the book, so the position and its legs
+      // read as they stood at `to`. If the same advance both taps the edge and
+      // fills the original stop, the fill already happened and the book is
+      // flat — the watch is simply cleared and no order is moved, which is the
+      // honest outcome: the stop was hit before the BE order could exist.
+      const watch = get().beWatch;
+      if (watch) {
+        const bk = useTrading.getState().derived;
+        if (bk.position.qty === 0 && bk.workingOrders.length === 0) {
+          set({ beWatch: null }); // trade resolved before the edge was reached
+        } else if (bk.position.qty !== 0) {
+          const long = watch.direction === 'long';
+          const touched = newBars.some((b) => (long ? b.h >= watch.edge : b.l <= watch.edge));
+          if (touched) {
+            const sl = bk.workingOrders.find((o) => o.reduceOnly && o.type === 'stop');
+            if (sl) useTrading.getState().moveOrder(sl.id, roundToTick(bk.position.avgPrice));
+            set({ beWatch: null }); // one move per trade
+          }
+        }
+      }
+
       // one-position gate (locked 2026-07-30): while a trade is on — open
       // position or ANY working order (an unfilled entry is a working order)
       // — the bot doesn't look for candidates at all. Also prevents the
@@ -1347,6 +1437,9 @@ export const useBot = create<BotState>((set, get) => {
             targets: {
               gaps: conditionGapsAt(to, boundsOf(s), TARGET_TFS),
               maxAgeSec: s.targetGapMaxAgeMinutes * 60,
+              // the min-RR floor (user spec 2026-08-14); off = the edge is
+              // always the TP, whatever the ratio
+              minRR: s.enforceMinRR ? s.minRR : null,
             },
             // mech-2 only (added 2026-08-12): the FVG bot's session-tap rule,
             // applied to the sweep — an overnight raid can't back a candidate
@@ -1527,6 +1620,9 @@ export const useBot = create<BotState>((set, get) => {
           dol ? targetScopeAt(to, s.targetGapMaxAgeMinutes * 60, bounds) : null,
         ),
         fired: Object.fromEntries(Object.entries(s.fired).filter(([, ts]) => ts <= to)),
+        // a rewind before the entry voids the order itself (the trading
+        // reducer), so its break-even watch goes with it
+        beWatch: s.beWatch && s.beWatch.placedAt <= to ? s.beWatch : null,
         pending: s.pending && s.pending.confirmTs > to ? null : s.pending,
         queue: s.queue.filter((d) => d.confirmTs <= to),
       });

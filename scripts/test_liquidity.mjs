@@ -10,7 +10,7 @@ import { writeFileSync } from 'node:fs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const test = `
 import {
-  DEFAULT_TARGET_GAP_MAX_AGE_MINUTES, MECH_TRIGGER_TFS, TARGET_TFS, foldSweep, freshSweepState,
+  DEFAULT_MIN_RR, DEFAULT_TARGET_GAP_MAX_AGE_MINUTES, MECH_TRIGGER_TFS, TARGET_TFS, foldSweep, freshSweepState,
   isArmed, levelLifespanSec, levelsAt, matchSweepTriggers, pickTarget, sweptSet, triggerWindowSec,
   type ArmedSweep, type DOLLevel, type LevelDataSource, type SweepRules, type SweepState,
 } from './src/lib/concepts/liquidity';
@@ -497,6 +497,55 @@ check('target-default-age', DEFAULT_TARGET_GAP_MAX_AGE_MINUTES, 60);
   }
   // omitting the option leaves the old behaviour (and the FVG bot) untouched
   check('targets-optional', matchSweepTriggers({ ...mBase, triggers: [trigAt('1m', 36)] })[0].target, undefined);
+}
+
+// ---- the MINIMUM-RR FLOOR on that target (user spec 2026-08-14) ----
+// mBase's long confirms at 09:36 with entryEst 21938 and stop 21880, so the
+// risk is 58 pts and an edge at 21996 is exactly 1R. Below the floor the mode
+// is 'stretched' (TP = minRR x R off the FILL, edge = the break-even trigger);
+// at or above it, 'edge' (TP at the edge, the original rule). The break-even
+// MOVE itself is store-level (botStore's beWatch) and out of this harness.
+{
+  const bear = (top: number, bottom: number) =>
+    mkGap({ tf: '5m' as const, dir: 'bear' as const, top, bottom, formedAt: w(9, 30) });
+  const near = bear(21980, 21950);  // edge 21950 -> 12 pts reward, 0.21R
+  const far = bear(22050, 22000);   // edge 22000 -> 62 pts reward, 1.07R
+  const exact = bear(22050, 21996); // edge 21996 -> 58 pts reward, exactly 1R
+  const mode = (gaps: FVG[], minRR: number | null | undefined) =>
+    matchSweepTriggers({
+      ...mBase, triggers: [trigAt('1m', 36)], targets: { gaps, maxAgeSec: 3600, minRR },
+    })[0]?.target?.mode;
+
+  check('minrr-default', DEFAULT_MIN_RR, 1);
+  check('minrr-below-floor-stretches', mode([near], 1), 'stretched');
+  check('minrr-at-floor-is-edge', mode([exact], 1), 'edge');
+  check('minrr-above-floor-is-edge', mode([far], 1), 'edge');
+  // 'tp' is the gap edge in BOTH modes — the TP in one, the BE trigger in the other
+  const stretched = matchSweepTriggers({
+    ...mBase, triggers: [trigAt('1m', 36)], targets: { gaps: [near], maxAgeSec: 3600, minRR: 1 },
+  })[0];
+  check('minrr-stretched-keeps-the-edge', [stretched.target?.tp, stretched.target?.tf], [21950, '5m']);
+  // rule OFF: null or absent -> 'edge' however tiny the ratio
+  check('minrr-null-is-off', mode([near], null), 'edge');
+  check('minrr-undefined-is-off', mode([near], undefined), 'edge');
+  // non-1 floors
+  check('minrr-1.5-stretches-a-1.07R-target', mode([far], 1.5), 'stretched');
+  check('minrr-1.5-edge-when-cleared', mode([bear(22100, 22030)], 1.5), 'edge'); // 92 pts = 1.59R
+  check('minrr-0.1-leaves-a-tiny-target-alone', mode([near], 0.1), 'edge');
+  // the floor never changes WHICH gap wins — closest valid edge still does
+  check('minrr-does-not-repick', [mode([near, far], 1), mode([near, far], null)], ['stretched', 'edge']);
+  // SHORT mirror: buyside sweep, bull target below the entry
+  {
+    const B = sweep({ level: lvl({ id: 'nyam:buyside:x', side: 'buyside', price: 21990, label: 'NYAM H' }) });
+    const sBase = { ...mBase, sweeps: [B], triggers: [{ ...trigAt('1m', 36), dir: 'bull' as const }] };
+    // short stop = the raid high 21955, entry 21938 -> risk 17 pts
+    const bull = (top: number, bottom: number) =>
+      mkGap({ tf: '5m' as const, dir: 'bull' as const, top, bottom, formedAt: w(9, 30) });
+    const sMode = (gaps: FVG[], minRR: number | null) =>
+      matchSweepTriggers({ ...sBase, targets: { gaps, maxAgeSec: 3600, minRR } })[0]?.target?.mode;
+    check('minrr-short-below-floor', sMode([bull(21930, 21900)], 1), 'stretched'); // 8 pts = 0.47R
+    check('minrr-short-above-floor', sMode([bull(21910, 21880)], 1), 'edge'); // 28 pts = 1.65R
+  }
 }
 
 // ---- level catalog: session windows pick the most recent COMPLETED one ----

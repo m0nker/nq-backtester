@@ -447,6 +447,36 @@ This replaces the 1R target of §6.2 / §3 "Execution" for these bots — the FV
   `tpPrice`), so the TP limit sits exactly AT the gap edge regardless of the entry fill. An entry
   that gaps through the edge exits at the next bar — the target was reached.
 
+#### Minimum-RR floor and break-even management (user spec 2026-08-14)
+
+A target nearer than a minimum reward:risk does **not** shrink the trade to it. At candidate
+assembly the ratio is measured off the entry estimate — `reward = (edge − entry)` on the profit
+side, `risk = (entry − stop)` — and the candidate records which of two **modes** it took:
+
+- **`edge`** — `reward/risk >= minRR`: unchanged, the TP is the absolute gap edge (`stopPrice` +
+  `tpPrice`).
+- **`stretched`** — `reward/risk < minRR`: the TP becomes **`minRR` × R**, placed through the
+  `stopPrice` + `rr` bracket so the ratio prices off the **ACTUAL fill** (a ratio rule cannot be
+  precomputed from an entry estimate). The gap edge is kept, but as the **BREAK-EVEN TRIGGER**:
+  the first print at or beyond it after entry (long: `bar.high >= edge`; short: `bar.low <= edge`)
+  moves the stop-loss order to **break-even** — the position's average fill price, tick-rounded.
+  One move per trade.
+
+Both bots carry the rule as two settings: **`enforceMinRR`** (default **ON**) and **`minRR`**
+(default **1** — the "1:1"; editable, minimum 0.1). With the toggle off, the edge is always the
+TP whatever the ratio (the pre-2026-08-14 behaviour).
+
+- The floor never changes **which** gap is chosen — the closest valid edge still wins; it only
+  changes what is done with it.
+- The candidate prompt shows a stretched target as `min <minRR>R · BE @ <edge>`.
+- **Resume limitation (implementation, not spec):** the break-even watch is **in memory only** —
+  it is not an event. Resuming a session while a stretched trade is already open does **not**
+  re-arm it, so that trade runs on its original stop. A rewind to before the entry drops the watch
+  along with the order.
+- Fill-timing note: if one advance both taps the edge and fills the original stop, the stop fill
+  already happened (the trading store simulates fills before the bot reads the book) — the trade
+  is closed and no break-even move occurs.
+
 ### 6.3b Deferred, not implemented
 
 - Runner management / continuation reasons: out of scope, same as §3's trade-management line.
@@ -514,6 +544,8 @@ rule of §6.2 — read that section first; what follows is only where Mech 2 dif
 ### 7.3 Target, and what is deferred
 
 - **The unfilled 5m/15m target of §6.3 applies in full** — same polarity rule, same closest-edge
-  choice across 5m and 15m, same `targetGapMaxAgeMinutes` window, same "no target, no trade".
+  choice across 5m and 15m, same `targetGapMaxAgeMinutes` window, same "no target, no trade", and
+  the same **min-RR floor with break-even management** (`enforceMinRR` / `minRR`, §6.3), including
+  its in-memory resume limitation.
 - Deferred, same as §6.3b: no runner management, and the same **rewind caveat** — cleared-blocker
   state is not reconstructed on rewind, so after a rewind the bot vetoes rather than over-fires.

@@ -443,8 +443,24 @@ export const MECH_TRIGGER_TFS: readonly Timeframe[] = ['1m', '2m', '3m', '4m', '
 // timeframes. The gap must also have formed recently (`maxAgeSec`, the
 // `targetGapMaxAgeMinutes` setting) and its edge must be on the PROFIT side of
 // the entry. No valid target -> no candidate ('no-target').
+//
+// MINIMUM-RR FLOOR (user spec 2026-08-14): a target closer than `minRR` × the
+// risk does NOT shrink the trade to it. The candidate's target `mode` says which
+// shape it took:
+//  - 'edge'      — reward:risk at the edge is >= minRR: the TP IS the edge, an
+//                  absolute price (the original rule);
+//  - 'stretched' — it is below minRR: the TP becomes minRR × R priced off the
+//                  ACTUAL fill (a ratio rule cannot be precomputed from an entry
+//                  ESTIMATE), and the edge becomes the BREAK-EVEN TRIGGER — the
+//                  first print at/beyond it moves the stop to the fill.
+// `tp` stays the gap edge in BOTH modes; what changes is what the edge MEANS.
+// `minRR` null/absent = the floor is off, and every target is 'edge'.
 export const TARGET_TFS: readonly Timeframe[] = ['5m', '15m'];
 export const DEFAULT_TARGET_GAP_MAX_AGE_MINUTES = 60;
+export const DEFAULT_MIN_RR = 1;
+
+// Which shape a candidate's target took — see the min-RR floor above.
+export type TargetMode = 'edge' | 'stretched';
 
 export interface TargetGap {
   tf: Timeframe;
@@ -511,7 +527,9 @@ export function matchSweepTriggers(opts: {
   // candidate REQUIRES one: `gaps` is the 5m/15m condition-gap pool at the
   // confirmation and `maxAgeSec` the formation-age window. Omitted (tests /
   // the FVG bot's path) the rule doesn't apply and the 1R target stands.
-  targets?: { gaps: FVG[]; maxAgeSec: number };
+  // `minRR` is the floor of the same spec (user spec 2026-08-14): null or
+  // absent = no floor, every target is 'edge'.
+  targets?: { gaps: FVG[]; maxAgeSec: number; minRR?: number | null };
   // optional diagnostics sink — every considered inversion appends one entry
   diag?: TriggerOutcome[];
 }): CandidateDraft[] {
@@ -608,19 +626,28 @@ export function matchSweepTriggers(opts: {
     // The target is a REQUIREMENT, not a decoration: no unfilled 5m/15m gap of
     // the opposite polarity within the age window and on the profit side means
     // there is nothing to rebalance into, so there is no trade.
-    let target: TargetGap | null = null;
+    let target: (TargetGap & { mode: TargetMode }) | null = null;
     if (opts.targets) {
-      target = pickTarget({
+      const picked = pickTarget({
         gaps: opts.targets.gaps,
         direction,
         entry: entryEst,
         at: confirmTs,
         maxAgeSec: opts.targets.maxAgeSec,
       });
-      if (!target) {
+      if (!picked) {
         note('no-target');
         continue;
       }
+      // MIN-RR FLOOR (user spec 2026-08-14): both legs measured from the
+      // ENTRY ESTIMATE, which is all this pure pass knows — the stretched TP
+      // itself is then priced off the real fill, downstream.
+      const sign = direction === 'long' ? 1 : -1;
+      const rewardPts = (picked.tp - entryEst) * sign;
+      const riskPts = (entryEst - stop) * sign; // > 0: the geometry test above
+      const minRR = opts.targets.minRR ?? null;
+      const mode: TargetMode = minRR !== null && rewardPts < minRR * riskPts ? 'stretched' : 'edge';
+      target = { ...picked, mode };
     }
     note('candidate');
 
