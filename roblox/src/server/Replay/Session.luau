@@ -1,0 +1,767 @@
+--!strict
+-- One replay session per player: the authoritative clock, the append-only
+-- event log, and the fill loop that ties them together.
+--
+-- The day's FULL bar array lives here and never leaves except through
+-- sendBars, which can only encode the revealed prefix — that is the whole
+-- anti-lookahead guarantee, and the assert in sendBars is what keeps it true.
+--
+-- Semantics mirror the web reference (lib/replay/clock.ts for stepping/play,
+-- lib/trading/store.ts for order mechanics). The divergences are structural:
+-- stepping runs on a server heartbeat instead of a browser timer, and every
+-- command arrives from an untrusted client and is re-validated here.
+
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Shared = ReplicatedStorage.Shared
+local Aggregate = require(Shared.Replay.Aggregate)
+local BarCodec = require(Shared.Data.BarCodec)
+local ContractMath = require(Shared.Trading.ContractMath)
+local Engine = require(Shared.Trading.Engine)
+local EventTypes = require(Shared.Events.Types)
+local Fills = require(Shared.Trading.Fills)
+local Protocol = require(Shared.Net.Protocol)
+local Types = require(Shared.Types)
+
+local BarStore = require(script.Parent.Parent.Data.BarStore)
+
+type Bar = Types.Bar
+type Timeframe = Types.Timeframe
+type Side = EventTypes.Side
+type SessionEvent = EventTypes.SessionEvent
+type WorkingOrder = Fills.WorkingOrder
+
+local M = {}
+
+export type Remotes = {
+	clock: RemoteEvent,
+	bars: RemoteEvent,
+	tradeState: RemoteEvent,
+	sessionInfo: RemoteEvent,
+}
+
+export type Session = {
+	player: Player,
+	remotes: Remotes,
+	date: string?,
+	bars: { Bar }, -- server-only; the client sees BarCodec slices of [1, revealedCount]
+	revealedCount: number,
+	currentTime: number,
+	startTs: number,
+	endTs: number, -- close of the last bar; the clock never advances past it
+	playing: boolean,
+	speed: number,
+	stepSize: Timeframe,
+	accumulator: number, -- fractional base bars carried between heartbeats
+	tickSize: number,
+	baseSec: number,
+	events: { SessionEvent },
+	derived: Engine.EngineState,
+	nextId: number,
+	clockDirty: boolean,
+	tradeDirty: boolean,
+}
+
+local STARTING_BALANCE = 10000
+local DEFAULT_SPEED = 5
+local DEFAULT_STEP: Timeframe = "1m"
+-- Client-supplied sizes are quantized then bounded; nothing about the sim
+-- breaks above this, it just stops absurd inputs reaching the reducer.
+local MAX_QTY = 100
+
+local SPEED_OK: { [number]: boolean } = {}
+for _, v in ipairs(Protocol.SPEEDS) do
+	SPEED_OK[v] = true
+end
+
+-- The web's 'view' step size is client-side sugar (follow the chart): the
+-- client resolves it and sends the concrete timeframe.
+local STEP_OK: { [string]: boolean } = {}
+for _, tf in ipairs(Types.TIMEFRAMES) do
+	STEP_OK[tf] = true
+end
+
+local function isFiniteNumber(v: any): boolean
+	return typeof(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
+end
+
+local function oid(s: Session): string
+	s.nextId += 1
+	return "o" .. s.nextId
+end
+
+local function findOrder(orders: { WorkingOrder }, id: string): WorkingOrder?
+	for _, o in ipairs(orders) do
+		if o.id == id then
+			return o
+		end
+	end
+	return nil
+end
+
+-- ------------------------------------------------------------------- log
+
+local function append(s: Session, evType: string, tsMarket: number, payload: any)
+	-- Autoplay advances the clock every heartbeat; one event per CONTIGUOUS
+	-- advance is enough (order/fill events carry their own tsMarket).
+	if evType == "time_advanced" then
+		local last = s.events[#s.events]
+		if
+			last ~= nil
+			and last.type == "time_advanced"
+			and last.payload.to == payload.from
+			and last.payload.mode == payload.mode
+		then
+			last.payload.to = payload.to
+			last.tsMarket = tsMarket
+			return
+		end
+	end
+	table.insert(s.events, { type = evType, tsMarket = tsMarket, payload = payload })
+end
+
+-- Derived state is never stored; every order-affecting append re-folds the log.
+local function refresh(s: Session)
+	s.derived = Engine.deriveState(s.events)
+	s.tradeDirty = true
+end
+
+-- ------------------------------------------------------------------ send
+
+local function sendClock(s: Session)
+	s.remotes.clock:FireClient(s.player, {
+		t = s.currentTime,
+		playing = s.playing,
+		speed = s.speed,
+		stepSize = s.stepSize,
+	})
+	s.clockDirty = false
+end
+
+local function sendTradeState(s: Session)
+	local st = s.derived
+	-- Exactly the Protocol fields: `bracket` stays server-side, it is an input
+	-- to fill processing and not part of the contract.
+	local orders: { { [string]: any } } = {}
+	for _, o in ipairs(st.workingOrders) do
+		table.insert(orders, {
+			id = o.id,
+			side = o.side,
+			type = o.type,
+			qty = o.qty,
+			limitPrice = o.limitPrice,
+			stopPrice = o.stopPrice,
+			ocoId = o.ocoId,
+			reduceOnly = o.reduceOnly,
+		})
+	end
+	s.remotes.tradeState:FireClient(s.player, {
+		position = { qty = st.position.qty, avgPrice = st.position.avgPrice },
+		realizedPts = st.realizedPts,
+		realizedUsd = st.realizedUsd,
+		workingOrders = orders,
+		trades = st.trades,
+		voidedCount = st.voidedCount,
+		startingBalance = st.startingBalance,
+	})
+	s.tradeDirty = false
+end
+
+local function sendBars(s: Session, fromIdx: number, toIdx: number, reset: boolean)
+	-- The anti-lookahead invariant, asserted at the only place bars leave the
+	-- server: never past the revealed prefix, and the last encoded bar must
+	-- have CLOSED at the current clock.
+	assert(toIdx <= s.revealedCount, "LOOKAHEAD VIOLATION: encode past revealedCount")
+	local last = s.bars[toIdx]
+	assert(
+		last == nil or last.t + s.baseSec <= s.currentTime,
+		"LOOKAHEAD VIOLATION: encoded bar has not closed at the current clock"
+	)
+	s.remotes.bars:FireClient(s.player, BarCodec.encodeSlice(s.bars, fromIdx, toIdx, s.tickSize), reset)
+end
+
+-- One packet per operation: bars for the newly revealed range, then a clock
+-- update and a trade state only if either actually changed.
+local function flush(s: Session, fromIdx: number?, toIdx: number?)
+	if fromIdx ~= nil and toIdx ~= nil and toIdx >= fromIdx then
+		sendBars(s, fromIdx, toIdx, false)
+	end
+	if s.clockDirty then
+		sendClock(s)
+	end
+	if s.tradeDirty then
+		sendTradeState(s)
+	end
+end
+
+function M.sendSessionInfo(s: Session)
+	s.remotes.sessionInfo:FireClient(s.player, {
+		availableDates = BarStore.availableDates(),
+		baseSec = s.baseSec,
+		tickSize = s.tickSize,
+		startingBalance = STARTING_BALANCE,
+	})
+end
+
+-- --------------------------------------------------------------- fills
+
+-- Spawn the OCO bracket legs after an entry fill. Points form only: command
+-- validation never produces BracketSpec's absolute-stop or absolute-TP forms,
+-- which exist for the web's bot strategies.
+local function spawnBracket(
+	s: Session,
+	entrySide: Side,
+	qty: number,
+	fillPrice: number,
+	stopLossPts: number,
+	takeProfitPts: number,
+	ts: number
+)
+	local legSide: Side = if entrySide == "buy" then "sell" else "buy"
+	local dir = if entrySide == "buy" then 1 else -1
+	local ocoId = "oco-" .. oid(s)
+	append(s, "order_placed", ts, {
+		orderId = oid(s),
+		side = legSide,
+		type = "stop",
+		qty = qty,
+		stopPrice = ContractMath.roundToTick(fillPrice - dir * stopLossPts, s.tickSize),
+		ocoId = ocoId,
+		reduceOnly = true,
+	})
+	append(s, "order_placed", ts, {
+		orderId = oid(s),
+		side = legSide,
+		type = "limit",
+		qty = qty,
+		limitPrice = ContractMath.roundToTick(fillPrice + dir * takeProfitPts, s.tickSize),
+		ocoId = ocoId,
+		reduceOnly = true,
+	})
+end
+
+-- Returns false when the intent was voided instead of filled (reduce-only
+-- no-op) — the caller still has a changed log either way.
+local function applyFill(s: Session, intent: Fills.FillIntent, order: WorkingOrder, barTs: number): boolean
+	local qty = intent.qty
+	local pre = s.derived.position.qty
+	if order.reduceOnly then
+		local opposes = (intent.side == "buy" and pre < 0) or (intent.side == "sell" and pre > 0)
+		if not opposes then
+			append(s, "order_cancelled", barTs, { orderId = intent.orderId, reason = "reduce_only_noop" })
+			return false
+		end
+		qty = ContractMath.quantizeQty(math.min(qty, math.abs(pre)))
+	end
+	append(s, "order_filled", barTs, {
+		orderId = intent.orderId,
+		fillId = HttpService:GenerateGUID(false),
+		side = intent.side,
+		qty = qty,
+		price = intent.price,
+		barTs = barTs,
+		fillKind = intent.fillKind,
+		ambiguousBar = intent.ambiguousBar,
+	})
+	local ocoId = order.ocoId
+	if ocoId ~= nil then
+		for _, o in ipairs(s.derived.workingOrders) do
+			if o.ocoId == ocoId and o.id ~= order.id then
+				append(s, "order_cancelled", barTs, { orderId = o.id, reason = "oco" })
+			end
+		end
+	end
+	local bracket = order.bracket
+	if bracket ~= nil and bracket.stopLossPts ~= nil and bracket.takeProfitPts ~= nil then
+		-- Brackets protect NEW exposure only: a bracketed order that merely
+		-- closes a position must not spawn legs for a flat book.
+		local signed = if intent.side == "buy" then qty else -qty
+		local post = ContractMath.quantizeQty(pre + signed)
+		local reversed = pre ~= 0 and post ~= 0 and math.sign(post) ~= math.sign(pre)
+		local increase = if reversed
+			then math.abs(post)
+			else ContractMath.quantizeQty(math.max(0, math.abs(post) - math.abs(pre)))
+		if increase > 0 then
+			local entrySide: Side = if post > 0 then "buy" else "sell"
+			spawnBracket(s, entrySide, increase, intent.price, bracket.stopLossPts, bracket.takeProfitPts, barTs)
+		end
+	end
+	return true
+end
+
+-- Position-linked cleanup: reduce-only orders exist to protect the current
+-- position. When it is gone (flat) or flipped, they cancel automatically.
+local function cancelOrphanedLegs(s: Session, ts: number): boolean
+	local pos = s.derived.position.qty
+	local cancelled = false
+	for _, o in ipairs(s.derived.workingOrders) do
+		if o.reduceOnly then
+			local valid = (o.side == "sell" and pos > 0) or (o.side == "buy" and pos < 0)
+			if not valid then
+				append(s, "order_cancelled", ts, { orderId = o.id, reason = "position_closed" })
+				cancelled = true
+			end
+		end
+	end
+	return cancelled
+end
+
+-- Evaluate one newly revealed base bar. This port ships no 1s data, so the
+-- seconds resolver is always nil and Fills falls back to SL-first.
+local function processBar(s: Session, bar: Bar)
+	if #s.derived.workingOrders == 0 then
+		return
+	end
+	local intents = Fills.simulateBar(s.derived.workingOrders, bar, nil, s.baseSec)
+	if #intents == 0 then
+		return
+	end
+	local filled = false
+	for _, intent in ipairs(intents) do
+		local order = findOrder(s.derived.workingOrders, intent.orderId)
+		if order == nil then
+			continue
+		end
+		filled = applyFill(s, intent, order, bar.t) or filled
+		refresh(s) -- fills/cancels affect the intents that follow
+	end
+	if cancelOrphanedLegs(s, bar.t) then
+		refresh(s)
+		filled = true
+	end
+	if filled then
+		local lastTrade = s.derived.trades[#s.derived.trades]
+		if lastTrade ~= nil and s.derived.position.qty == 0 and lastTrade.exitTs == bar.t then
+			append(s, "position_closed", bar.t, {
+				entryTs = lastTrade.entryTs,
+				exitTs = lastTrade.exitTs,
+				side = lastTrade.side,
+				qty = lastTrade.qty,
+				avgEntry = lastTrade.avgEntry,
+				avgExit = lastTrade.avgExit,
+				pnlPts = lastTrade.pnlPts,
+				pnlUsd = lastTrade.pnlUsd,
+			})
+		end
+	end
+end
+
+-- ---------------------------------------------------------------- clock
+
+local function advanceClock(s: Session, to: number, mode: string)
+	if to <= s.currentTime then
+		return
+	end
+	append(s, "time_advanced", to, { from = s.currentTime, to = to, mode = mode })
+	s.currentTime = to
+	s.clockDirty = true
+end
+
+-- Reveal exactly one bar. Bars are revealed one at a time and IN ORDER even
+-- when a heartbeat covers many, so fill timing stays bar-exact.
+local function revealOne(s: Session, mode: string): boolean
+	if s.revealedCount >= #s.bars then
+		return false
+	end
+	local bar = s.bars[s.revealedCount + 1]
+	s.revealedCount += 1
+	advanceClock(s, bar.t + s.baseSec, mode)
+	processBar(s, bar)
+	return true
+end
+
+local function revealThrough(s: Session, target: number, mode: string): (number, number)
+	local fromIdx = s.revealedCount + 1
+	while s.revealedCount < #s.bars do
+		local nextBar = s.bars[s.revealedCount + 1]
+		if nextBar.t + s.baseSec > target then
+			break
+		end
+		revealOne(s, mode)
+	end
+	return fromIdx, s.revealedCount
+end
+
+local function revealedAt(s: Session, t: number): number
+	local n = 0
+	for i = 1, #s.bars do
+		if s.bars[i].t + s.baseSec <= t then
+			n = i
+		else
+			break
+		end
+	end
+	return n
+end
+
+-- Going backwards is a REWIND, not a re-render: the log keeps every order and
+-- fill, and Engine.deriveState voids the ones after the target. The client
+-- cache is replaced wholesale because its tail is now unrevealed.
+local function rewindTo(s: Session, to: number)
+	append(s, "time_rewound", to, { from = s.currentTime, to = to })
+	refresh(s)
+	s.currentTime = to
+	s.revealedCount = revealedAt(s, to)
+	s.accumulator = 0
+	sendBars(s, 1, s.revealedCount, true)
+	sendClock(s)
+	sendTradeState(s)
+end
+
+-- -------------------------------------------------------------- commands
+
+local function cmdStartSession(s: Session, date: string)
+	-- The loads below YIELD (DataStore); stop the heartbeat first, or the old
+	-- day keeps advancing on top of the session that is being replaced.
+	s.playing = false
+	s.accumulator = 0
+	if not BarStore.hasDate(date) then
+		return
+	end
+	local bars = BarStore.dayBars(date)
+	if bars == nil or #bars == 0 then
+		return
+	end
+	s.date = date
+	s.bars = bars
+	s.tickSize = BarStore.tickSize()
+	s.baseSec = BarStore.baseSec()
+	s.revealedCount = 0
+	-- Nothing is revealed until the first step/play: the clock sits ON the
+	-- first bar's open, which has not closed yet (matches the web's start(ts)).
+	s.startTs = bars[1].t
+	s.currentTime = bars[1].t
+	s.endTs = bars[#bars].t + s.baseSec
+	s.playing = false
+	s.accumulator = 0
+	s.nextId = 0
+	s.events = {}
+	append(s, "session_started", bars[1].t, {
+		startTs = bars[1].t,
+		startingBalance = STARTING_BALANCE,
+		config = {},
+	})
+	refresh(s)
+	sendBars(s, 1, 0, true)
+	sendClock(s)
+	sendTradeState(s)
+end
+
+-- Advance by one bar of the step timeframe: reveal base bars through the end
+-- of the bucket the next hidden bar belongs to. Completes a partial candle
+-- first; skips halts naturally, since buckets follow the data.
+local function cmdStepForward(s: Session)
+	local nextBar = s.bars[s.revealedCount + 1]
+	if nextBar == nil or s.currentTime >= s.endTs then
+		return
+	end
+	local target = Aggregate.bucketEnd(nextBar.t, s.stepSize)
+	-- Always make progress: old-era sessions have bars past the nominal bucket
+	-- end (17:00-17:59 ET), which would otherwise pin the clock.
+	target = math.max(target, nextBar.t + s.baseSec)
+	target = math.min(target, s.endTs)
+	local fromIdx, toIdx = revealThrough(s, target, "step")
+	advanceClock(s, target, "step")
+	flush(s, fromIdx, toIdx)
+end
+
+-- Hide the latest (possibly partial) bucket of the step timeframe.
+local function cmdStepBack(s: Session)
+	if s.revealedCount == 0 then
+		return
+	end
+	rewindTo(s, Aggregate.bucketStart(s.bars[s.revealedCount].t, s.stepSize))
+end
+
+local function cmdJumpTo(s: Session, t: number)
+	if #s.bars == 0 or t < s.startTs or t > s.endTs then
+		return
+	end
+	if s.playing then
+		s.playing = false
+		s.clockDirty = true
+	end
+	s.accumulator = 0
+	if t < s.currentTime then
+		rewindTo(s, t)
+		return
+	end
+	-- Forward jumps reveal bar-by-bar WITH fill simulation, exactly like play;
+	-- only the network batching differs (one packet at the end).
+	local fromIdx, toIdx = revealThrough(s, t, "step")
+	advanceClock(s, t, "step")
+	flush(s, fromIdx, toIdx)
+end
+
+local function cmdPlay(s: Session)
+	if s.playing or s.revealedCount >= #s.bars then
+		return
+	end
+	s.playing = true
+	s.accumulator = 0
+	s.clockDirty = true
+	flush(s)
+end
+
+local function cmdPause(s: Session)
+	if not s.playing then
+		return
+	end
+	s.playing = false
+	s.accumulator = 0
+	s.clockDirty = true
+	flush(s)
+end
+
+local function cmdPlaceOrder(s: Session, msg: any)
+	local side = msg.side
+	if side ~= "buy" and side ~= "sell" then
+		return
+	end
+	local orderType = msg.type
+	if orderType ~= "market" and orderType ~= "limit" and orderType ~= "stop" then
+		return
+	end
+	if not isFiniteNumber(msg.qty) then
+		return
+	end
+	local qty = ContractMath.quantizeQty(msg.qty)
+	if qty <= 0 or qty > MAX_QTY then
+		return
+	end
+	-- Prices are only required to be finite: session normalization can put a
+	-- valid instrument anywhere on the axis, so a positivity test would be a
+	-- lie. Tick-rounding is the real guard.
+	local limitPrice: number? = nil
+	local stopPrice: number? = nil
+	if orderType == "limit" then
+		if not isFiniteNumber(msg.limitPrice) then
+			return
+		end
+		limitPrice = ContractMath.roundToTick(msg.limitPrice, s.tickSize)
+	elseif orderType == "stop" then
+		if not isFiniteNumber(msg.stopPrice) then
+			return
+		end
+		stopPrice = ContractMath.roundToTick(msg.stopPrice, s.tickSize)
+	end
+	local bracket: EventTypes.BracketSpec? = nil
+	local spec = msg.bracket
+	if typeof(spec) == "table" then
+		-- Bracket legs are DISTANCES from the fill, so they must be strictly
+		-- positive; a non-positive one would place the leg on the wrong side.
+		if not isFiniteNumber(spec.stopLossPts) or not isFiniteNumber(spec.takeProfitPts) then
+			return
+		end
+		if spec.stopLossPts <= 0 or spec.takeProfitPts <= 0 then
+			return
+		end
+		bracket = { stopLossPts = spec.stopLossPts, takeProfitPts = spec.takeProfitPts }
+	end
+	append(s, "order_placed", s.currentTime, {
+		orderId = oid(s),
+		side = side,
+		type = orderType,
+		qty = qty,
+		limitPrice = limitPrice,
+		stopPrice = stopPrice,
+		bracket = bracket,
+	})
+	refresh(s)
+	flush(s)
+end
+
+local function cmdModifyOrder(s: Session, msg: any)
+	local orderId = msg.orderId
+	if typeof(orderId) ~= "string" or findOrder(s.derived.workingOrders, orderId) == nil then
+		return
+	end
+	local changes = msg.changes
+	if typeof(changes) ~= "table" then
+		return
+	end
+	local applied: { limitPrice: number?, stopPrice: number?, qty: number? } = {}
+	local any = false
+	if changes.limitPrice ~= nil then
+		if not isFiniteNumber(changes.limitPrice) then
+			return
+		end
+		applied.limitPrice = ContractMath.roundToTick(changes.limitPrice, s.tickSize)
+		any = true
+	end
+	if changes.stopPrice ~= nil then
+		if not isFiniteNumber(changes.stopPrice) then
+			return
+		end
+		applied.stopPrice = ContractMath.roundToTick(changes.stopPrice, s.tickSize)
+		any = true
+	end
+	if changes.qty ~= nil then
+		if not isFiniteNumber(changes.qty) then
+			return
+		end
+		local qty = ContractMath.quantizeQty(changes.qty)
+		if qty <= 0 or qty > MAX_QTY then
+			return
+		end
+		applied.qty = qty
+		any = true
+	end
+	if not any then
+		return
+	end
+	append(s, "order_modified", s.currentTime, { orderId = orderId, changes = applied })
+	refresh(s)
+	flush(s)
+end
+
+local function cmdCancelOrder(s: Session, msg: any)
+	local orderId = msg.orderId
+	if typeof(orderId) ~= "string" or findOrder(s.derived.workingOrders, orderId) == nil then
+		return
+	end
+	append(s, "order_cancelled", s.currentTime, { orderId = orderId, reason = "user" })
+	refresh(s)
+	flush(s)
+end
+
+local function cmdFlatten(s: Session)
+	local st = s.derived
+	for _, o in ipairs(st.workingOrders) do
+		append(s, "order_cancelled", s.currentTime, { orderId = o.id, reason = "user" })
+	end
+	if st.position.qty ~= 0 then
+		append(s, "order_placed", s.currentTime, {
+			orderId = oid(s),
+			side = if st.position.qty > 0 then "sell" else "buy",
+			type = "market",
+			qty = math.abs(st.position.qty),
+			reduceOnly = true,
+		})
+	end
+	refresh(s)
+	flush(s)
+end
+
+-- ------------------------------------------------------------------ api
+
+function M.new(player: Player, remotes: Remotes): Session
+	return {
+		player = player,
+		remotes = remotes,
+		date = nil,
+		bars = {},
+		revealedCount = 0,
+		currentTime = 0,
+		startTs = 0,
+		endTs = 0,
+		playing = false,
+		speed = DEFAULT_SPEED,
+		stepSize = DEFAULT_STEP,
+		accumulator = 0,
+		tickSize = BarStore.tickSize(),
+		baseSec = BarStore.baseSec(),
+		events = {},
+		derived = Engine.deriveState({} :: { SessionEvent }),
+		nextId = 0,
+		clockDirty = false,
+		tradeDirty = false,
+	}
+end
+
+-- Every field below is attacker-controlled. Unknown commands, wrong types and
+-- out-of-range values are dropped silently: a hostile client must not be able
+-- to fill the server log either.
+function M.handleCmd(s: Session, msg: any)
+	if typeof(msg) ~= "table" or typeof(msg.cmd) ~= "string" then
+		return
+	end
+	local cmd: string = msg.cmd
+	if cmd == "startSession" then
+		if typeof(msg.date) == "string" then
+			cmdStartSession(s, msg.date)
+		end
+		return
+	end
+	-- Clock CONFIG is accepted with no day loaded (the client sets it from the
+	-- lobby); anything that touches bars or the log is not.
+	if cmd == "setSpeed" then
+		if isFiniteNumber(msg.speed) and SPEED_OK[msg.speed] then
+			s.speed = msg.speed
+			s.clockDirty = true
+			flush(s)
+		end
+		return
+	elseif cmd == "setStepSize" then
+		if typeof(msg.stepSize) == "string" and STEP_OK[msg.stepSize] then
+			s.stepSize = msg.stepSize
+			s.clockDirty = true
+			flush(s)
+		end
+		return
+	end
+	if s.date == nil then
+		return -- every other command needs a loaded day
+	end
+	if cmd == "stepForward" then
+		cmdStepForward(s)
+	elseif cmd == "stepBack" then
+		cmdStepBack(s)
+	elseif cmd == "jumpTo" then
+		if isFiniteNumber(msg.t) then
+			cmdJumpTo(s, msg.t)
+		end
+	elseif cmd == "play" then
+		cmdPlay(s)
+	elseif cmd == "pause" then
+		cmdPause(s)
+	elseif cmd == "placeOrder" then
+		cmdPlaceOrder(s, msg)
+	elseif cmd == "modifyOrder" then
+		cmdModifyOrder(s, msg)
+	elseif cmd == "cancelOrder" then
+		cmdCancelOrder(s, msg)
+	elseif cmd == "flatten" then
+		cmdFlatten(s)
+	end
+end
+
+function M.tick(s: Session, dt: number)
+	if not s.playing then
+		return
+	end
+	if s.revealedCount >= #s.bars then
+		s.playing = false
+		s.clockDirty = true
+		flush(s)
+		return
+	end
+	s.accumulator += s.speed * dt
+	local budget = math.floor(s.accumulator)
+	if budget <= 0 then
+		return
+	end
+	s.accumulator -= budget
+	-- A scheduler hitch must not dump the rest of the day into one frame: a
+	-- heartbeat reveals at most one second of playback, and the overshoot is
+	-- dropped rather than carried (playback slows, it never jumps).
+	local cap = math.max(1, math.floor(s.speed))
+	if budget > cap then
+		budget = cap
+		s.accumulator = 0
+	end
+	local fromIdx = s.revealedCount + 1
+	for _ = 1, budget do
+		if not revealOne(s, "autoplay") then
+			break
+		end
+	end
+	if s.revealedCount >= #s.bars then
+		s.playing = false -- end of the day's data
+		s.clockDirty = true
+	end
+	flush(s, fromIdx, s.revealedCount)
+end
+
+return M

@@ -1,0 +1,5 @@
+# Toolchain pins (install Rokit, then `rokit install` in this directory).
+# Add lune (`rokit add lune-org/lune`) when out-of-Studio CI testing lands.
+
+[tools]
+rojo = "rojo-rbx/rojo@7.7.0"

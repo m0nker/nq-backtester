@@ -1,0 +1,9 @@
+Packages/
+ServerPackages/
+data-out/
+DevPackages/
+*.rbxl
+*.rbxlx
+*.rbxl.lock
+*.rbxlx.lock
+sourcemap.json
