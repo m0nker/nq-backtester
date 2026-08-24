@@ -118,6 +118,12 @@ type Fields = {
 	dragMoved: boolean,
 	dragStartX: number,
 	dragStartRight: number,
+
+	-- overlays that draw in this chart's space (order lines/chips) subscribe
+	-- here instead of running their own RenderStepped loop
+	repaintListeners: { () -> () },
+	-- set while an overlay owns the mouse; a chip drag must not also pan
+	panLocked: boolean,
 }
 
 export type ChartView = typeof(setmetatable({} :: Fields, ChartView))
@@ -260,6 +266,43 @@ end
 
 function ChartView.markDirty(self: ChartView)
 	self.dirty = true
+end
+
+-- ---------------------------------------------------------------------------
+-- overlay API. An overlay parents its Instances into the plot (clipped, and
+-- above the candles by ZIndex) and maps prices through the scale the LAST
+-- repaint painted — re-deriving it would let the two drift apart.
+-- ---------------------------------------------------------------------------
+
+function ChartView.getPlot(self: ChartView): Frame
+	return self.plot
+end
+
+-- Plot-local pixel y for a price. Values outside [priceMin, priceMax] map
+-- outside the plot; callers hide rather than clamp, so a chip never lies.
+function ChartView.priceToY(self: ChartView, price: number): number
+	return priceToY(price, self.priceMin, self.priceMax, self.plot.AbsoluteSize.Y)
+end
+
+function ChartView.yToPrice(self: ChartView, y: number): number
+	return yToPrice(y, self.priceMin, self.priceMax, self.plot.AbsoluteSize.Y)
+end
+
+function ChartView.getPriceRange(self: ChartView): (number, number)
+	return self.priceMin, self.priceMax
+end
+
+-- Fired after every repaint, in subscription order. Overlays also repaint on
+-- their own data changes; this hook only covers pan/zoom/resize/new bars.
+function ChartView.onRepaint(self: ChartView, fn: () -> ())
+	table.insert(self.repaintListeners, fn)
+end
+
+function ChartView.setPanLocked(self: ChartView, locked: boolean)
+	self.panLocked = locked
+	if locked then
+		self.dragging = false
+	end
 end
 
 function ChartView.repaint(self: ChartView)
@@ -545,7 +588,7 @@ local function wireInput(self: ChartView)
 		end
 	end)
 	self.plot.InputBegan:Connect(function(input: InputObject)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		if input.UserInputType == Enum.UserInputType.MouseButton1 and not self.panLocked then
 			self.dragging = true
 			self.dragMoved = false
 			self.dragStartX = mouseLocation().X
@@ -701,6 +744,8 @@ function ChartView.new(cache: BarCache): ChartView
 			dragMoved = false,
 			dragStartX = 0,
 			dragStartRight = 0,
+			repaintListeners = {},
+			panLocked = false,
 		} :: Fields,
 		ChartView
 	)
@@ -724,6 +769,9 @@ function ChartView.new(cache: BarCache): ChartView
 		if self.dirty then
 			self.dirty = false
 			self:repaint()
+			for _, fn in ipairs(self.repaintListeners) do
+				fn()
+			end
 		end
 	end)
 

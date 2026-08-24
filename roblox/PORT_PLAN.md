@@ -46,16 +46,30 @@ toolchain, chart rendering, data delivery). Revisit only with new evidence.
 3. **Server replay service** — ✅ DONE 2026-08-24. Verified live in Play mode:
    reveal loop, step/rewind, fills+brackets+OCO ($-200 SL round trip exact).
    Deferred: event-log persistence to player DataStores, multi-day sessions.
-4. **Client chart + controls** — ✅ DONE 2026-08-24 (phase 4a). Live chart
-   with pan/zoom/crosshair/axes/follow-tail, replay controls, session picker,
-   position HUD. Phase 4b remaining: order placement UI, chart order
-   markers/price lines, keyboard shortcuts, trade log panel.
-5. **Meta** — sessions UI, OrderedDataStore leaderboard, daily challenge
-   (seeded mystery day), 1v1 rooms.
+4. **Client chart + trading UI** — ✅ DONE 2026-08-24 (4a + 4b). Live chart
+   with pan/zoom/crosshair/axes/follow-tail, replay controls + keyboard
+   shortcuts (Space claimed via ContextActionService so the avatar never
+   jumps), session picker, order panel, draggable order lines/chips with ✕
+   cancel, position line, trade log with R multiples, flatten button.
+   Verified live: bracketed entry -> TP fill (+$600.00, 2.0R) with correct
+   chip rendering and out-of-range hiding.
+4b. **Persistence** — ✅ DONE 2026-08-24. Per-player DataStore (players_v1):
+   active session event log (8s debounced flush, PlayerRemoving/BindToClose
+   blocking flush), resume-on-ready mirroring web resumeTimeOf, lifetime
+   stats fold (sessions/trades/pnlUsd/wins — the future leaderboard source).
+   In-memory fallback exercised in Studio; live DataStore path needs the
+   game's API access enabled.
+5. **Meta (future)** — OrderedDataStore leaderboard, daily challenge (seeded
+   mystery day), 1v1 rooms. Not part of the base backtester.
 
-Cleanup backlog: export payload types from Protocol.luau (client currently
-mirrors them in Net/Messages.luau); a `ready` cmd to replace the SessionInfo
-resend loop; `running` flag in SessionInfo; pin luau-lsp/stylua in rokit.toml.
+Cleanup backlog: `export type Cmd` in Protocol (client declares a local Send
+alias in four modules); chip-vs-follow-button overlap at the plot's right
+edge; silent truncation past 24 chips / 200 trade-log rows; click-to-place
+orders on the chart; qty edit via chip.
+
+Test-tooling note: Studio virtual input cannot click UI under the chat
+CoreGui canvas (top-left region) — real mice are unaffected. Drive those
+paths via remotes when verifying with MCP.
 
 ## Key platform numbers (research-verified, Aug 2026)
 

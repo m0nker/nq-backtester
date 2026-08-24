@@ -28,7 +28,6 @@ local DATASTORE_NAME = "bars_v1"
 local MANIFEST_KEY = "manifest"
 local MONTH_KEY_PREFIX = "m:"
 
-
 type Chunk = { bars: { Bar }, tickSize: number }
 
 local chunks: { [string]: Chunk } = {}

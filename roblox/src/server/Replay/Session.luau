@@ -25,6 +25,7 @@ local Protocol = require(Shared.Net.Protocol)
 local Types = require(Shared.Types)
 
 local BarStore = require(script.Parent.Parent.Data.BarStore)
+local PlayerStore = require(script.Parent.Parent.Data.PlayerStore)
 
 type Bar = Types.Bar
 type Timeframe = Types.Timeframe
@@ -39,6 +40,20 @@ export type Remotes = {
 	bars: RemoteEvent,
 	tradeState: RemoteEvent,
 	sessionInfo: RemoteEvent,
+}
+
+-- Persistence bookkeeping. The DataStore round trip yields, the reveal loop
+-- must not, so every field here exists to keep the write on its own thread and
+-- to stop two of them overlapping on one key.
+export type Persist = {
+	data: PlayerStore.PlayerData,
+	loaded: boolean,
+	loading: boolean,
+	writing: boolean,
+	dirty: boolean,
+	capped: boolean, -- log outgrew MAX_EVENTS: this session is no longer written
+	resumeTried: boolean,
+	lastWrite: number,
 }
 
 export type Session = {
@@ -61,6 +76,8 @@ export type Session = {
 	nextId: number,
 	clockDirty: boolean,
 	tradeDirty: boolean,
+	switching: boolean, -- a session load is mid-yield; no other load may interleave
+	persist: Persist,
 }
 
 local STARTING_BALANCE = 10000
@@ -69,6 +86,12 @@ local DEFAULT_STEP: Timeframe = "1m"
 -- Client-supplied sizes are quantized then bounded; nothing about the sim
 -- breaks above this, it just stops absurd inputs reaching the reducer.
 local MAX_QTY = 100
+-- Upper bound on how much of a session a crash can cost. Writes are one key
+-- per player, so this is also the per-player DataStore write rate.
+local PERSIST_INTERVAL_SEC = 8
+-- A dirty session left mid-write on shutdown: how long the blocking flush will
+-- wait for the in-flight write before giving up on the tail.
+local PERSIST_WAIT_SEC = 5
 
 local SPEED_OK: { [number]: boolean } = {}
 for _, v in ipairs(Protocol.SPEEDS) do
@@ -115,10 +138,18 @@ local function append(s: Session, evType: string, tsMarket: number, payload: any
 		then
 			last.payload.to = payload.to
 			last.tsMarket = tsMarket
+			s.persist.dirty = true
 			return
 		end
 	end
 	table.insert(s.events, { type = evType, tsMarket = tsMarket, payload = payload })
+	s.persist.dirty = true
+	if not s.persist.capped and #s.events > PlayerStore.MAX_EVENTS then
+		-- Past the cap the key is at risk of growing unwritable, so this session
+		-- stops being saved entirely; what is already stored stays resumable.
+		s.persist.capped = true
+		warn(`[backtester] {s.player.Name}'s log passed {PlayerStore.MAX_EVENTS} events; it will no longer be saved`)
+	end
 end
 
 -- Derived state is never stored; every order-affecting append re-folds the log.
@@ -196,12 +227,17 @@ local function flush(s: Session, fromIdx: number?, toIdx: number?)
 end
 
 function M.sendSessionInfo(s: Session)
-	s.remotes.sessionInfo:FireClient(s.player, {
+	local info: Protocol.SessionInfo = {
 		availableDates = BarStore.availableDates(),
 		baseSec = s.baseSec,
 		tickSize = s.tickSize,
 		startingBalance = STARTING_BALANCE,
-	})
+		-- A resumed session is already running when the client first hears from
+		-- us, so the picker must not present itself as the only next step.
+		running = s.date ~= nil,
+		date = s.date,
+	}
+	s.remotes.sessionInfo:FireClient(s.player, info)
 end
 
 -- --------------------------------------------------------------- fills
@@ -409,9 +445,196 @@ local function rewindTo(s: Session, to: number)
 	sendTradeState(s)
 end
 
+-- ----------------------------------------------------------- persistence
+
+-- Ported from the web reference (lib/data/sessions.ts):
+--   export function resumeTimeOf(events: SessionEvent[], fallback: number): number {
+--     let t = fallback;
+--     for (const ev of events) if (ev.tsMarket > t) t = ev.tsMarket;
+--     return t;
+--   }
+-- The clock resumes at the LATEST market time any event observed. A trailing
+-- time_rewound does NOT pull it back: rewinds void, they never truncate, so
+-- the log's furthest point is where the session stood.
+local function resumeTimeOf(events: { SessionEvent }, fallback: number): number
+	local t = fallback
+	for _, ev in ipairs(events) do
+		if ev.tsMarket > t then
+			t = ev.tsMarket
+		end
+	end
+	return t
+end
+
+local function idNumber(v: any): number
+	if typeof(v) ~= "string" then
+		return 0
+	end
+	local n = string.match(v, "^o(%d+)$") or string.match(v, "^oco%-o(%d+)$")
+	return if n ~= nil then (tonumber(n) or 0) else 0
+end
+
+-- Order ids are minted from nextId, so a resumed log has to push the counter
+-- past every id it already contains — otherwise a new order reuses a
+-- historical id and deriveState folds the two into one.
+local function highestOrderId(events: { SessionEvent }): number
+	local hi = 0
+	for _, ev in ipairs(events) do
+		local payload = ev.payload
+		if typeof(payload) == "table" then
+			hi = math.max(hi, idNumber(payload.orderId), idNumber(payload.ocoId))
+		end
+	end
+	return hi
+end
+
+-- YIELDS. Idempotent, and safe to call from two threads: the second waits out
+-- the first rather than issuing a second read.
+local function ensurePersistLoaded(s: Session)
+	while s.persist.loading do
+		task.wait()
+	end
+	if s.persist.loaded then
+		return
+	end
+	s.persist.loading = true
+	local ok, data = pcall(PlayerStore.load, s.player.UserId)
+	s.persist.loading = false
+	if ok and typeof(data) == "table" then
+		s.persist.data = data
+	else
+		warn(`[backtester] player data load failed for {s.player.Name}: {data}`)
+	end
+	s.persist.loaded = true
+end
+
+-- YIELDS. Only ever reached from a spawned task, PlayerRemoving or
+-- BindToClose — never from the reveal loop.
+local function persistWrite(s: Session)
+	if s.persist.writing or s.persist.capped then
+		return
+	end
+	s.persist.writing = true
+	ensurePersistLoaded(s)
+	local data = s.persist.data
+	if s.date ~= nil then
+		-- The live log IS the saved log; PlayerStore.save makes the decoupled
+		-- copy, before any yield, so later appends cannot corrupt this write.
+		data.active = { date = s.date, events = s.events, savedAt = os.time() }
+	end
+	-- Cleared BEFORE the write: an append landing while it is in flight has to
+	-- leave the session dirty, not be swallowed by a late clear.
+	s.persist.dirty = false
+	local ok, saved = pcall(PlayerStore.save, s.player.UserId, data)
+	if not ok or saved ~= true then
+		s.persist.dirty = true
+	end
+	s.persist.lastWrite = os.clock()
+	s.persist.writing = false
+end
+
+-- Never yields: the heartbeat calls this every frame and hands the round trip
+-- to its own thread.
+local function persistTick(s: Session)
+	local p = s.persist
+	if not p.dirty or p.capped or p.writing then
+		return
+	end
+	if os.clock() - p.lastWrite < PERSIST_INTERVAL_SEC then
+		return
+	end
+	task.spawn(persistWrite, s)
+end
+
+-- Fold the outgoing session into lifetime stats and drop it. The live log wins
+-- over the last snapshot; when nothing is loaded in memory (the player never
+-- sent ready and started a fresh day) the saved log is folded instead.
+local function finalizeActive(s: Session)
+	local data = s.persist.data
+	local outgoing: Engine.EngineState? = nil
+	if s.date ~= nil then
+		outgoing = s.derived
+	else
+		local active = data.active
+		if active ~= nil then
+			local ok, state = pcall(Engine.deriveState, active.events)
+			if ok then
+				outgoing = state
+			end
+		end
+	end
+	if outgoing ~= nil then
+		local stats = data.stats
+		stats.sessions += 1
+		stats.trades += #outgoing.trades
+		stats.pnlUsd += outgoing.realizedUsd
+		-- A session that never traded is neither a win nor a loss, whatever
+		-- rounding left behind in realizedUsd.
+		if outgoing.realizedUsd > 0 and #outgoing.trades > 0 then
+			stats.wins += 1
+		end
+	end
+	data.active = nil
+	s.persist.dirty = true
+end
+
+-- YIELDS. Restores a saved session in full but sends nothing: the caller
+-- controls packet order. Returns false when there was nothing to resume.
+local function tryResume(s: Session): boolean
+	local p = s.persist
+	if p.resumeTried or s.switching or s.date ~= nil then
+		return false
+	end
+	p.resumeTried = true
+	local active = p.data.active
+	if active == nil then
+		return false
+	end
+	local function dropDead(why: string)
+		-- The day is gone from the store, so the log can never be replayed
+		-- against bars again. It is discarded WITHOUT counting toward stats:
+		-- a session nobody can see the result of is not a session played.
+		warn(`[backtester] dropping saved session for {s.player.Name}: {why}`)
+		p.data.active = nil
+		p.dirty = true
+	end
+	if not BarStore.hasDate(active.date) then
+		dropDead(`date {active.date} is no longer available`)
+		return false
+	end
+	local bars = BarStore.dayBars(active.date)
+	if bars == nil or #bars == 0 then
+		dropDead(`date {active.date} has no bars`)
+		return false
+	end
+	if s.date ~= nil then
+		return false -- a startSession landed while the bars were loading
+	end
+	s.date = active.date
+	s.bars = bars
+	s.tickSize = BarStore.tickSize()
+	s.baseSec = BarStore.baseSec()
+	s.startTs = bars[1].t
+	s.endTs = bars[#bars].t + s.baseSec
+	s.events = active.events
+	s.nextId = highestOrderId(s.events)
+	-- deriveState replays the whole log, rewind voiding included; no fill is
+	-- re-simulated, the log already records every one that happened.
+	refresh(s)
+	local t = math.clamp(resumeTimeOf(s.events, s.startTs), s.startTs, s.endTs)
+	s.currentTime = t
+	s.revealedCount = revealedAt(s, t)
+	s.playing = false
+	s.accumulator = 0
+	-- The caller sends the full state unconditionally; nothing is left pending.
+	s.clockDirty = false
+	s.tradeDirty = false
+	return true
+end
+
 -- -------------------------------------------------------------- commands
 
-local function cmdStartSession(s: Session, date: string)
+local function startSessionInner(s: Session, date: string)
 	-- The loads below YIELD (DataStore); stop the heartbeat first, or the old
 	-- day keeps advancing on top of the session that is being replaced.
 	s.playing = false
@@ -423,6 +646,12 @@ local function cmdStartSession(s: Session, date: string)
 	if bars == nil or #bars == 0 then
 		return
 	end
+	-- Committed to the replacement only now: the outgoing session is closed out
+	-- into lifetime stats before its log stops existing.
+	ensurePersistLoaded(s)
+	finalizeActive(s)
+	s.persist.capped = false
+	s.persist.resumeTried = true -- a started session never resumes a saved one
 	s.date = date
 	s.bars = bars
 	s.tickSize = BarStore.tickSize()
@@ -446,6 +675,27 @@ local function cmdStartSession(s: Session, date: string)
 	sendBars(s, 1, 0, true)
 	sendClock(s)
 	sendTradeState(s)
+	-- Written immediately, after the client is served: the cleared stats and the
+	-- new active session have to land in the same value, or a crash in between
+	-- would resurrect the session that was just folded in.
+	s.persist.dirty = true
+	persistWrite(s)
+end
+
+-- The load yields, so a second startSession could otherwise interleave with
+-- the first and fold the same session into stats twice.
+local function cmdStartSession(s: Session, date: string)
+	if s.switching then
+		return
+	end
+	s.switching = true
+	-- pcall's result arity follows its callee, which this one has none of; the
+	-- cast buys back the error value without loosening the call itself.
+	local ok, err = pcall(startSessionInner :: any, s, date)
+	s.switching = false
+	if not ok then
+		error(err, 0) -- the caller's guard owns the logging
+	end
 end
 
 -- Advance by one bar of the step timeframe: reveal base bars through the end
@@ -667,7 +917,46 @@ function M.new(player: Player, remotes: Remotes): Session
 		nextId = 0,
 		clockDirty = false,
 		tradeDirty = false,
+		switching = false,
+		persist = {
+			data = PlayerStore.empty(),
+			loaded = false,
+			loading = false,
+			writing = false,
+			dirty = false,
+			capped = false,
+			resumeTried = false,
+			lastWrite = os.clock(),
+		},
 	}
+end
+
+-- YIELDS (DataStore). The client's handlers are connected: resume whatever was
+-- saved, then answer with the picker and the state of what is now running.
+function M.onReady(s: Session)
+	ensurePersistLoaded(s)
+	local resumed = tryResume(s)
+	-- SessionInfo goes first even on resume: it carries the tickSize and
+	-- baseSec the client needs to decode the bar packet behind it.
+	M.sendSessionInfo(s)
+	if resumed then
+		sendBars(s, 1, s.revealedCount, true)
+		sendClock(s)
+		sendTradeState(s)
+	end
+end
+
+-- YIELDS until the tail is written. For PlayerRemoving and BindToClose only:
+-- both are given time to block, and the tail is the one loss resume can't heal.
+function M.persistNow(s: Session)
+	local deadline = os.clock() + PERSIST_WAIT_SEC
+	while s.persist.writing and os.clock() < deadline do
+		task.wait()
+	end
+	if not s.persist.dirty then
+		return
+	end
+	persistWrite(s)
 end
 
 -- Every field below is attacker-controlled. Unknown commands, wrong types and
@@ -728,6 +1017,9 @@ function M.handleCmd(s: Session, msg: any)
 end
 
 function M.tick(s: Session, dt: number)
+	-- Checked whether or not the clock is running, and never yielding: the
+	-- write itself is spawned so the reveal loop below can't wait on DataStore.
+	persistTick(s)
 	if not s.playing then
 		return
 	end

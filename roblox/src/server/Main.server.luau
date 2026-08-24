@@ -17,7 +17,8 @@ local MAX_CMDS_PER_SEC = 30
 -- FireClient before the joining player's scripts have connected is a dropped
 -- packet, and SessionInfo carries the date picker, so it is re-sent on this
 -- schedule until the player's first command proves the client is listening.
--- (A client->server "ready" command would replace this, but Protocol is frozen.)
+-- A "ready" command ends it immediately; this is only the fallback for clients
+-- that never send one.
 local SESSION_INFO_RETRIES: { number } = { 1, 2, 4 }
 
 local remotesFolder = Protocol.ensureRemotes()
@@ -88,12 +89,21 @@ local function onPlayerAdded(player: Player)
 end
 
 local function onPlayerRemoving(player: Player)
+	local s = sessions[player]
 	sessions[player] = nil
 	buckets[player] = nil
 	heard[player] = nil
 	local i = table.find(joined, player)
 	if i ~= nil then
 		table.remove(joined, i)
+	end
+	-- Deregistered first, so the flush below cannot race a heartbeat write for
+	-- a player who is already gone.
+	if s ~= nil then
+		local ok, err = guard(Session.persistNow, s)
+		if not ok then
+			warn(`[backtester] final save failed for {player.Name}: {err}`)
+		end
 	end
 end
 
@@ -103,6 +113,15 @@ cmdRemote.OnServerEvent:Connect(function(player: Player, msg: any)
 		return
 	end
 	heard[player] = true
+	if typeof(msg) == "table" and msg.cmd == "ready" then
+		-- Resume reads the player's DataStore key and the day's bars, so this
+		-- handler yields; it stays on the remote's own thread.
+		local ok, err = guard(Session.onReady, s)
+		if not ok then
+			warn(`[backtester] ready failed for {player.Name}: {err}`)
+		end
+		return
+	end
 	local ok, err = guard(Session.handleCmd, s, msg)
 	if not ok then
 		warn(`[backtester] command failed for {player.Name}: {err}`)
@@ -116,6 +135,21 @@ RunService.Heartbeat:Connect(function(dt: number)
 			local ok, err = guard(Session.tick, s, dt)
 			if not ok then
 				warn(`[backtester] replay tick failed for {player.Name}: {err}`)
+			end
+		end
+	end
+end)
+
+-- Shutdown is the one place a save may block: PlayerRemoving does not fire for
+-- everyone on a server close, and an unwritten tail is lost replay time.
+game:BindToClose(function()
+	for _, player in ipairs(table.clone(joined)) do
+		local s = sessions[player]
+		if s ~= nil then
+			sessions[player] = nil
+			local ok, err = guard(Session.persistNow, s)
+			if not ok then
+				warn(`[backtester] shutdown save failed for {player.Name}: {err}`)
 			end
 		end
 	end

@@ -33,6 +33,9 @@
 --
 -- Cmd shapes (server validates everything; qty is quantized, prices
 -- tick-rounded server-side — the client is untrusted):
+--   { cmd = "ready" }                              -- client's handlers are connected; server
+--                                                  -- replies SessionInfo (+ full session state
+--                                                  -- when a persisted session resumed)
 --   { cmd = "startSession", date = "YYYY-MM-DD" }  -- start at that trading day's first bar
 --   { cmd = "stepForward" } | { cmd = "stepBack" }
 --   { cmd = "jumpTo", t = number }
@@ -49,6 +52,61 @@
 --   { cmd = "flatten" }                            -- market-close the position, cancel all
 
 local M = {}
+
+-- Payload shapes as REAL types — the single declaration both sides typecheck
+-- against. Keep in lockstep with the doc comment above.
+export type WorkingOrderView = {
+	id: string,
+	side: string,
+	type: string,
+	qty: number,
+	limitPrice: number?,
+	stopPrice: number?,
+	ocoId: string?,
+	reduceOnly: boolean?,
+}
+
+-- Mirrors Engine.Trade structurally so Protocol stays dependency-free.
+export type TradeView = {
+	entryTs: number,
+	exitTs: number,
+	side: string,
+	qty: number,
+	avgEntry: number,
+	avgExit: number,
+	pnlPts: number,
+	pnlUsd: number,
+	ambiguous: boolean,
+	riskPts: number?,
+	slPrice: number?,
+	tpPrice: number?,
+}
+
+export type Clock = {
+	t: number,
+	playing: boolean,
+	speed: number,
+	stepSize: string,
+}
+
+export type TradeState = {
+	position: { qty: number, avgPrice: number },
+	realizedPts: number,
+	realizedUsd: number,
+	workingOrders: { WorkingOrderView },
+	trades: { TradeView },
+	voidedCount: number,
+	startingBalance: number,
+}
+
+export type SessionInfo = {
+	availableDates: { string },
+	baseSec: number,
+	tickSize: number,
+	startingBalance: number,
+	running: boolean?, -- a (possibly resumed) session is already active
+	date: string?, -- its trading date, when running
+}
 
 M.REMOTES_FOLDER = "Remotes"
 M.REMOTE_NAMES = { "Cmd", "Clock", "Bars", "TradeState", "SessionInfo" }

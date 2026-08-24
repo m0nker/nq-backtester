@@ -5,8 +5,13 @@
 --
 -- Timeframe is the one exception: it is a pure display choice, re-aggregated
 -- locally from bars the server already revealed.
+--
+-- The keyboard bindings are the same commands as the buttons. Every one of
+-- them is gated on GetFocusedTextBox() being nil: the order panel's fields
+-- share this keyboard, and a space typed into a qty box must not toggle play.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Et = require(Shared:WaitForChild("Time"):WaitForChild("Et"))
@@ -14,10 +19,10 @@ local Protocol = require(Shared:WaitForChild("Net"):WaitForChild("Protocol"))
 local Types = require(Shared:WaitForChild("Types"))
 
 local Client = script.Parent.Parent
-local Messages = require(Client:WaitForChild("Net"):WaitForChild("Messages"))
 local Theme = require(Client:WaitForChild("UI"):WaitForChild("Theme"))
 
 type Timeframe = Types.Timeframe
+type Send = ({ [string]: any }) -> ()
 
 local PAD = 4
 local TF_BTN_W = 34
@@ -27,7 +32,7 @@ local Controls = {}
 Controls.__index = Controls
 
 export type Callbacks = {
-	send: (Messages.Cmd) -> (),
+	send: Send,
 	setTimeframe: (Timeframe) -> (),
 }
 
@@ -97,6 +102,53 @@ local function highlightTf(self: Controls)
 	end
 end
 
+-- Every speed change starts from the SERVER's current speed, so a dropped Cmd
+-- cannot leave the ladder position walking away from the clock.
+local function speedIndex(self: Controls): number
+	return table.find(Protocol.SPEEDS, self.speed) or 1
+end
+
+-- The arrow keys walk the ladder and stop at its ends; the button wraps.
+local function nudgeSpeed(self: Controls, dir: number)
+	local idx = math.clamp(speedIndex(self) + dir, 1, #Protocol.SPEEDS)
+	local speed = Protocol.SPEEDS[idx]
+	if speed ~= self.speed then
+		self.cbs.send({ cmd = "setSpeed", speed = speed })
+	end
+end
+
+local function wireKeyboard(self: Controls)
+	-- Space is play/pause, and the avatar's default jump must not fire with
+	-- it. It is claimed through ContextActionService — handled AND sunk here —
+	-- because a sunk input reaches UserInputService with processed=true, so the
+	-- generic handler below could never see it.
+	game:GetService("ContextActionService"):BindAction("BacktesterPlayPause", function(_, state: Enum.UserInputState)
+		if UserInputService:GetFocusedTextBox() ~= nil then
+			return Enum.ContextActionResult.Pass -- typing a space, not commanding
+		end
+		if state == Enum.UserInputState.Begin then
+			self.cbs.send({ cmd = if self.playing then "pause" else "play" })
+		end
+		return Enum.ContextActionResult.Sink
+	end, false, Enum.KeyCode.Space)
+
+	UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
+		if processed or UserInputService:GetFocusedTextBox() ~= nil then
+			return
+		end
+		local key = input.KeyCode
+		if key == Enum.KeyCode.Right then
+			self.cbs.send({ cmd = "stepForward" })
+		elseif key == Enum.KeyCode.Left then
+			self.cbs.send({ cmd = "stepBack" })
+		elseif key == Enum.KeyCode.Up then
+			nudgeSpeed(self, 1)
+		elseif key == Enum.KeyCode.Down then
+			nudgeSpeed(self, -1)
+		end
+	end)
+end
+
 function Controls.setTimeframe(self: Controls, tf: Timeframe)
 	if tf == self.tf then
 		return
@@ -111,7 +163,7 @@ end
 
 -- Authoritative transport state: the bar renders what the server reports, not
 -- what the last click asked for.
-function Controls.onClock(self: Controls, msg: Messages.Clock)
+function Controls.onClock(self: Controls, msg: Protocol.Clock)
 	local t = Et.formatET(msg.t, true)
 	if self.clockLabel.Text ~= t then
 		self.clockLabel.Text = t
@@ -191,11 +243,7 @@ function Controls.new(gui: ScreenGui, cbs: Callbacks): Controls
 		cbs.send({ cmd = if self.playing then "pause" else "play" })
 	end)
 	speedBtn.Activated:Connect(function()
-		-- cycle from the SERVER's current speed, so a dropped Cmd cannot leave
-		-- the button walking a different ladder position than the clock
-		local idx = table.find(Protocol.SPEEDS, self.speed) or 1
-		local nextSpeed = Protocol.SPEEDS[idx % #Protocol.SPEEDS + 1]
-		cbs.send({ cmd = "setSpeed", speed = nextSpeed })
+		cbs.send({ cmd = "setSpeed", speed = Protocol.SPEEDS[speedIndex(self) % #Protocol.SPEEDS + 1] })
 	end)
 	stepBtn.Activated:Connect(function()
 		self.stepMode = if self.stepMode == "1m" then "view" else "1m"
@@ -206,6 +254,7 @@ function Controls.new(gui: ScreenGui, cbs: Callbacks): Controls
 			self:setTimeframe(tf)
 		end)
 	end
+	wireKeyboard(self)
 
 	return self
 end
