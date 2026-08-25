@@ -194,6 +194,11 @@ local function degradeInStudio(reason: any): boolean
 end
 
 local function getOrdered(storeName: string, scope: string): OrderedDataStore?
+	-- Test switch, mirroring PlayerStore: spec suites must never touch the
+	-- real boards from Studio now that API access is enabled on this place.
+	if RunService:IsStudio() and _G.__BACKTESTER_TEST_MEMORY == true then
+		memoryOnly = true
+	end
 	if memoryOnly then
 		return nil
 	end

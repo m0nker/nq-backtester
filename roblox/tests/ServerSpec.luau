@@ -1709,6 +1709,11 @@ export type Result = { passed: number, failed: number, failures: { string } }
 function ServerSpec.run(): Result
 	print("=== ServerSpec ===")
 
+	-- Pin PlayerStore/Board to their in-memory paths (honored by their store
+	-- getters, Studio-only): with API access enabled on this place, a run
+	-- would otherwise write real players_v1 keys under the fake user ids.
+	_G.__BACKTESTER_TEST_MEMORY = true
+
 	local dates = BarStore.availableDates()
 	if #dates == 0 then
 		local why = "[preflight] BarStore.availableDates() is empty — SampleData is missing or failed to decode"

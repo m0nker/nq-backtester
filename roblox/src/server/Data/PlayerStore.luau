@@ -76,6 +76,12 @@ local blocked: { [number]: boolean } = {} -- load failed: never overwrite what w
 local cappedWarned: { [number]: boolean } = {}
 
 local function getStore(): DataStore?
+	-- Test switch: the spec suites (ServerSpec/BoardSpec) set this in Studio so
+	-- their fake-user sessions can never write real player keys — necessary now
+	-- that this place has Studio API access enabled.
+	if RunService:IsStudio() and _G.__BACKTESTER_TEST_MEMORY == true then
+		memoryOnly = true
+	end
 	if memoryOnly then
 		return nil
 	end

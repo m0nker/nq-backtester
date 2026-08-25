@@ -32,12 +32,12 @@ unless noted.
 Two of these are not stated cleanly in current Roblox docs and must be
 confirmed in Studio before the code depends on them:
 
-1. **OrderedDataStore rejects negative values.** The API reference does not
-   spell out the constraint; the long-standing community answer is "positive
-   integers only", with negative values either erroring or sorting wrongly.
-   The design below never writes a negative value regardless, so a
-   confirmation either way costs nothing — but the verifier should run
-   `ods:SetAsync("probe", -5)` once and record the result in this file.
+1. **OrderedDataStore rejects negative values.** RESOLVED 2026-08-24 — the
+   startup probe ran against the live store and a negative value was
+   **ACCEPTED**, so the long-standing community claim is wrong (at least
+   today). The cent-offset encoding is therefore not strictly required; it
+   is KEPT anyway (monotonic, harmless, and immune to the behavior ever
+   changing back). Do not remove the offset without migrating stored values.
 2. **`GetSortedAsync` pageSize cap.** Ask for 20; if 100 is legal we still
    only want 20.
 
