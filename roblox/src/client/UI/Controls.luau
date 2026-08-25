@@ -28,6 +28,30 @@ local PAD = 4
 local TF_BTN_W = 34
 local BTN_H = 26
 
+-- Step size is either a concrete timeframe or this: "follow the chart". The
+-- server has no such mode (Protocol), so "view" never travels — it only
+-- decides which CONCRETE timeframe setStepSize carries.
+local STEP_VIEW = "view"
+local STEP_MENU_W = 86
+local STEP_ROW_H = 22
+local STEP_MENU_PAD = 3
+
+-- Timeframe hotkeys, TradingView-style: the digit row walks the ladder. Bound
+-- here rather than next to the buttons so the two can never disagree about
+-- which key means what.
+local TF_HOTKEYS: { [Enum.KeyCode]: Timeframe } = {
+	[Enum.KeyCode.One] = "1m",
+	[Enum.KeyCode.Two] = "2m",
+	[Enum.KeyCode.Three] = "3m",
+	[Enum.KeyCode.Four] = "4m",
+	[Enum.KeyCode.Five] = "5m",
+	[Enum.KeyCode.Six] = "15m",
+	[Enum.KeyCode.Seven] = "30m",
+	[Enum.KeyCode.Eight] = "1h",
+	[Enum.KeyCode.Nine] = "4h",
+	[Enum.KeyCode.Zero] = "1D",
+}
+
 local Controls = {}
 Controls.__index = Controls
 
@@ -42,14 +66,20 @@ type Fields = {
 	playBtn: TextButton,
 	speedBtn: TextButton,
 	stepBtn: TextButton,
+	stepMenu: Frame,
+	stepScrim: TextButton,
+	stepRows: { [string]: TextButton },
 	tfButtons: { [Timeframe]: TextButton },
 	tf: Timeframe,
 	playing: boolean,
 	speed: number,
-	-- "1m" pins stepping to the base resolution; "view" follows the chart
-	-- timeframe. The server has no "view" mode, so the CONCRETE timeframe is
-	-- what actually travels in setStepSize.
+	-- A concrete Types.TIMEFRAMES value pins stepping to that timeframe;
+	-- STEP_VIEW follows the chart's. Either way the CONCRETE timeframe is what
+	-- travels in setStepSize.
 	stepMode: string,
+	-- what the SERVER last said it is stepping by; the button reports this
+	-- rather than the last click, so a rejected setStepSize cannot lie
+	serverStepSize: string,
 }
 
 export type Controls = typeof(setmetatable({} :: Fields, Controls))
@@ -66,8 +96,8 @@ local function newButton(parent: Instance, x: number, w: number, text: string): 
 	b.AnchorPoint = Vector2.new(0, 0.5)
 	b.Position = UDim2.new(0, x, 0.5, 0)
 	b.Size = UDim2.fromOffset(w, BTN_H)
-	b.Font = Enum.Font.Code
-	b.TextSize = 13
+	b.Font = Theme.fontUiMedium
+	b.TextSize = Theme.textMd
 	b.Text = text
 	b.AutoButtonColor = true
 	b.Parent = parent
@@ -82,8 +112,9 @@ local function newLabel(parent: Instance, x: number, w: number, color: Color3): 
 	l.AnchorPoint = Vector2.new(0, 0.5)
 	l.Position = UDim2.new(0, x, 0.5, 0)
 	l.Size = UDim2.fromOffset(w, BTN_H)
-	l.Font = Enum.Font.Code
-	l.TextSize = 13
+	-- the clock is rewritten on every reveal: fixed advance or it shuffles
+	l.Font = Theme.fontMono
+	l.TextSize = Theme.textMd
 	l.TextColor3 = color
 	l.TextXAlignment = Enum.TextXAlignment.Left
 	l.Text = ""
@@ -93,7 +124,82 @@ end
 
 -- The concrete timeframe the server should step by, given the local mode.
 local function stepSizeFor(self: Controls): string
-	return if self.stepMode == "1m" then "1m" else self.tf
+	return if self.stepMode == STEP_VIEW then self.tf else self.stepMode
+end
+
+-- The button names the MODE ("view" is a mode, not a size); every concrete
+-- mode names the size the server confirmed.
+local function syncStep(self: Controls)
+	local text = "step " .. (if self.stepMode == STEP_VIEW then STEP_VIEW else self.serverStepSize)
+	if self.stepBtn.Text ~= text then
+		self.stepBtn.Text = text
+	end
+	for value, row in pairs(self.stepRows) do
+		styleButton(row, value == self.stepMode)
+	end
+end
+
+local function setStepMenuOpen(self: Controls, open: boolean)
+	self.stepMenu.Visible = open
+	self.stepScrim.Visible = open
+end
+
+local function setStepMode(self: Controls, mode: string)
+	self.stepMode = mode
+	setStepMenuOpen(self, false)
+	syncStep(self)
+	self.cbs.send({ cmd = "setStepSize", stepSize = stepSizeFor(self) })
+end
+
+-- The menu is parented to the HUD ScreenGui, not to the control bar: it opens
+-- UPWARD out of the bar's bounds, and the scrim that dismisses it has to cover
+-- the whole screen. Rows are built once — the option list is static.
+local function newStepMenu(gui: ScreenGui, x: number): (Frame, TextButton, { [string]: TextButton })
+	local scrim = Instance.new("TextButton")
+	scrim.Name = "StepMenuScrim"
+	scrim.BorderSizePixel = 0
+	scrim.BackgroundTransparency = 1
+	scrim.AutoButtonColor = false
+	scrim.Text = ""
+	scrim.Size = UDim2.fromScale(1, 1)
+	scrim.ZIndex = 19
+	scrim.Visible = false
+	scrim.Parent = gui
+
+	local options: { string } = { STEP_VIEW }
+	for _, tf in ipairs(Types.TIMEFRAMES) do
+		table.insert(options, tf)
+	end
+
+	local menu = Instance.new("Frame")
+	menu.Name = "StepMenu"
+	menu.BorderSizePixel = 0
+	menu.BackgroundColor3 = Theme.border
+	menu.AnchorPoint = Vector2.new(0, 1)
+	menu.Position = UDim2.new(0, x, 1, -(Theme.controlBarHeight + 2))
+	menu.Size = UDim2.fromOffset(STEP_MENU_W, #options * STEP_ROW_H + STEP_MENU_PAD * 2)
+	menu.ZIndex = 20
+	menu.Visible = false
+	menu.Active = true
+	menu.Parent = gui
+
+	local rows: { [string]: TextButton } = {}
+	for i, value in ipairs(options) do
+		local row = Instance.new("TextButton")
+		row.Name = value
+		row.BorderSizePixel = 0
+		row.Position = UDim2.fromOffset(STEP_MENU_PAD, STEP_MENU_PAD + (i - 1) * STEP_ROW_H)
+		row.Size = UDim2.fromOffset(STEP_MENU_W - STEP_MENU_PAD * 2, STEP_ROW_H)
+		row.Font = Theme.fontUi
+		row.TextSize = Theme.textMd
+		row.Text = value
+		row.AutoButtonColor = true
+		row.ZIndex = 21
+		row.Parent = menu
+		styleButton(row, false)
+		rows[value] = row
+	end
+	return menu, scrim, rows
 end
 
 local function highlightTf(self: Controls)
@@ -137,6 +243,11 @@ local function wireKeyboard(self: Controls)
 			return
 		end
 		local key = input.KeyCode
+		local tf = TF_HOTKEYS[key]
+		if tf ~= nil then
+			self:setTimeframe(tf)
+			return
+		end
 		if key == Enum.KeyCode.Right then
 			self.cbs.send({ cmd = "stepForward" })
 		elseif key == Enum.KeyCode.Left then
@@ -177,9 +288,9 @@ function Controls.onClock(self: Controls, msg: Protocol.Clock)
 		self.speed = msg.speed
 		self.speedBtn.Text = string.format("%d bar/s", msg.speed)
 	end
-	local step = "step " .. msg.stepSize
-	if self.stepBtn.Text ~= step then
-		self.stepBtn.Text = step
+	if self.serverStepSize ~= msg.stepSize then
+		self.serverStepSize = msg.stepSize
+		syncStep(self)
 	end
 end
 
@@ -207,6 +318,7 @@ function Controls.new(gui: ScreenGui, cbs: Callbacks): Controls
 	local speedBtn = newButton(bar, x, 78, "1 bar/s")
 	x += 78 + PAD
 	local stepBtn = newButton(bar, x, 82, "step 1m")
+	local stepMenu, stepScrim, stepRows = newStepMenu(gui, x)
 	x += 82 + PAD * 3
 
 	local tfButtons: { [Timeframe]: TextButton } = {}
@@ -222,16 +334,21 @@ function Controls.new(gui: ScreenGui, cbs: Callbacks): Controls
 			playBtn = playBtn,
 			speedBtn = speedBtn,
 			stepBtn = stepBtn,
+			stepMenu = stepMenu,
+			stepScrim = stepScrim,
+			stepRows = stepRows,
 			tfButtons = tfButtons,
 			tf = "1m" :: Timeframe,
 			playing = false,
 			speed = Protocol.SPEEDS[1],
 			stepMode = "1m",
+			serverStepSize = "1m",
 		} :: Fields,
 		Controls
 	)
 
 	highlightTf(self)
+	syncStep(self)
 
 	backBtn.Activated:Connect(function()
 		cbs.send({ cmd = "stepBack" })
@@ -246,9 +363,18 @@ function Controls.new(gui: ScreenGui, cbs: Callbacks): Controls
 		cbs.send({ cmd = "setSpeed", speed = Protocol.SPEEDS[speedIndex(self) % #Protocol.SPEEDS + 1] })
 	end)
 	stepBtn.Activated:Connect(function()
-		self.stepMode = if self.stepMode == "1m" then "view" else "1m"
-		cbs.send({ cmd = "setStepSize", stepSize = stepSizeFor(self) })
+		setStepMenuOpen(self, not self.stepMenu.Visible)
 	end)
+	-- Clicking anywhere else — including back on the button, which the scrim
+	-- now covers — closes without choosing.
+	stepScrim.Activated:Connect(function()
+		setStepMenuOpen(self, false)
+	end)
+	for value, row in pairs(stepRows) do
+		row.Activated:Connect(function()
+			setStepMode(self, value)
+		end)
+	end
 	for tf, btn in pairs(tfButtons) do
 		btn.Activated:Connect(function()
 			self:setTimeframe(tf)

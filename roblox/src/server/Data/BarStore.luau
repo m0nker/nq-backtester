@@ -186,13 +186,36 @@ local function loadManifest(): { DayMeta }
 			days = coerceDays({ days = data.days })
 		end
 	end
+	-- The full dataset carries a handful of degenerate trading dates (lone
+	-- Sunday-evening bars, sub-100-bar stubs) that would list as unplayable
+	-- sessions. Filtered here rather than in the shipped data, so the raw
+	-- chunks stay complete for context-bar use.
+	local playable: { DayMeta } = {}
+	for _, day in ipairs(days) do
+		if day.barCount >= 100 then
+			table.insert(playable, day)
+		end
+	end
 	-- ISO dates sort lexicographically; the picker order is observable output,
 	-- so it can never come from DataStore/table iteration order.
-	table.sort(days, function(a: DayMeta, b: DayMeta): boolean
+	table.sort(playable, function(a: DayMeta, b: DayMeta): boolean
 		return a.date < b.date
 	end)
-	manifest = days
-	return days
+	manifest = playable
+	return playable
+end
+
+local function prevMonthKey(monthKey: string): string?
+	local y, mo = string.match(monthKey, "^(%d%d%d%d)-(%d%d)$")
+	local yn = tonumber(y)
+	local mon = tonumber(mo)
+	if yn == nil or mon == nil then
+		return nil
+	end
+	if mon == 1 then
+		return string.format("%04d-12", yn - 1)
+	end
+	return string.format("%04d-%02d", yn, mon - 1)
 end
 
 local function parseDate(date: string): (number?, number?, number?)
@@ -243,6 +266,55 @@ function M.dayBars(date: string): { Bar }?
 	end
 	if #out == 0 then
 		return nil
+	end
+	return out
+end
+
+-- YIELDS (may load a second month chunk). The last n bars strictly before
+-- dayStartSec, ascending — the CLOSED history a session shows in front of its
+-- start point. A month bucket opens the evening before the month's first
+-- trading day, so a day early in the month has little of its own context and
+-- the search continues into the previous month's chunk. A chunk that isn't
+-- there (never uploaded, DataStore miss, sample data) just yields fewer bars:
+-- context is history for the eye, never a reason to fail a session load.
+function M.barsBefore(dayStartSec: number, n: number): { Bar }
+	if n <= 0 then
+		return {}
+	end
+	local rev: { Bar } = {}
+	-- Tightened as bars are taken, so two chunks that overlap at their shared
+	-- boundary can never contribute the same bar twice.
+	local limit = dayStartSec
+	local used: Chunk? = nil
+	local function take(monthKey: string?)
+		if monthKey == nil or #rev >= n then
+			return
+		end
+		local chunk = loadMonth(monthKey)
+		-- loadMonth degrades to the SHARED sample chunk, so the previous month's
+		-- key can hand back the very table this already walked.
+		if chunk == nil or chunk == used then
+			return
+		end
+		used = chunk
+		for i = #chunk.bars, 1, -1 do
+			local b = chunk.bars[i]
+			if b.t < limit then
+				table.insert(rev, b)
+				limit = b.t
+				if #rev >= n then
+					return
+				end
+			end
+		end
+	end
+	local monthKey = string.sub(Et.tradingDateOf(dayStartSec), 1, 7)
+	take(monthKey)
+	-- One month of overhang covers any n a session asks for at ~1400 bars/day.
+	take(prevMonthKey(monthKey))
+	local out: { Bar } = {}
+	for i = #rev, 1, -1 do
+		table.insert(out, rev[i])
 	end
 	return out
 end

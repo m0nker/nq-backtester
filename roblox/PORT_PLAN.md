@@ -16,7 +16,7 @@ toolchain, chart rendering, data delivery). Revisit only with new evidence.
 | Bar encoding | Columnar packed binary in `buffer`: u32 t + f32 o/h/l/c + f32 v = 24 B/bar (~33 KB/day). Base64 via native `EncodingService` only at the DataStore boundary. | Buffers replicate natively over remotes with on-the-wire compression. No gzip in Luau; native compression is Zstd-only — v1 skips compression entirely (86 MB raw dataset fits the quota; add Zstd later if wanted). |
 | 1s data | CUT. 1m base only. | 14 MB/day doesn't fit the platform; engine's SL-first ambiguous-bar fallback already handles absent 1s coverage. |
 | Sub-minute TFs | CUT (15s/30s need 1s base). Timeframes: 1m..1M. | Follows from 1s cut. |
-| Licensing hygiene | Normalize prices per session (undisclosed rebase) + shuffle date identity before upload; never label data as NQ/CME in-game. | CME historical-distribution licensing is triggered by distribution, not revenue. Friends-only today, but hygiene is cheap now and expensive later. |
+| Licensing hygiene | Normalize prices by ONE undisclosed dataset-wide shift (earliest packed day opens at 20000) + shuffle date identity before upload; never label data as NQ/CME in-game. Was per-month rebase. | CME historical-distribution licensing is triggered by distribution, not revenue. Friends-only today, but hygiene is cheap now and expensive later. A single shift still destroys absolute levels, and unlike the per-month rebase it keeps cross-month continuity — which a deep 1D/1W/1M chart *is* (META_PLAN §4); per-month shifts made it a sawtooth. |
 | Multiplayer | Server-authoritative clock; clients receive only revealed bars. | Anti-lookahead becomes cheat-proof by construction; enables 1v1/daily-challenge later. |
 
 ## What ports where

@@ -6,6 +6,12 @@
 -- sendBars, which can only encode the revealed prefix — that is the whole
 -- anti-lookahead guarantee, and the assert in sendBars is what keeps it true.
 --
+-- The array is prefixed with `contextCount` bars from BEFORE the day's open.
+-- They are revealed from the first frame because they closed before startTs
+-- (the web shows the same window — barSource's ensureLoadedAround), and they
+-- are history, not session time: nothing fills on them and no rewind reaches
+-- back into them.
+--
 -- Semantics mirror the web reference (lib/replay/clock.ts for stepping/play,
 -- lib/trading/store.ts for order mechanics). The divergences are structural:
 -- stepping runs on a server heartbeat instead of a browser timer, and every
@@ -61,9 +67,10 @@ export type Session = {
 	remotes: Remotes,
 	date: string?,
 	bars: { Bar }, -- server-only; the client sees BarCodec slices of [1, revealedCount]
+	contextCount: number, -- bars[1 .. contextCount] closed before startTs
 	revealedCount: number,
 	currentTime: number,
-	startTs: number,
+	startTs: number, -- open of the first DAY bar; the context prefix sits before it
 	endTs: number, -- close of the last bar; the clock never advances past it
 	playing: boolean,
 	speed: number,
@@ -81,6 +88,9 @@ export type Session = {
 }
 
 local STARTING_BALANCE = 10000
+-- Closed bars shown in front of the start point, ~1.5 trading days. Costs one
+-- extra month chunk on load and ~48 KB in the reset bar packet.
+local CONTEXT_BARS = 2000
 local DEFAULT_SPEED = 5
 local DEFAULT_STEP: Timeframe = "1m"
 -- Client-supplied sizes are quantized then bounded; nothing about the sim
@@ -346,6 +356,10 @@ end
 -- Evaluate one newly revealed base bar. This port ships no 1s data, so the
 -- seconds resolver is always nil and Fills falls back to SL-first.
 local function processBar(s: Session, bar: Bar)
+	-- Reveal starts at contextCount, so this can only ever see day bars. Stated
+	-- as an assert because a fill on a context bar would be a trade the player
+	-- was never given the chance to place.
+	assert(bar.t >= s.startTs, "fill processing reached a pre-session context bar")
 	if #s.derived.workingOrders == 0 then
 		return
 	end
@@ -435,14 +449,32 @@ end
 -- fill, and Engine.deriveState voids the ones after the target. The client
 -- cache is replaced wholesale because its tail is now unrevealed.
 local function rewindTo(s: Session, to: number)
+	-- The floor is the day's open, never the context prefix: a bucket that
+	-- starts before it (1W/1M step sizes, or the first bucket of the day) is
+	-- clamped here rather than rejected, so stepping back still makes progress.
+	to = math.max(to, s.startTs)
 	append(s, "time_rewound", to, { from = s.currentTime, to = to })
 	refresh(s)
 	s.currentTime = to
-	s.revealedCount = revealedAt(s, to)
+	s.revealedCount = math.max(revealedAt(s, to), s.contextCount)
 	s.accumulator = 0
 	sendBars(s, 1, s.revealedCount, true)
 	sendClock(s)
 	sendTradeState(s)
+end
+
+-- ----------------------------------------------------------------- bars
+
+-- YIELDS (BarStore may fetch a second month chunk). Returns the day's bars
+-- behind their context prefix, plus the prefix length. Called BEFORE either
+-- load path commits to the new day, so no yield sits between the commit and a
+-- consistent bars/contextCount pair.
+local function withContext(dayBars: { Bar }): ({ Bar }, number)
+	local context = BarStore.barsBefore(dayBars[1].t, CONTEXT_BARS)
+	local all: { Bar } = {}
+	table.move(context, 1, #context, 1, all)
+	table.move(dayBars, 1, #dayBars, #context + 1, all)
+	return all, #context
 end
 
 -- ----------------------------------------------------------- persistence
@@ -607,11 +639,13 @@ local function tryResume(s: Session): boolean
 		dropDead(`date {active.date} has no bars`)
 		return false
 	end
+	local all, contextCount = withContext(bars)
 	if s.date ~= nil then
 		return false -- a startSession landed while the bars were loading
 	end
 	s.date = active.date
-	s.bars = bars
+	s.bars = all
+	s.contextCount = contextCount
 	s.tickSize = BarStore.tickSize()
 	s.baseSec = BarStore.baseSec()
 	s.startTs = bars[1].t
@@ -623,6 +657,9 @@ local function tryResume(s: Session): boolean
 	refresh(s)
 	local t = math.clamp(resumeTimeOf(s.events, s.startTs), s.startTs, s.endTs)
 	s.currentTime = t
+	-- t >= startTs and every context bar closed at/before startTs, so the scan
+	-- covers the whole prefix without the log knowing it exists — which is why
+	-- a log saved before context existed still resumes correctly.
 	s.revealedCount = revealedAt(s, t)
 	s.playing = false
 	s.accumulator = 0
@@ -646,6 +683,7 @@ local function startSessionInner(s: Session, date: string)
 	if bars == nil or #bars == 0 then
 		return
 	end
+	local all, contextCount = withContext(bars)
 	-- Committed to the replacement only now: the outgoing session is closed out
 	-- into lifetime stats before its log stops existing.
 	ensurePersistLoaded(s)
@@ -653,12 +691,15 @@ local function startSessionInner(s: Session, date: string)
 	s.persist.capped = false
 	s.persist.resumeTried = true -- a started session never resumes a saved one
 	s.date = date
-	s.bars = bars
+	s.bars = all
+	s.contextCount = contextCount
 	s.tickSize = BarStore.tickSize()
 	s.baseSec = BarStore.baseSec()
-	s.revealedCount = 0
-	-- Nothing is revealed until the first step/play: the clock sits ON the
-	-- first bar's open, which has not closed yet (matches the web's start(ts)).
+	-- The context prefix is revealed from the outset — it closed before the
+	-- session began — while nothing of the DAY is revealed until the first
+	-- step/play: the clock sits ON the first day bar's open, which has not
+	-- closed yet (matches the web's start(ts)).
+	s.revealedCount = contextCount
 	s.startTs = bars[1].t
 	s.currentTime = bars[1].t
 	s.endTs = bars[#bars].t + s.baseSec
@@ -672,7 +713,7 @@ local function startSessionInner(s: Session, date: string)
 		config = {},
 	})
 	refresh(s)
-	sendBars(s, 1, 0, true)
+	sendBars(s, 1, s.revealedCount, true)
 	sendClock(s)
 	sendTradeState(s)
 	-- Written immediately, after the client is served: the cleared stats and the
@@ -718,7 +759,10 @@ end
 
 -- Hide the latest (possibly partial) bucket of the step timeframe.
 local function cmdStepBack(s: Session)
-	if s.revealedCount == 0 then
+	-- At the day's open there is nothing left to hide; the context prefix is not
+	-- session time, so it must not be stepped into (rewindTo clamps, but a
+	-- no-op rewind would still append an event and resend the whole cache).
+	if s.revealedCount <= s.contextCount then
 		return
 	end
 	rewindTo(s, Aggregate.bucketStart(s.bars[s.revealedCount].t, s.stepSize))
@@ -902,6 +946,7 @@ function M.new(player: Player, remotes: Remotes): Session
 		remotes = remotes,
 		date = nil,
 		bars = {},
+		contextCount = 0,
 		revealedCount = 0,
 		currentTime = 0,
 		startTs = 0,

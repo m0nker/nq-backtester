@@ -53,8 +53,10 @@ local function newCell(parent: Instance, x: number, w: number, align: Enum.TextX
 	l.BorderSizePixel = 0
 	l.Position = UDim2.fromOffset(x, 0)
 	l.Size = UDim2.fromOffset(w, ROW_H)
-	l.Font = Enum.Font.Code
-	l.TextSize = 12
+	-- a column of prices, dollars and R multiples only reads as a column with
+	-- a fixed advance behind it
+	l.Font = Theme.fontMono
+	l.TextSize = Theme.textSm
 	l.TextColor3 = Theme.text
 	l.TextXAlignment = align
 	l.Text = ""
@@ -173,8 +175,8 @@ function TradeLog.new(gui: ScreenGui): TradeLog
 	title.BorderSizePixel = 0
 	title.Position = UDim2.fromOffset(8, 0)
 	title.Size = UDim2.new(1, -16, 0, HEADER_H)
-	title.Font = Enum.Font.Code
-	title.TextSize = 12
+	title.Font = Theme.fontUiMedium
+	title.TextSize = Theme.textMd
 	title.TextColor3 = Theme.textDim
 	title.TextXAlignment = Enum.TextXAlignment.Left
 	title.Text = "trades (0)"
@@ -197,8 +199,8 @@ function TradeLog.new(gui: ScreenGui): TradeLog
 	empty.BorderSizePixel = 0
 	empty.Position = UDim2.fromOffset(8, 6)
 	empty.Size = UDim2.new(1, -16, 0, ROW_H)
-	empty.Font = Enum.Font.Code
-	empty.TextSize = 12
+	empty.Font = Theme.fontUi
+	empty.TextSize = Theme.textSm
 	empty.TextColor3 = Theme.textDim
 	empty.TextXAlignment = Enum.TextXAlignment.Left
 	empty.Text = "no completed trades yet"

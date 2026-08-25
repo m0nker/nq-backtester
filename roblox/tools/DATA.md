@@ -6,10 +6,12 @@ DataStore. Run everything from the **repo root**.
 ## The three commands
 
 ```sh
-# 1. dev slice — a few months, fast, proves the pipeline end to end
+# 1. dev slice — a few months, fast, proves the pipeline end to end.
+#    NOT canonical: the normalization shift is derived from the subset. See below.
 npx tsx roblox/tools/prepareData.ts --months 2026-05,2026-06,2026-07 --sample-days 3
 
-# 2. full history — every month in the dataset (~4150 trading days)
+# 2. full history — every month in the dataset (~4150 trading days).
+#    The only run whose output may be uploaded or committed.
 npx tsx roblox/tools/prepareData.ts
 
 # 3. upload (dry run first, ALWAYS)
@@ -40,24 +42,39 @@ against the pre-pack bars. Zero tolerance: any mismatch aborts the run.
 ## Normalization
 
 Licensing hygiene (see `PORT_PLAN.md`): the game must never ship recognizable
-CME price levels. Per **calendar month of trading dates**:
+CME price levels. **One shift for the whole dataset**:
 
 ```
-shift = roundToTick(firstOpenOfMonth - 20000, 0.25)
-o,h,l,c -= shift          # timestamps and volume untouched
+shift = roundToTick(firstOpenOfEarliestPackedDay - 20000, 0.25)
+o,h,l,c -= shift          # every bar of every month; timestamps and volume untouched
 ```
 
-Each month therefore opens at 20000. One constant shift per month preserves
-every intra-month relationship — ranges, gaps, swing structure, level retests —
-while destroying the absolute price identity and any cross-month continuity.
+The dataset's earliest day therefore opens at 20000 and every later month
+floats where its real history puts it. A single constant shift preserves every
+price relationship — ranges, gaps, swing structure, level retests, and
+**continuity across month boundaries** — while destroying the absolute price
+identity. Cross-month continuity is the point: a deep 1D/1W/1M chart *is* that
+continuity, and the earlier per-month rebase turned it into a sawtooth back to
+20000 at every boundary (`META_PLAN.md` §4).
+
+**Only a full run is canonical.** The anchor is the earliest day *actually
+packed*, so `--months 2026-05,2026-06` derives its shift from May 2026 and
+produces prices incompatible with every other run. The script prints a loud
+warning when `--months` is used; that output is for pipeline smoke-testing
+only — never upload it, never commit the `SampleData.luau` / `Codec.json` it
+regenerates. Anything destined for the DataStore comes from
+`npx tsx roblox/tools/prepareData.ts` with no flags.
 
 Prices are snapped back onto the 0.25 grid after the shift. Some source chunks
 carry float dust from the roll adjustment (observed max ~1.5e-11 ticks); the
 packed form is integer tick counts regardless, and the snap is bounded at 1e-6
 ticks so a genuinely off-grid price would still abort the run.
 
-Tick counts are **i32**, not u32 — a month whose data sits far below its rebase
-anchor can go negative, and the Codec fixture pins that case.
+Tick counts are **i32**, not u32. Under a global shift anchored at the
+dataset's earliest day no real bar goes negative, so the Codec fixture pins the
+negative and sign-extreme cases with synthetic bars instead. The run prints the
+post-shift min low / max high in both price and ticks, so the i32 margin stays
+visible if the dataset is ever extended backwards.
 
 ## One-time Open Cloud setup (user action)
 

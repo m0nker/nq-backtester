@@ -61,8 +61,8 @@ function SessionPicker.setDates(self: SessionPicker, dates: { string })
 		row.BorderSizePixel = 0
 		row.BackgroundColor3 = Theme.panel
 		row.TextColor3 = Theme.text
-		row.Font = Enum.Font.Code
-		row.TextSize = 13
+		row.Font = Theme.fontUi
+		row.TextSize = Theme.textMd
 		row.Text = date
 		row.Position = UDim2.fromOffset(0, (i - 1) * (ROW_H + 2))
 		row.Size = UDim2.new(1, -12, 0, ROW_H)
@@ -103,8 +103,8 @@ function SessionPicker.new(gui: ScreenGui, onPick: (string) -> ()): SessionPicke
 	title.BorderSizePixel = 0
 	title.Position = UDim2.fromOffset(12, 8)
 	title.Size = UDim2.new(1, -24, 0, 20)
-	title.Font = Enum.Font.Code
-	title.TextSize = 14
+	title.Font = Theme.fontUiMedium
+	title.TextSize = Theme.textLg
 	title.TextColor3 = Theme.text
 	title.TextXAlignment = Enum.TextXAlignment.Left
 	title.Text = "pick a session"
@@ -130,8 +130,8 @@ function SessionPicker.new(gui: ScreenGui, onPick: (string) -> ()): SessionPicke
 	openBtn.Size = UDim2.fromOffset(110, 24)
 	openBtn.BackgroundColor3 = Theme.panel
 	openBtn.TextColor3 = Theme.text
-	openBtn.Font = Enum.Font.Code
-	openBtn.TextSize = 12
+	openBtn.Font = Theme.fontUiMedium
+	openBtn.TextSize = Theme.textSm
 	openBtn.Text = "new session"
 	openBtn.ZIndex = 5
 	openBtn.Parent = gui

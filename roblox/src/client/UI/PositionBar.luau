@@ -43,8 +43,9 @@ local function newChip(parent: Instance, x: number, w: number, filled: boolean):
 	l.Size = UDim2.fromOffset(w, 18)
 	l.BackgroundTransparency = if filled then 0 else 1
 	l.BackgroundColor3 = Theme.border
-	l.Font = Enum.Font.Code
-	l.TextSize = 12
+	-- position, P&L and trade count are all live numbers
+	l.Font = Theme.fontMono
+	l.TextSize = Theme.textSm
 	l.TextColor3 = Theme.textDim
 	l.TextXAlignment = Enum.TextXAlignment.Left
 	l.Text = ""
@@ -61,8 +62,8 @@ local function newButton(parent: Instance, name: string, x: number, w: number): 
 	b.Size = UDim2.fromOffset(w, BTN_H)
 	b.BackgroundColor3 = Theme.panelHover
 	b.TextColor3 = Theme.text
-	b.Font = Enum.Font.Code
-	b.TextSize = 12
+	b.Font = Theme.fontUiMedium
+	b.TextSize = Theme.textSm
 	b.Text = name
 	b.Parent = parent
 	return b

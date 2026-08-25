@@ -127,8 +127,8 @@ local function newButton(parent: Instance, name: string, x: number, w: number, h
 	b.Size = UDim2.fromOffset(w, h)
 	b.BackgroundColor3 = Theme.panelHover
 	b.TextColor3 = Theme.text
-	b.Font = Enum.Font.Code
-	b.TextSize = 12
+	b.Font = Theme.fontUiMedium
+	b.TextSize = Theme.textSm
 	b.Text = name
 	b.AutoButtonColor = true
 	b.ZIndex = 6
@@ -143,8 +143,8 @@ local function newLabel(parent: Instance, x: number, w: number, text: string): T
 	l.AnchorPoint = Vector2.new(0, 0.5)
 	l.Position = UDim2.new(0, x, 0.5, 0)
 	l.Size = UDim2.fromOffset(w, ROW_H)
-	l.Font = Enum.Font.Code
-	l.TextSize = 12
+	l.Font = Theme.fontUi
+	l.TextSize = Theme.textSm
 	l.TextColor3 = Theme.textDim
 	l.TextXAlignment = Enum.TextXAlignment.Left
 	l.Text = text
@@ -162,8 +162,9 @@ local function newBox(parent: Instance, name: string, x: number, w: number): Tex
 	b.Size = UDim2.fromOffset(w, ROW_H - 4)
 	b.BackgroundColor3 = Theme.border
 	b.TextColor3 = Theme.text
-	b.Font = Enum.Font.Code
-	b.TextSize = 12
+	-- every box on this panel holds a number
+	b.Font = Theme.fontMono
+	b.TextSize = Theme.textSm
 	b.Text = ""
 	b.ClearTextOnFocus = false
 	b.ZIndex = 6

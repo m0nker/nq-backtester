@@ -66,17 +66,31 @@ local controls = Controls.new(hud, {
 	send = send,
 	setTimeframe = function(tf: Types.Timeframe)
 		cache:setTimeframe(tf)
+		-- rightIndex is an INDEX: the same value means a 60x different time
+		-- after 1m -> 1h. The web recenters on every switch
+		-- (scrollToPosition(6)); snapping to tail is our equivalent.
+		chart:snapToTail()
 	end,
 })
 local picker = SessionPicker.new(hud, function(date: string)
 	send({ cmd = "startSession", date = date })
 	chart:snapToTail()
+	-- A price range dragged out by hand belongs to the day it was dragged on;
+	-- carrying it into a new session can leave the new day's candles entirely
+	-- off-screen with no obvious way back.
+	chart:resetPriceScale()
 end)
 
 -- Remote payloads are untrusted/untyped on the wire; each handler casts once at
 -- the boundary against the exported Protocol shapes.
 barsRemote.OnClientEvent:Connect(function(packet: any, reset: any)
 	cache:applyPacket(packet :: buffer, reset == true)
+	if reset == true then
+		-- A reset replaces the whole bar array (session start, rewind, jump
+		-- back): any camera position from before is an index into an array
+		-- that no longer exists. Snap rather than strand.
+		chart:snapToTail()
+	end
 end)
 
 clockRemote.OnClientEvent:Connect(function(msg: any)

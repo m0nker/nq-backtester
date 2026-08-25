@@ -10,10 +10,14 @@
 // tests/fixtures/Codec.json pins the two implementations byte-for-byte. Change
 // one without the other and parity breaks by construction.
 //
-// Prices are rebased per calendar month (licensing hygiene, PORT_PLAN) — an
-// undisclosed constant shift that preserves every bar's shape and every
-// intra-month price relationship while destroying the absolute price identity.
-// Timestamps and volume are untouched.
+// Prices are rebased by ONE dataset-wide constant (licensing hygiene,
+// PORT_PLAN) — an undisclosed shift that destroys the absolute price identity
+// while preserving every bar's shape and every price relationship, including
+// across month boundaries. Timestamps and volume are untouched.
+//
+// The shift is derived from the earliest day actually packed, so a --months
+// subset produces a DIFFERENT shift than a full run: only full runs are
+// canonical (see DATA.md).
 //
 // Nothing here is a replay-clock read: this is an offline preprocessing tool
 // operating on whole trading days, the same as scripts/ingest.mjs.
@@ -30,8 +34,8 @@ const RESOLUTION = '1m';
 const TICK_SIZE = 0.25;
 const BASE_SEC = 60;
 
-// Every month's first open is rebased to this price. Arbitrary and undisclosed
-// on purpose — see the licensing-hygiene row in PORT_PLAN.
+// The dataset's earliest open is rebased to this price. Arbitrary and
+// undisclosed on purpose — see the licensing-hygiene row in PORT_PLAN.
 const NORMALIZED_OPEN = 20_000;
 
 // Script.Source caps at 200k chars; SampleData.luau is Rojo-mapped to a
@@ -325,13 +329,21 @@ function inspectRawDay(date: string, bars: Bar[], meta: DayRow): void {
 const SNAP_TOLERANCE_TICKS = 1e-6;
 let maxSnapTicks = 0;
 
-// Rebase the whole calendar month by one constant so its first open lands on
-// NORMALIZED_OPEN. One shift per month keeps every intra-month relationship
-// (gaps, levels, ranges) intact; cross-month levels are deliberately broken.
-function normalizeMonth(month: string, days: Array<{ date: string; bars: Bar[] }>): number {
-  const first = days.find((d) => d.bars.length > 0);
-  if (!first) throw new Error(`${month}: no bars`);
-  const shift = roundToTick(first.bars[0].o - NORMALIZED_OPEN, TICK_SIZE);
+// Post-shift extremes, to prove the whole dataset stays inside the i32 tick
+// range the packed form uses.
+let minLow = Infinity;
+let maxHigh = -Infinity;
+
+// ONE shift for the entire dataset, so that the earliest packed day opens on
+// NORMALIZED_OPEN. Every price relationship survives — including across month
+// boundaries, which a deep multi-year chart IS (META_PLAN §4) — while the
+// absolute level identity is destroyed. Derived from the earliest packed day,
+// hence only canonical on a full run.
+function globalShiftFrom(firstOpen: number): number {
+  return roundToTick(firstOpen - NORMALIZED_OPEN, TICK_SIZE);
+}
+
+function normalizeDays(days: Array<{ date: string; bars: Bar[] }>, shift: number): void {
   const snap = (date: string, t: number, field: string, raw: number): number => {
     const shifted = raw - shift;
     const onGrid = roundToTick(shifted, TICK_SIZE);
@@ -350,6 +362,8 @@ function normalizeMonth(month: string, days: Array<{ date: string; bars: Bar[] }
       b.h = snap(day.date, b.t, 'h', b.h);
       b.l = snap(day.date, b.t, 'l', b.l);
       b.c = snap(day.date, b.t, 'c', b.c);
+      if (b.l < minLow) minLow = b.l;
+      if (b.h > maxHigh) maxHigh = b.h;
       if (!Number.isInteger(b.v) || b.v < 0 || b.v > 0xffffffff) {
         throw new Error(`${day.date} t=${b.t}: volume ${b.v} does not fit u32`);
       }
@@ -358,7 +372,6 @@ function normalizeMonth(month: string, days: Array<{ date: string; bars: Bar[] }
       }
     }
   }
-  return shift;
 }
 
 // --------------------------------------------------------------- sample days
@@ -413,9 +426,10 @@ function writeSampleData(run: Array<{ date: string; bars: Bar[] }>): { chars: nu
 }
 
 // Pins the TS packer to the Luau decoder byte-for-byte. Real bars alone cannot
-// cover the representation edges — normalization never pushes a modern NQ month
-// negative — so the tail bars are constructed to exercise i32 sign, the u32
-// volume range and the u32 timestamp range.
+// cover the representation edges — the global shift puts the dataset's earliest
+// open at 20000 and the run reports the post-shift range, which stays positive
+// and orders of magnitude inside i32 — hence the tail bars are constructed to
+// exercise i32 sign, the u32 volume range and the u32 timestamp range.
 function writeCodecFixture(realBars: Bar[]): number {
   const bars: Bar[] = [
     ...realBars.slice(0, 4),
@@ -456,12 +470,23 @@ async function main(): Promise<void> {
   const months = [...byMonth.keys()].sort();
   if (months.length === 0) throw new Error('no months selected');
   console.log(`processing ${months.length} month(s): ${months.join(', ')}`);
+  if (onlyMonths) {
+    console.warn(
+      '\n!!! --months: the normalization shift is derived from the EARLIEST PACKED day,\n' +
+        '!!! so this subset gets a different shift than a full run. The output is NOT\n' +
+        '!!! canonical and MUST NOT be uploaded or committed. Rerun without --months.\n',
+    );
+  }
 
   mkdirSync(MONTH_DIR, { recursive: true });
 
   const failed: string[] = [];
   const monthsOut: Array<{ month: string; key: string; byteSize: number; days: DayOut[] }> = [];
   let totalBars = 0;
+
+  // Months are processed in ascending order, so the first month with usable
+  // days carries the earliest packed day — the anchor for the whole dataset.
+  let shift: number | null = null;
 
   // The dataset's newest month is still in progress (its last trading day can
   // be a partial session), so the sample prefers any earlier — complete —
@@ -487,7 +512,12 @@ async function main(): Promise<void> {
     }
     for (const d of days) inspectRawDay(d.date, d.bars, d.meta);
 
-    const shift = normalizeMonth(month, days);
+    if (shift === null) {
+      const anchor = days[0];
+      shift = globalShiftFrom(anchor.bars[0].o);
+      console.log(`global shift ${shift} (anchor ${anchor.date} first open ${anchor.bars[0].o})`);
+    }
+    normalizeDays(days, shift);
     const bars = days.flatMap((d) => d.bars);
     const buf = pack(bars, TICK_SIZE);
     assertRoundTrip(month, bars, buf);
@@ -505,9 +535,7 @@ async function main(): Promise<void> {
         barCount: d.bars.length,
       })),
     });
-    console.log(
-      `  ${month}: ${days.length} days, ${bars.length} bars, ${(buf.length / 1024).toFixed(1)} KiB, shift ${shift}`,
-    );
+    console.log(`  ${month}: ${days.length} days, ${bars.length} bars, ${(buf.length / 1024).toFixed(1)} KiB`);
 
     // Keep only the most recent viable sample run in memory; whole months are
     // dropped as soon as they are packed so a full-history run stays bounded.
@@ -542,6 +570,10 @@ async function main(): Promise<void> {
       `(${chosen.map((d) => d.date).join(', ')}), ${sample.chars} chars`,
   );
   console.log(`tests/fixtures/Codec.json: ${fixtureChars} chars`);
+  console.log(
+    `normalization: global shift ${shift}, post-shift range ${minLow} .. ${maxHigh} ` +
+      `(${ticks(minLow, TICK_SIZE)} .. ${ticks(maxHigh, TICK_SIZE)} ticks, i32 limit ±2147483647)`,
+  );
   console.log('round-trip: OK (every month + sample + fixture unpacked and compared exactly)');
   console.log(
     `data quality: off-grid raw prices ${quality.offGridPrices} across ${quality.offGridDays.size} day(s), ` +

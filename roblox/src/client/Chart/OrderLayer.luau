@@ -105,8 +105,9 @@ local function newChip(parent: Instance): TextButton
 	b.AnchorPoint = Vector2.new(1, 0.5)
 	b.Size = UDim2.fromOffset(CHIP_W, CHIP_H)
 	b.BackgroundColor3 = Theme.panel
-	b.Font = Enum.Font.Code
-	b.TextSize = 12
+	-- a drag re-prices this chip every frame: fixed advance or the level jitters
+	b.Font = Theme.fontMono
+	b.TextSize = Theme.textSm
 	b.TextXAlignment = Enum.TextXAlignment.Left
 	b.TextTruncate = Enum.TextTruncate.AtEnd
 	b.Text = ""
@@ -125,8 +126,8 @@ local function newCancel(chip: TextButton): TextButton
 	b.Position = UDim2.new(1, -1, 0.5, 0)
 	b.Size = UDim2.fromOffset(CANCEL_W, CHIP_H - 2)
 	b.BackgroundTransparency = 1
-	b.Font = Enum.Font.Code
-	b.TextSize = 12
+	b.Font = Theme.fontUiMedium
+	b.TextSize = Theme.textSm
 	b.TextColor3 = Theme.textDim
 	b.Text = "x"
 	b.ZIndex = Z_CANCEL
@@ -288,11 +289,12 @@ function OrderLayer.beginDrag(self: OrderLayer, slot: Slot)
 	self.chart:setPanLocked(true)
 end
 
--- The chart ScreenGui sets IgnoreGuiInset, so GetMouseLocation and the plot's
--- AbsolutePosition share a coordinate space (same reasoning as ChartView).
+-- Plot-local pixels come from the chart, which owns the one mouse -> plot
+-- conversion (the topbar inset makes GetMouseLocation and AbsolutePosition
+-- different spaces — see ChartView.mouseLocation).
 local function dragPriceAt(self: OrderLayer): number
 	local plot = self.chart:getPlot()
-	local y = math.clamp(UserInputService:GetMouseLocation().Y - plot.AbsolutePosition.Y, 0, plot.AbsoluteSize.Y)
+	local y = math.clamp(self.chart:mouseToPlot().Y, 0, plot.AbsoluteSize.Y)
 	return ContractMath.roundToTick(self.chart:yToPrice(y), self.tickSize)
 end
 

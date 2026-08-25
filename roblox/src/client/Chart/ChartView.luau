@@ -43,12 +43,36 @@ local PRICE_AXIS_W = 62
 local TIME_AXIS_H = 20
 local MIN_BAR_W = 2
 local MAX_BAR_W = 40
-local ZOOM_FACTOR = 1.15
+local DEFAULT_BAR_W = 8
+local ZOOM_FACTOR = 1.25
 -- empty candle slots kept between the newest candle and the right edge, so
 -- price has somewhere to go (mirrors the web chart's rightOffset of 6)
 local TAIL_PAD = 6
 local DRAG_THRESHOLD = 5
 local BODY_WIDTH_FRACTION = 0.7
+
+-- Axis-strip drags. Both are exponential in the pixel delta so the gesture
+-- feels identical at every zoom level; e^(200 * 0.0035) ~= 2, i.e. a drag of
+-- roughly a third of a 1080p screen doubles or halves the scale.
+local AXIS_DRAG_RATE = 0.0035
+-- A manual price range narrower than this would blow the candle Frames up to
+-- absurd pixel heights; wider than this and the tape is a flat line.
+local MIN_PRICE_RANGE = 0.05
+local MAX_PRICE_RANGE = 1e7
+-- Roblox has no double-click signal for a Frame; two presses inside this
+-- window on the same strip are one.
+local DOUBLE_CLICK_SEC = 0.35
+
+-- Dashed crosshair (the web chart's large-dash style). A Frame has no stroke
+-- pattern, so each line is a transparent CONTAINER holding one small Frame per
+-- dash. Only the container moves on mouse move; the dashes are laid out once
+-- per resize, so the per-frame cost is still two Position writes.
+local DASH_LEN = 4
+local DASH_PERIOD = 8
+-- Enough for a 4K-wide plot; past it the line simply stops, which no display
+-- this game runs on will reach.
+local DASH_POOL_MAX = 480
+local CROSS_TIME_W = 96
 
 -- Axis steps come from the 1 / 2 / 2.5 / 5 x 10^k ladder.
 local STEP_MULTIPLIERS: { number } = { 1, 2, 2.5, 5, 10 }
@@ -62,7 +86,11 @@ local TIME_STEPS: { number } = {
 	900,
 	1800,
 	3600,
+	2 * 3600,
+	3 * 3600,
 	4 * 3600,
+	6 * 3600,
+	8 * 3600,
 	12 * 3600,
 	86400,
 	7 * 86400,
@@ -79,6 +107,9 @@ ChartView.__index = ChartView
 type Fields = {
 	cache: BarCache,
 	gui: ScreenGui,
+	-- flush with the true top-left of the screen; mouseLocation() reads its
+	-- AbsolutePosition to convert screen coordinates into AbsolutePosition space
+	root: Frame,
 	plot: Frame,
 	priceAxis: Frame,
 	timeAxis: Frame,
@@ -94,6 +125,10 @@ type Fields = {
 
 	crossV: Frame,
 	crossH: Frame,
+	crossVDashes: { Frame },
+	crossHDashes: { Frame },
+	crossVShown: number,
+	crossHShown: number,
 	crossPrice: TextLabel,
 	crossTime: TextLabel,
 
@@ -112,12 +147,39 @@ type Fields = {
 	-- repaints
 	priceMin: number,
 	priceMax: number,
+	-- false until a repaint has painted a real price range. A blank chart has
+	-- NO scale, so the axis, the gridlines and the crosshair readouts must all
+	-- stay dark rather than quote the placeholder range.
+	scaled: boolean,
+
+	-- Manual price scale (price-axis drag). While manual the range is frozen:
+	-- new bars, pans and zooms move the tape THROUGH it instead of rescaling
+	-- it. Double-clicking the axis returns to auto-fit.
+	priceManual: boolean,
+	manualMin: number,
+	manualMax: number,
 
 	dirty: boolean,
 	dragging: boolean,
 	dragMoved: boolean,
 	dragStartX: number,
+	dragStartY: number,
 	dragStartRight: number,
+	dragStartMin: number,
+	dragStartMax: number,
+
+	-- axis-strip drags. Each records the value it started from, so the gesture
+	-- is a function of total displacement rather than an accumulation of
+	-- per-frame deltas (which would drift).
+	priceAxisDrag: boolean,
+	priceAxisStartY: number,
+	priceAxisStartMin: number,
+	priceAxisStartMax: number,
+	priceAxisLastClick: number,
+	timeAxisDrag: boolean,
+	timeAxisStartX: number,
+	timeAxisStartWidth: number,
+	timeAxisLastClick: number,
 
 	-- overlays that draw in this chart's space (order lines/chips) subscribe
 	-- here instead of running their own RenderStepped loop
@@ -153,6 +215,24 @@ local function yToPrice(y: number, pMin: number, pMax: number, plotH: number): n
 	return pMax - (y / plotH) * (pMax - pMin)
 end
 
+-- Mouse -> the coordinate space AbsolutePosition/AbsoluteSize are reported in.
+--
+-- These are two DIFFERENT spaces: GetMouseLocation() measures from the true
+-- top-left of the window, while AbsolutePosition is measured from the topbar
+-- INSET origin — under this ScreenGui's IgnoreGuiInset the root frame is drawn
+-- flush with the top of the screen and reports AbsolutePosition.Y = -58.
+--
+-- The offset between them is MEASURED, never asked for:
+-- GuiService:GetGuiInset() reports (0, 0) to this LocalScript on a client whose
+-- frames are demonstrably inset by 58px, so a fix built on it silently does
+-- nothing (that is exactly how the crosshair sat one topbar below the cursor).
+-- `root` is at the ScreenGui's (0, 0) with no anchor, so its AbsolutePosition
+-- IS the screen origin expressed in AbsolutePosition space, whatever the inset
+-- currently is — and it re-reads every call, so a changing inset self-corrects.
+local function mouseLocation(self: ChartView): Vector2
+	return UserInputService:GetMouseLocation() + self.root.AbsolutePosition
+end
+
 local function niceStep(range: number, target: number): number
 	if range <= 0 or target <= 0 then
 		return 1
@@ -166,17 +246,6 @@ local function niceStep(range: number, target: number): number
 		end
 	end
 	return 10 * mag
-end
-
-local function priceDecimals(step: number): number
-	if step >= 10 then
-		return 0
-	elseif step >= 1 then
-		return 1
-	elseif step >= 0.1 then
-		return 2
-	end
-	return 3
 end
 
 -- ---------------------------------------------------------------------------
@@ -198,9 +267,12 @@ local function newLabel(parent: Instance, name: string, z: number): TextLabel
 	l.Name = name
 	l.BackgroundTransparency = 1
 	l.BorderSizePixel = 0
-	l.Font = Enum.Font.Code
-	l.TextSize = 12
-	l.TextColor3 = Theme.textDim
+	-- every label built here is a live number (axis ticks, crosshair readouts)
+	l.Font = Theme.fontMono
+	l.TextSize = Theme.textSm
+	-- axis type is FULL contrast, not the dimmed UI grey: the scale is read as
+	-- often as the candles are
+	l.TextColor3 = Theme.text
 	l.Text = ""
 	l.ZIndex = z
 	l.Parent = parent
@@ -216,6 +288,35 @@ local function makeSlot(plot: Frame): CandleSlot
 	body.AnchorPoint = Vector2.new(0.5, 0)
 	body.Visible = false
 	return { wick = wick, body = body }
+end
+
+-- Dashes along one crosshair line. Called on resize only — growth is a one-off
+-- pool extension, exactly like the candle slots.
+local function layoutDashes(container: Frame, dashes: { Frame }, shown: number, span: number, vertical: boolean): number
+	local want = math.min(math.ceil(span / DASH_PERIOD), DASH_POOL_MAX)
+	for i = #dashes + 1, want do
+		local d = newFrame(container, "D" .. i, Theme.crosshair, 1)
+		d.Visible = false
+		dashes[i] = d
+	end
+	for i = 1, want do
+		local off = (i - 1) * DASH_PERIOD
+		local d = dashes[i]
+		if vertical then
+			d.Position = UDim2.fromOffset(0, off)
+			d.Size = UDim2.fromOffset(1, DASH_LEN)
+		else
+			d.Position = UDim2.fromOffset(off, 0)
+			d.Size = UDim2.fromOffset(DASH_LEN, 1)
+		end
+	end
+	for k = want + 1, shown do
+		dashes[k].Visible = false
+	end
+	for k = shown + 1, want do
+		dashes[k].Visible = true
+	end
+	return want
 end
 
 -- Growth is amortized and capped, never per repaint: the pool only extends the
@@ -268,6 +369,39 @@ function ChartView.markDirty(self: ChartView)
 	self.dirty = true
 end
 
+-- Re-cut both dashed crosshair lines to the plot's size. Resize only: mouse
+-- movement moves the containers, never the dashes inside them.
+function ChartView.layoutCrosshair(self: ChartView)
+	local size = self.plot.AbsoluteSize
+	self.crossVShown = layoutDashes(self.crossV, self.crossVDashes, self.crossVShown, size.Y, true)
+	self.crossHShown = layoutDashes(self.crossH, self.crossHDashes, self.crossHShown, size.X, false)
+end
+
+-- --------------------------------------------------------------- price scale
+-- Auto-fit (the default) refits the range to the visible candles on every
+-- repaint. Dragging the price axis switches to MANUAL, which freezes the
+-- range: revealed bars, pans and zooms then move the tape through a fixed
+-- scale instead of moving the scale. Only a double-click on the axis and
+-- resetPriceScale() go back to auto.
+
+function ChartView.resetPriceScale(self: ChartView)
+	if not self.priceManual then
+		return
+	end
+	self.priceManual = false
+	self.dirty = true
+end
+
+-- Expand/compress about the midpoint, TradingView-style: the price under the
+-- middle of the axis is the one that stays put. factor < 1 zooms in.
+local function scaleManualRange(self: ChartView, min0: number, max0: number, factor: number)
+	local mid = (min0 + max0) * 0.5
+	local half = math.clamp((max0 - min0) * 0.5 * factor, MIN_PRICE_RANGE * 0.5, MAX_PRICE_RANGE * 0.5)
+	self.priceManual = true
+	self.manualMin, self.manualMax = mid - half, mid + half
+	self.dirty = true
+end
+
 -- ---------------------------------------------------------------------------
 -- overlay API. An overlay parents its Instances into the plot (clipped, and
 -- above the candles by ZIndex) and maps prices through the scale the LAST
@@ -290,6 +424,14 @@ end
 
 function ChartView.getPriceRange(self: ChartView): (number, number)
 	return self.priceMin, self.priceMax
+end
+
+-- Cursor position in plot-local pixels. Overlays MUST go through this rather
+-- than subtracting AbsolutePosition from GetMouseLocation themselves: those
+-- two are in different spaces, and mouseLocation() above owns the (measured)
+-- term that reconciles them.
+function ChartView.mouseToPlot(self: ChartView): Vector2
+	return mouseLocation(self) - self.plot.AbsolutePosition
 end
 
 -- Fired after every repaint, in subscription order. Overlays also repaint on
@@ -330,21 +472,29 @@ function ChartView.repaint(self: ChartView)
 		return
 	end
 
-	local lo, hi = math.huge, -math.huge
-	for i = first, last do
-		local c = candles[i]
-		if c.l < lo then
-			lo = c.l
+	local pMin, pMax
+	if self.priceManual then
+		pMin, pMax = self.manualMin, self.manualMax
+	else
+		local lo, hi = math.huge, -math.huge
+		for i = first, last do
+			local c = candles[i]
+			if c.l < lo then
+				lo = c.l
+			end
+			if c.h > hi then
+				hi = c.h
+			end
 		end
-		if c.h > hi then
-			hi = c.h
-		end
+		-- Asymmetric margins, mirroring the web chart's price scale: 20% of the
+		-- range above, 10% below, so the tape sits low and new highs have room.
+		-- The floors keep a flat range from collapsing the scale to zero height.
+		local range = hi - lo
+		pMin, pMax = lo - math.max(range * 0.10, 0.25), hi + math.max(range * 0.20, 0.5)
 	end
-	-- 5% padding above and below; the floor keeps a flat range from collapsing
-	-- the price scale to zero height
-	local pad = math.max((hi - lo) * 0.05, 0.25)
-	local pMin, pMax = lo - pad, hi + pad
 	self.priceMin, self.priceMax = pMin, pMax
+	self.scaled = true
+	self:syncCrosshairVisibility()
 
 	ensureSlots(self, last - first + 1)
 
@@ -392,7 +542,9 @@ end
 function ChartView.paintPriceAxis(self: ChartView, plotH: number)
 	local pMin, pMax = self.priceMin, self.priceMax
 	local step = niceStep(pMax - pMin, PRICE_LABELS - 1)
-	local fmt = "%." .. priceDecimals(step) .. "f"
+	-- two decimals at EVERY zoom: a scale that drops decimals as it widens
+	-- makes two adjacent ticks read as the same price
+	local fmt = "%.2f"
 	-- index arithmetic instead of accumulating `p += step`: float drift would
 	-- otherwise make the labels wander off the round values
 	local k0 = math.ceil(pMin / step)
@@ -503,6 +655,20 @@ function ChartView.hideAll(self: ChartView)
 		self.vLines[k].Visible = false
 	end
 	self.drawn, self.priceShown, self.timeShown = 0, 0, 0
+	-- nothing drawn means no scale to read prices or times off
+	self.scaled = false
+	self:syncCrosshairVisibility()
+end
+
+-- The readouts are gated on `scaled` on top of the crosshair's own visibility:
+-- with no bars the placeholder range would otherwise print a price the chart
+-- is not showing.
+function ChartView.syncCrosshairVisibility(self: ChartView)
+	local readouts = self.crossV.Visible and self.scaled
+	if self.crossPrice.Visible ~= readouts then
+		self.crossPrice.Visible = readouts
+		self.crossTime.Visible = readouts
+	end
 end
 
 function ChartView.setCrosshairVisible(self: ChartView, v: boolean)
@@ -511,21 +677,18 @@ function ChartView.setCrosshairVisible(self: ChartView, v: boolean)
 	end
 	self.crossV.Visible = v
 	self.crossH.Visible = v
-	self.crossPrice.Visible = v
-	self.crossTime.Visible = v
+	self:syncCrosshairVisibility()
 end
 
--- `mouse` is in the ScreenGui's coordinate space (see mouseLocation below);
--- nil hides the crosshair.
+-- `mouse` is already plot-local (mouseToPlot); nil hides the crosshair.
 function ChartView.updateCrosshair(self: ChartView, mouse: Vector2?)
 	if mouse == nil then
 		self:setCrosshairVisible(false)
 		return
 	end
-	local origin = self.plot.AbsolutePosition
 	local size = self.plot.AbsoluteSize
-	local x = mouse.X - origin.X
-	local y = mouse.Y - origin.Y
+	local x = mouse.X
+	local y = mouse.Y
 	if x < 0 or y < 0 or x > size.X or y > size.Y or size.X < 1 or size.Y < 1 then
 		self:setCrosshairVisible(false)
 		return
@@ -533,13 +696,18 @@ function ChartView.updateCrosshair(self: ChartView, mouse: Vector2?)
 	self:setCrosshairVisible(true)
 	self.crossV.Position = UDim2.fromOffset(math.round(x), 0)
 	self.crossH.Position = UDim2.fromOffset(0, math.round(y))
+	if not self.scaled then
+		return
+	end
 
 	local price = yToPrice(y, self.priceMin, self.priceMax, size.Y)
 	local ps = string.format("%.2f", price)
 	if self.crossPrice.Text ~= ps then
 		self.crossPrice.Text = ps
 	end
-	self.crossPrice.Position = UDim2.fromOffset(0, math.round(y) - 8)
+	-- anchored at its own vertical centre, so the chip is centred on the line
+	-- rather than hanging off it
+	self.crossPrice.Position = UDim2.fromOffset(0, math.round(y))
 
 	local candles = self.cache:getCandles()
 	local c = candles[math.round(xToIndex(x, self.rightIndex, self.barWidthPx, size.X))]
@@ -547,7 +715,11 @@ function ChartView.updateCrosshair(self: ChartView, mouse: Vector2?)
 	if self.crossTime.Text ~= ts then
 		self.crossTime.Text = ts
 	end
-	self.crossTime.Position = UDim2.fromOffset(math.round(x), 2)
+	-- clamped inside the strip: at either extreme the chip would otherwise hang
+	-- half off the time axis and be clipped mid-timestamp
+	local half = CROSS_TIME_W * 0.5
+	local cx = if size.X >= CROSS_TIME_W then math.clamp(x, half, size.X - half) else size.X * 0.5
+	self.crossTime.Position = UDim2.fromOffset(math.round(cx), 2)
 end
 
 -- Zoom keeps the bar under the cursor pinned: solve indexToX(anchor, right')=x
@@ -557,7 +729,7 @@ function ChartView.zoomAt(self: ChartView, mouse: Vector2, delta: number)
 	if size.X < 1 then
 		return
 	end
-	local x = math.clamp(mouse.X - self.plot.AbsolutePosition.X, 0, size.X)
+	local x = math.clamp(mouse.X, 0, size.X)
 	local anchor = xToIndex(x, self.rightIndex, self.barWidthPx, size.X)
 	local factor = if delta > 0 then ZOOM_FACTOR else 1 / ZOOM_FACTOR
 	self.barWidthPx = math.clamp(self.barWidthPx * factor, minBarWidth(size.X), MAX_BAR_W)
@@ -566,20 +738,14 @@ function ChartView.zoomAt(self: ChartView, mouse: Vector2, delta: number)
 	self.dirty = true
 end
 
--- The chart ScreenGui sets IgnoreGuiInset, so its coordinate space is raw
--- screen space — exactly what GetMouseLocation reports. Input positions from
--- InputObject are measured below the topbar inset instead, so they are used
--- only for the event type and the wheel delta, never for coordinates.
-local function mouseLocation(): Vector2
-	return UserInputService:GetMouseLocation()
-end
-
+-- InputObject.Position is used only for the event type and the wheel delta,
+-- never for coordinates: mouseLocation is the one conversion.
 local function wireInput(self: ChartView)
 	self.plot.InputChanged:Connect(function(input: InputObject)
 		if input.UserInputType == Enum.UserInputType.MouseWheel then
-			self:zoomAt(mouseLocation(), input.Position.Z)
+			self:zoomAt(self:mouseToPlot(), input.Position.Z)
 		elseif input.UserInputType == Enum.UserInputType.MouseMovement then
-			self:updateCrosshair(mouseLocation())
+			self:updateCrosshair(self:mouseToPlot())
 		end
 	end)
 	self.plot.InputEnded:Connect(function(input: InputObject)
@@ -589,10 +755,13 @@ local function wireInput(self: ChartView)
 	end)
 	self.plot.InputBegan:Connect(function(input: InputObject)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 and not self.panLocked then
+			local m = mouseLocation(self)
 			self.dragging = true
 			self.dragMoved = false
-			self.dragStartX = mouseLocation().X
+			self.dragStartX = m.X
+			self.dragStartY = m.Y
 			self.dragStartRight = self.rightIndex
+			self.dragStartMin, self.dragStartMax = self.priceMin, self.priceMax
 		end
 	end)
 	-- pan tracking is global: the cursor routinely leaves the plot mid-drag
@@ -600,19 +769,122 @@ local function wireInput(self: ChartView)
 		if not self.dragging or input.UserInputType ~= Enum.UserInputType.MouseMovement then
 			return
 		end
-		local dx = mouseLocation().X - self.dragStartX
-		if not self.dragMoved and math.abs(dx) < DRAG_THRESHOLD then
+		local m = mouseLocation(self)
+		local dx = m.X - self.dragStartX
+		local dy = m.Y - self.dragStartY
+		if not self.dragMoved and math.abs(dx) < DRAG_THRESHOLD and math.abs(dy) < DRAG_THRESHOLD then
 			return
 		end
 		self.dragMoved = true
 		-- dragging right pulls the tape right, which reveals older bars
 		self.rightIndex = self.dragStartRight - dx / self.barWidthPx
 		syncFollowTail(self)
+		-- Vertical panning exists ONLY on a manual scale: under auto-fit the
+		-- range is a function of the visible candles, so the next repaint would
+		-- immediately undo it.
+		local plotH = self.plot.AbsoluteSize.Y
+		if self.priceManual and plotH >= 1 then
+			-- the price under the cursor stays under the cursor: shifting the
+			-- range by dy/plotH of its own span is exactly that condition
+			local shift = (dy / plotH) * (self.dragStartMax - self.dragStartMin)
+			self.manualMin = self.dragStartMin + shift
+			self.manualMax = self.dragStartMax + shift
+		end
 		self.dirty = true
 	end)
 	UserInputService.InputEnded:Connect(function(input: InputObject)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
 			self.dragging = false
+		end
+	end)
+end
+
+-- The strips have no cursor image of their own to offer (a custom Mouse.Icon
+-- would need an uploaded asset), so the affordance is a one-step-lighter
+-- ground while the pointer is over them.
+local function wireHover(strip: Frame)
+	strip.InputBegan:Connect(function(input: InputObject)
+		if input.UserInputType == Enum.UserInputType.MouseMovement then
+			strip.BackgroundColor3 = Theme.grid
+		end
+	end)
+	strip.InputEnded:Connect(function(input: InputObject)
+		if input.UserInputType == Enum.UserInputType.MouseMovement then
+			strip.BackgroundColor3 = Theme.bg
+		end
+	end)
+end
+
+local function wireAxes(self: ChartView)
+	wireHover(self.priceAxis)
+	wireHover(self.timeAxis)
+
+	self.priceAxis.InputBegan:Connect(function(input: InputObject)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+			return
+		end
+		local now = os.clock()
+		if now - self.priceAxisLastClick <= DOUBLE_CLICK_SEC then
+			self.priceAxisLastClick = 0
+			self:resetPriceScale()
+			return
+		end
+		self.priceAxisLastClick = now
+		if not self.scaled then
+			return -- nothing painted: there is no range to seize, only the placeholder
+		end
+		-- Seizing the range the LAST repaint painted (rather than fitting a new
+		-- one) is what makes the auto -> manual switch invisible: the first drag
+		-- pixel starts from exactly what is on screen.
+		self.priceAxisStartMin, self.priceAxisStartMax = self.priceMin, self.priceMax
+		self.priceAxisStartY = mouseLocation(self).Y
+		self.priceAxisDrag = true
+	end)
+
+	self.timeAxis.InputBegan:Connect(function(input: InputObject)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+			return
+		end
+		local now = os.clock()
+		if now - self.timeAxisLastClick <= DOUBLE_CLICK_SEC then
+			self.timeAxisLastClick = 0
+			-- the time scale's "auto": default bar width, parked back on the tail
+			self.barWidthPx = DEFAULT_BAR_W
+			self:snapToTail()
+			return
+		end
+		self.timeAxisLastClick = now
+		self.timeAxisStartX = mouseLocation(self).X
+		self.timeAxisStartWidth = self.barWidthPx
+		self.timeAxisDrag = true
+	end)
+
+	-- Tracking is global for the same reason panning is: the cursor leaves the
+	-- strip within the first few pixels of the gesture.
+	UserInputService.InputChanged:Connect(function(input: InputObject)
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement then
+			return
+		end
+		if self.priceAxisDrag then
+			-- TradingView convention: dragging UP compresses the range, i.e.
+			-- zooms the price scale in.
+			local dy = mouseLocation(self).Y - self.priceAxisStartY
+			scaleManualRange(self, self.priceAxisStartMin, self.priceAxisStartMax, math.exp(dy * AXIS_DRAG_RATE))
+		elseif self.timeAxisDrag then
+			-- Anchored at the right edge: rightIndex is deliberately untouched,
+			-- so the bar at the edge stays put and the tape stretches away from
+			-- it.
+			local dx = mouseLocation(self).X - self.timeAxisStartX
+			local plotW = self.plot.AbsoluteSize.X
+			self.barWidthPx =
+				math.clamp(self.timeAxisStartWidth * math.exp(dx * AXIS_DRAG_RATE), minBarWidth(plotW), MAX_BAR_W)
+			self.dirty = true
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input: InputObject)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			self.priceAxisDrag = false
+			self.timeAxisDrag = false
 		end
 	end)
 end
@@ -640,12 +912,14 @@ function ChartView.new(cache: BarCache): ChartView
 	priceAxis.Position = UDim2.fromScale(1, 0)
 	priceAxis.Size = UDim2.new(0, PRICE_AXIS_W, 1, -TIME_AXIS_H)
 	priceAxis.ClipsDescendants = true
+	priceAxis.Active = true -- the strip is a drag target, not decoration
 
 	local timeAxis = newFrame(root, "TimeAxis", Theme.bg, 1)
 	timeAxis.AnchorPoint = Vector2.new(0, 1)
 	timeAxis.Position = UDim2.fromScale(0, 1)
 	timeAxis.Size = UDim2.new(1, -PRICE_AXIS_W, 0, TIME_AXIS_H)
 	timeAxis.ClipsDescendants = true
+	timeAxis.Active = true
 
 	local hLines: { Frame } = {}
 	local priceLabels: { TextLabel } = {}
@@ -676,22 +950,31 @@ function ChartView.new(cache: BarCache): ChartView
 		timeLabels[i] = label
 	end
 
+	-- containers only: the dashes are children, cut to size by layoutCrosshair
 	local crossV = newFrame(plot, "CrossV", Theme.crosshair, 4)
+	crossV.BackgroundTransparency = 1
 	crossV.Size = UDim2.new(0, 1, 1, 0)
 	crossV.Visible = false
 	local crossH = newFrame(plot, "CrossH", Theme.crosshair, 4)
+	crossH.BackgroundTransparency = 1
 	crossH.Size = UDim2.new(1, 0, 0, 1)
 	crossH.Visible = false
 
 	local crossPrice = newLabel(priceAxis, "CrossPrice", 3)
+	crossPrice.AnchorPoint = Vector2.new(0, 0.5)
 	crossPrice.Size = UDim2.fromOffset(PRICE_AXIS_W, 16)
 	crossPrice.BackgroundTransparency = 0
 	crossPrice.BackgroundColor3 = Theme.border
 	crossPrice.TextColor3 = Theme.text
+	crossPrice.TextXAlignment = Enum.TextXAlignment.Left
 	crossPrice.Visible = false
+	local pricePad = Instance.new("UIPadding")
+	pricePad.PaddingLeft = UDim.new(0, 4)
+	pricePad.PaddingRight = UDim.new(0, 4)
+	pricePad.Parent = crossPrice
 	local crossTime = newLabel(timeAxis, "CrossTime", 3)
 	crossTime.AnchorPoint = Vector2.new(0.5, 0)
-	crossTime.Size = UDim2.fromOffset(96, 16)
+	crossTime.Size = UDim2.fromOffset(CROSS_TIME_W, 16)
 	crossTime.BackgroundTransparency = 0
 	crossTime.BackgroundColor3 = Theme.border
 	crossTime.TextColor3 = Theme.text
@@ -706,8 +989,8 @@ function ChartView.new(cache: BarCache): ChartView
 	snapBtn.Size = UDim2.fromOffset(64, 24)
 	snapBtn.BackgroundColor3 = Theme.accent
 	snapBtn.TextColor3 = Theme.bg
-	snapBtn.Font = Enum.Font.Code
-	snapBtn.TextSize = 12
+	snapBtn.Font = Theme.fontUiMedium
+	snapBtn.TextSize = Theme.textMd
 	snapBtn.Text = "follow"
 	snapBtn.ZIndex = 5
 	snapBtn.Parent = root
@@ -716,6 +999,7 @@ function ChartView.new(cache: BarCache): ChartView
 		{
 			cache = cache,
 			gui = gui,
+			root = root,
 			plot = plot,
 			priceAxis = priceAxis,
 			timeAxis = timeAxis,
@@ -729,9 +1013,13 @@ function ChartView.new(cache: BarCache): ChartView
 			timeText = {},
 			crossV = crossV,
 			crossH = crossH,
+			crossVDashes = {},
+			crossHDashes = {},
+			crossVShown = 0,
+			crossHShown = 0,
 			crossPrice = crossPrice,
 			crossTime = crossTime,
-			barWidthPx = 8,
+			barWidthPx = DEFAULT_BAR_W,
 			rightIndex = TAIL_PAD,
 			followTail = true,
 			drawn = 0,
@@ -739,11 +1027,27 @@ function ChartView.new(cache: BarCache): ChartView
 			timeShown = 0,
 			priceMin = 0,
 			priceMax = 1,
+			scaled = false,
+			priceManual = false,
+			manualMin = 0,
+			manualMax = 1,
 			dirty = true,
 			dragging = false,
 			dragMoved = false,
 			dragStartX = 0,
+			dragStartY = 0,
 			dragStartRight = 0,
+			dragStartMin = 0,
+			dragStartMax = 1,
+			priceAxisDrag = false,
+			priceAxisStartY = 0,
+			priceAxisStartMin = 0,
+			priceAxisStartMax = 1,
+			priceAxisLastClick = 0,
+			timeAxisDrag = false,
+			timeAxisStartX = 0,
+			timeAxisStartWidth = DEFAULT_BAR_W,
+			timeAxisLastClick = 0,
 			repaintListeners = {},
 			panLocked = false,
 		} :: Fields,
@@ -761,9 +1065,12 @@ function ChartView.new(cache: BarCache): ChartView
 		self.dirty = true
 	end)
 	plot:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		self:layoutCrosshair()
 		self.dirty = true
 	end)
+	self:layoutCrosshair()
 	wireInput(self)
+	wireAxes(self)
 
 	RunService.RenderStepped:Connect(function()
 		if self.dirty then
