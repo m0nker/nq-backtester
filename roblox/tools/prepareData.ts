@@ -21,7 +21,9 @@
 //
 // The shift is derived from the earliest day actually packed, so a --months
 // subset produces a DIFFERENT shift than a full run: only full runs are
-// canonical (see DATA.md).
+// canonical (see DATA.md). A --months run therefore packs its months and
+// NOTHING else — SampleData.luau, Codec.json and the 1h history all stay as the
+// last full run left them.
 //
 // The deep 1h history (META_PLAN §4) is folded from the SAME normalized bars the
 // months are packed from, so it carries the same dataset-wide shift for free and
@@ -46,6 +48,13 @@ const BASE_SEC = 60;
 // The dataset's earliest open is rebased to this price. Arbitrary and
 // undisclosed on purpose — see the licensing-hygiene row in PORT_PLAN.
 const NORMALIZED_OPEN = 20_000;
+
+// Names the normalization scheme the artifacts were produced under, so that
+// per-month-rebased output (the pre-META_PLAN-§4 scheme, which has no marker at
+// all) can never be mixed into a DataStore alongside globally-shifted output —
+// the two frames disagree by a different constant in every month and nothing
+// downstream could tell. uploadData.ts refuses a manifest without it.
+const SCHEME = 'global-offset-v1';
 
 // Script.Source caps at 200k chars; SampleData.luau is Rojo-mapped to a
 // ModuleScript, so the base64 payload plus wrapper must stay under this.
@@ -193,6 +202,9 @@ interface HistOut {
 }
 
 interface OutManifest {
+  // Optional on read: a manifest written before the marker existed has none,
+  // and that absence is exactly what uploadData.ts keys its refusal on.
+  scheme?: string;
   tickSize: number;
   baseSec: number;
   months: MonthOut[];
@@ -618,6 +630,13 @@ function histOnlyRun(): void {
     straddles += foldMonthHourly(hourly, bars, meta.month);
   }
 
+  // The scheme marker is NOT fabricated here: --hist-only refolds whatever the
+  // months on disk already are, so a manifest that never claimed the global
+  // shift must keep not claiming it and stay unuploadable.
+  if (manifest.scheme === undefined) {
+    console.warn(`WARNING: manifest.json has no \`scheme\` — these months predate ${SCHEME}; rerun a full prepareData before uploading`);
+  }
+
   const hist = writeHourly(hourly);
   manifest.hist = hist;
   writeManifestFile(manifest);
@@ -655,7 +674,10 @@ async function main(): Promise<void> {
     console.warn(
       '\n!!! --months: the normalization shift is derived from the EARLIEST PACKED day,\n' +
         '!!! so this subset gets a different shift than a full run. The output is NOT\n' +
-        '!!! canonical and MUST NOT be uploaded or committed. Rerun without --months.\n',
+        '!!! canonical and MUST NOT be uploaded or committed. Rerun without --months.\n' +
+        '!!! SKIPPED (left exactly as the last full run wrote them): SampleData.luau,\n' +
+        '!!! tests/fixtures/Codec.json, data-out/hist/1h.bin.\n' +
+        '!!! data-out/m/*.bin and manifest.json ARE overwritten for the named months.\n',
     );
   }
 
@@ -709,7 +731,7 @@ async function main(): Promise<void> {
     assertRoundTrip(month, bars, buf);
     writeFileSync(join(MONTH_DIR, `${month}.bin`), buf);
     totalBars += bars.length;
-    histStraddles += foldMonthHourly(hourly, bars, month);
+    if (!onlyMonths) histStraddles += foldMonthHourly(hourly, bars, month);
 
     monthsOut.push({
       month,
@@ -740,30 +762,42 @@ async function main(): Promise<void> {
     throw new Error('aborting: incomplete data — rerun (fetches are idempotent)');
   }
 
-  const hist = writeHourly(hourly);
-  const outManifest: OutManifest = { tickSize: TICK_SIZE, baseSec: BASE_SEC, months: monthsOut, hist };
+  // Everything below the months themselves is derived from the WHOLE dataset —
+  // the 1h history spans it, and SampleData/Codec.json are committed artifacts
+  // the parity suite pins. Under a subset shift each would be a quiet lie, so a
+  // --months run stops at the months and leaves the rest of the tree alone.
+  const outManifest: OutManifest = { scheme: SCHEME, tickSize: TICK_SIZE, baseSec: BASE_SEC, months: monthsOut };
+  if (!onlyMonths) outManifest.hist = writeHourly(hourly);
   writeManifestFile(outManifest);
 
-  const chosen = sampleRun ?? sampleFallback;
-  if (!chosen) throw new Error(`no run of ${sampleDaysWanted} consecutive weekday trading days found`);
-  const sample = writeSampleData(chosen);
-  const fixtureChars = writeCodecFixture(chosen[0].bars);
+  const chosen = onlyMonths ? null : (sampleRun ?? sampleFallback);
+  if (!onlyMonths && !chosen) {
+    throw new Error(`no run of ${sampleDaysWanted} consecutive weekday trading days found`);
+  }
 
   console.log(
     `\npacked ${monthsOut.length} month(s), ${totalBars} bars, ` +
       `${(monthsOut.reduce((s, m) => s + m.byteSize, 0) / 1048576).toFixed(2)} MiB total`,
   );
-  console.log(
-    `SampleData.luau: ${sample.bars} bars from ${chosen.length} day(s) ` +
-      `(${chosen.map((d) => d.date).join(', ')}), ${sample.chars} chars`,
-  );
-  console.log(`tests/fixtures/Codec.json: ${fixtureChars} chars`);
-  reportHourly(hist, histStraddles);
+  if (chosen) {
+    const sample = writeSampleData(chosen);
+    const fixtureChars = writeCodecFixture(chosen[0].bars);
+    console.log(
+      `SampleData.luau: ${sample.bars} bars from ${chosen.length} day(s) ` +
+        `(${chosen.map((d) => d.date).join(', ')}), ${sample.chars} chars`,
+    );
+    console.log(`tests/fixtures/Codec.json: ${fixtureChars} chars`);
+  } else {
+    console.log('SKIPPED (--months): SampleData.luau, tests/fixtures/Codec.json, hist:1h fold');
+  }
+  if (outManifest.hist) reportHourly(outManifest.hist, histStraddles);
   console.log(
     `normalization: global shift ${shift}, post-shift range ${minLow} .. ${maxHigh} ` +
       `(${ticks(minLow, TICK_SIZE)} .. ${ticks(maxHigh, TICK_SIZE)} ticks, i32 limit ±2147483647)`,
   );
-  console.log('round-trip: OK (every month + hist:1h + sample + fixture unpacked and compared exactly)');
+  console.log(
+    `round-trip: OK (every month${chosen ? ' + hist:1h + sample + fixture' : ''} unpacked and compared exactly)`,
+  );
   console.log(
     `data quality: off-grid raw prices ${quality.offGridPrices} across ${quality.offGridDays.size} day(s), ` +
       `max deviation ${quality.maxRawDevTicks.toExponential(3)} ticks` +

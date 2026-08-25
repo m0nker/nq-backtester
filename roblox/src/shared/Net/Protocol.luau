@@ -14,9 +14,16 @@
 --         Payload: { cmd: string, ... } — shapes below.
 --   Clock (RemoteEvent, server -> client): { t: number, playing: boolean,
 --         speed: number, stepSize: string } after every clock change.
---   Bars  (RemoteEvent, server -> client): (packet: buffer, reset: boolean)
---         packet is BarCodec-framed. reset=true -> replace the whole client
---         bar cache (session start / jump / rewind); false -> append reveals.
+--   Bars  (RemoteEvent, server -> client): (packet: buffer, reset: boolean,
+--         mode: string?) packet is BarCodec-framed. With `mode` absent (the
+--         default), reset=true -> replace the whole client bar cache (session
+--         start / jump / rewind); false -> append reveals.
+--         mode = BARS_MODE_HISTORY marks a deep-history packet: HISTORY_SEC
+--         bars that all CLOSED before the session's first bar opened, which the
+--         client keeps in a separate array and splices under its own bars on
+--         hourly-backed timeframes. `reset` carries no meaning on it. The
+--         argument is additive — a client that ignores it sees exactly the
+--         reveal contract above.
 --   TradeState (RemoteEvent, server -> client): sanitized derived state after
 --         every order/fill/void change:
 --         { position: { qty: number, avgPrice: number },
@@ -133,6 +140,14 @@ export type MetaBoard = {
 	rows: { BoardRow },
 	you: BoardRow?,
 }
+
+-- The Bars remote's only non-default `mode`. Named on both sides so the string
+-- can never drift between the sender and the branch that decodes it.
+M.BARS_MODE_HISTORY = "history"
+
+-- Resolution of the bars inside a BARS_MODE_HISTORY packet. The packed format
+-- carries a tick size but no bar duration, so both sides read it from here.
+M.HISTORY_SEC = 3600
 
 M.REMOTES_FOLDER = "Remotes"
 M.REMOTE_NAMES = { "Cmd", "Clock", "Bars", "TradeState", "SessionInfo", "Meta" }

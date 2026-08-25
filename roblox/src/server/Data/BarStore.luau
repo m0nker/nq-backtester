@@ -6,6 +6,8 @@
 -- SampleData module. Studio without API access always lands on the last path,
 -- so every platform call is pcall-wrapped instead of asserted; a failed load
 -- degrades to the sample, never to an error.
+--
+-- The deep 1h history (hourlyHistory) has no sample tier: it degrades to nil.
 
 local DataStoreService = game:GetService("DataStoreService")
 local EncodingService = game:GetService("EncodingService")
@@ -27,6 +29,9 @@ local M = {}
 local DATASTORE_NAME = "bars_v1"
 local MANIFEST_KEY = "manifest"
 local MONTH_KEY_PREFIX = "m:"
+-- The whole dataset folded to 1h bars (roblox/tools/DATA.md), one BarCodec
+-- chunk under one key.
+local HIST_KEY = "hist:1h"
 
 type Chunk = { bars: { Bar }, tickSize: number }
 
@@ -41,6 +46,10 @@ local storeTried = false
 local sampleChunk: Chunk? = nil
 local sampleData: SampleData? = nil
 local sampleTried = false
+
+local histBars: { Bar }? = nil
+local histTried = false
+local histLoading = false
 
 local function getStore(): DataStore?
 	if not storeTried then
@@ -317,6 +326,39 @@ function M.barsBefore(dayStartSec: number, n: number): { Bar }
 		table.insert(out, rev[i])
 	end
 	return out
+end
+
+-- YIELDS on the first call. The deep 1h series (the whole dataset, ~96k bars),
+-- loaded ONCE per server and cached forever: it never changes, it is ~3 MB of
+-- base64, and the per-key read ceiling is 25 MB/min — this must never be read
+-- per session. There is no sample fallback and an absent key is not an error:
+-- deep history is a nicety, so every caller treats nil as "this server has
+-- none" and behaves as it did before the key existed.
+function M.hourlyHistory(): { Bar }?
+	-- Two sessions can start on the same frame; the second waits out the first
+	-- read rather than issuing a second one against the same key.
+	while histLoading do
+		task.wait()
+	end
+	if histTried then
+		return histBars
+	end
+	histTried = true
+	histLoading = true
+	local ds = getStore()
+	if ds ~= nil then
+		local ok, value = pcall(function()
+			return ds:GetAsync(HIST_KEY)
+		end)
+		if ok and typeof(value) == "string" then
+			local chunk = decodeChunk(value)
+			if chunk ~= nil then
+				histBars = chunk.bars
+			end
+		end
+	end
+	histLoading = false
+	return histBars
 end
 
 function M.tickSize(): number

@@ -92,6 +92,12 @@ local STARTING_BALANCE = 10000
 -- Closed bars shown in front of the start point, ~1.5 trading days. Costs one
 -- extra month chunk on load and ~48 KB in the reset bar packet.
 local CONTEXT_BARS = 2000
+-- Trailing hourly bars sent as deep history, one packet per session start.
+-- ~23.2 bars per trading day, so this is roughly 3.4 years — META_PLAN §4.3's
+-- 3-year horizon expressed as a bar count, which is what bounds the PACKET
+-- (20 + 24 * 20000 = ~480 KB) rather than the horizon. The full series is
+-- ~96k bars / 2.3 MB and is far past what one FireClient should carry.
+local HISTORY_MAX_BARS = 20000
 local DEFAULT_SPEED = 5
 local DEFAULT_STEP: Timeframe = "1m"
 -- Client-supplied sizes are quantized then bounded; nothing about the sim
@@ -222,6 +228,52 @@ local function sendBars(s: Session, fromIdx: number, toIdx: number, reset: boole
 		"LOOKAHEAD VIOLATION: encoded bar has not closed at the current clock"
 	)
 	s.remotes.bars:FireClient(s.player, BarCodec.encodeSlice(s.bars, fromIdx, toIdx, s.tickSize), reset)
+end
+
+-- YIELDS on the first call per server (the DataStore read behind
+-- BarStore.hourlyHistory), so it is only ever reached from a spawned thread —
+-- never from the reveal loop, and never inside the `switching` guard.
+--
+-- Deep 1h history for the high timeframes, sent ONCE per session start/resume:
+-- the series is fixed, so no reveal or rewind can change what belongs in it.
+-- Everything sent CLOSED before the session's first bar OPENED, which is what
+-- makes it history rather than lookahead — asserted here rather than trusted,
+-- exactly as sendBars does one resolution down.
+local function sendHistory(s: Session)
+	local bars = s.bars
+	local first = bars[1]
+	if first == nil then
+		return
+	end
+	local hist = BarStore.hourlyHistory()
+	if hist == nil or #hist == 0 then
+		return -- no artifact on this server: the client never hears about history
+	end
+	if s.bars ~= bars then
+		return -- the day was replaced while the key loaded; that load sends its own
+	end
+	-- Number of hourly bars closed at or before `first.t`. Binary-searched: the
+	-- series is ~96k bars and a linear scan of it runs on a command thread.
+	local lo, hi = 1, #hist + 1
+	while lo < hi do
+		local mid = (lo + hi) // 2
+		if hist[mid].t + Protocol.HISTORY_SEC <= first.t then
+			lo = mid + 1
+		else
+			hi = mid
+		end
+	end
+	local cut = lo - 1
+	if cut <= 0 then
+		return
+	end
+	assert(
+		hist[cut].t + Protocol.HISTORY_SEC <= first.t,
+		"LOOKAHEAD VIOLATION: hourly history overlaps the session's first bar"
+	)
+	local from = math.max(1, cut - HISTORY_MAX_BARS + 1)
+	local packet = BarCodec.encodeSlice(hist, from, cut, s.tickSize)
+	s.remotes.bars:FireClient(s.player, packet, false, Protocol.BARS_MODE_HISTORY)
 end
 
 -- One packet per operation: bars for the newly revealed range, then a clock
@@ -777,6 +829,10 @@ local function startSessionInner(s: Session, date: string)
 	sendBars(s, 1, s.revealedCount, true)
 	sendClock(s)
 	sendTradeState(s)
+	-- Its own thread: the history key may take seconds to load, and neither the
+	-- client's session state nor the `switching` guard may wait on it. The client
+	-- handles the packet whenever it lands.
+	task.spawn(sendHistory, s)
 	-- Written immediately, after the client is served: the cleared stats and the
 	-- new active session have to land in the same value, or a crash in between
 	-- would resurrect the session that was just folded in.
@@ -1049,6 +1105,7 @@ function M.onReady(s: Session)
 		sendBars(s, 1, s.revealedCount, true)
 		sendClock(s)
 		sendTradeState(s)
+		task.spawn(sendHistory, s)
 	end
 end
 

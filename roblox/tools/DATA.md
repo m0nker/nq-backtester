@@ -8,6 +8,8 @@ DataStore. Run everything from the **repo root**.
 ```sh
 # 1. dev slice — a few months, fast, proves the pipeline end to end.
 #    NOT canonical: the normalization shift is derived from the subset. See below.
+#    Writes ONLY data-out/m/<those months>.bin and manifest.json; SampleData.luau,
+#    Codec.json and hist/1h.bin are skipped, not rewritten.
 npx tsx roblox/tools/prepareData.ts --months 2026-05,2026-06,2026-07 --sample-days 3
 
 # 2. full history — every month in the dataset (~4150 trading days).
@@ -34,7 +36,7 @@ npx tsx roblox/tools/prepareData.ts --hist-only
 |---|---|---|
 | `roblox/data-out/m/YYYY-MM.bin` | one BarCodec v1 chunk per calendar month | no (gitignored) |
 | `roblox/data-out/hist/1h.bin` | the whole dataset as 1h bars, one BarCodec v1 chunk | no (gitignored) |
-| `roblox/data-out/manifest.json` | `{ tickSize, baseSec, months:[{ month, key, byteSize, days:[{ date, firstTs, lastTs, barCount }] }], hist:{ key, file, barCount, byteSize, firstTs, lastTs } }` | no (gitignored) |
+| `roblox/data-out/manifest.json` | `{ scheme, tickSize, baseSec, months:[{ month, key, byteSize, days:[{ date, firstTs, lastTs, barCount }] }], hist:{ key, file, barCount, byteSize, firstTs, lastTs } }` | no (gitignored) |
 | `roblox/src/server/Data/SampleData.luau` | 3 consecutive weekday trading days, base64, for Studio/offline runs | yes |
 | `roblox/tests/fixtures/Codec.json` | ~8 bars + their exact packed bytes — pins the TS packer to `BarCodec.luau` | yes |
 
@@ -69,11 +71,42 @@ continuity, and the earlier per-month rebase turned it into a sawtooth back to
 
 **Only a full run is canonical.** The anchor is the earliest day *actually
 packed*, so `--months 2026-05,2026-06` derives its shift from May 2026 and
-produces prices incompatible with every other run. The script prints a loud
-warning when `--months` is used; that output is for pipeline smoke-testing
-only — never upload it, never commit the `SampleData.luau` / `Codec.json` it
-regenerates. Anything destined for the DataStore comes from
-`npx tsx roblox/tools/prepareData.ts` with no flags.
+produces prices incompatible with every other run. Anything destined for the
+DataStore comes from `npx tsx roblox/tools/prepareData.ts` with no flags.
+
+A `--months` run is therefore **fenced**: it packs its months, rewrites
+`manifest.json` to describe exactly those months, and stops. `SampleData.luau`,
+`tests/fixtures/Codec.json` and `hist/1h.bin` are skipped and left byte-for-byte
+as the last full run wrote them — the two committed artifacts because the parity
+suite pins them, and the history because it spans the whole dataset and would
+otherwise be refolded from three months. The run prints both the loud
+non-canonical warning and the skip list.
+
+What a `--months` run *does* leave behind, if you point it at a tree holding a
+full run: those months' `.bin`s carry the subset shift, and `manifest.json` now
+lists three months instead of ~190. `uploadData.ts` catches this — 191 months of
+`.bin` files become strays and warn — but the fix is a full rerun, not a
+reupload.
+
+### Scheme marker
+
+`manifest.json` carries `scheme: "global-offset-v1"`, naming the normalization
+above. It exists because two schemes in one DataStore are **undetectable in
+game**: per-month-rebased months (the pre-`META_PLAN` §4 scheme, which wrote no
+marker at all) and globally-shifted months differ by a different constant in each
+month, and no bar carries evidence of which frame it is in.
+
+`uploadData.ts` refuses to upload a manifest whose `scheme` is absent or
+different. `--force-scheme` overrides, for the one honest case: you are replacing
+the whole store and you know what the bytes are. Note that forcing uploads the
+manifest *as it is*, so the DataStore copy stays unmarked too — if you know an
+existing pre-marker `data-out/` is globally shifted, adding
+`"scheme": "global-offset-v1"` to `manifest.json` by hand is the better fix, and
+a full rerun is better still.
+
+`--hist-only` never fabricates the marker: it refolds whatever the months on disk
+already are, so an unmarked manifest stays unmarked (and stays unuploadable) and
+the run warns.
 
 Prices are snapped back onto the 0.25 grid after the shift. Some source chunks
 carry float dust from the roll adjustment (observed max ~1.5e-11 ticks); the
@@ -157,13 +190,29 @@ DataStore `bars_v1`, standard (not ordered):
 - `hist:1h` → `hist/1h.bin` the same way. Written **once per run**: 3 MB against
   a 4 MB/min per-key write ceiling. Read once per server and cached forever on
   the read side (25 MB/min ⇒ 8 reads/min), never per session.
-- `manifest` → the `manifest.json` object verbatim, the day index the server
-  reads before it knows which month key to fetch.
+- `manifest` → a **flattened** view of `manifest.json`, the day index the server
+  reads before it knows which month key to fetch:
+
+  ```
+  { scheme, tickSize, baseSec, days: [{ date, firstTs, lastTs, barCount }, …],
+    hist: { key, file, barCount, byteSize, firstTs, lastTs } }
+  ```
+
+  The disk shape nests days under `months` because the tool cross-checks per
+  month; `BarStore.coerceDays` reads ONE flat `days` array and nothing else.
+  Uploading the disk shape verbatim yields an empty in-game day index and a
+  silent fall back to the bundled `SampleData` chunk — which looks exactly like a
+  lost DataStore, not like a bad value. `days` is sorted ascending by `date`.
+  `tickSize`/`baseSec`/`hist` are not read from this key today (BarStore resolves
+  the tick from the first decoded chunk); they ride along to keep the value
+  self-describing. `data-out/manifest.json` on disk keeps the nested shape.
 
 Writes go to the `standard-datastores/.../entries/entry` endpoint with the
 required `content-md5` header, throttled to one per 500 ms. A full-history
 upload is ~190 month keys, roughly two minutes. Each key stays well under the
 4 MB DataStore limit (a 22-day month is ~950 KiB base64; `hist:1h` is the one
-big key at 73%); `uploadData.ts` refuses any value that would exceed it, and
-cross-checks `manifest.json` against the files on disk in both directions before
-writing anything.
+big key at 73%; the flattened manifest is ~320 KB at 4147 days);
+`uploadData.ts` refuses any value that would exceed it, and cross-checks
+`manifest.json` against the files on disk in both directions — for
+`data-out/m/` *and* `data-out/hist/` — before writing anything. A missing file
+aborts; an unknown one warns and is skipped.

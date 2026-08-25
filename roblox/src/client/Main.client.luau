@@ -58,6 +58,10 @@ local drawLayer = DrawingLayer.new(chart, cache)
 DrawToolbar.new(hud, drawLayer)
 local board = Leaderboard.new(hud, send)
 local tradeLog = TradeLog.new(hud)
+-- MAE/MFE scans the revealed 1m bars between a trade's entry and exit.
+tradeLog:setBarsProvider(function()
+	return cache:getBase()
+end)
 
 -- Leaderboard toggle lives up by "new session" (the panel anchors below it);
 -- the trade log's toggle stays in the position bar where trading state lives.
@@ -124,12 +128,16 @@ end)
 
 -- Remote payloads are untrusted/untyped on the wire; each handler casts once at
 -- the boundary against the exported Protocol shapes.
-barsRemote.OnClientEvent:Connect(function(packet: any, reset: any)
-	cache:applyPacket(packet :: buffer, reset == true)
-	if reset == true then
-		-- A reset replaces the whole bar array (session start, rewind, jump
-		-- back): any camera position from before is an index into an array
-		-- that no longer exists. Snap rather than strand.
+barsRemote.OnClientEvent:Connect(function(packet: any, reset: any, mode: any)
+	local history = mode == Protocol.BARS_MODE_HISTORY
+	cache:applyPacket(packet :: buffer, reset == true, if typeof(mode) == "string" then mode else nil)
+	-- A reset replaces the whole bar array (session start, rewind, jump back)
+	-- and a history packet inserts years of candles IN FRONT of it: either way
+	-- any camera position from before is an index into an array that no longer
+	-- exists. Snap rather than strand — but only when the history actually
+	-- reached the candles, or a packet landing while the chart is on a
+	-- minute timeframe would yank a deliberate pan back to the tail.
+	if reset == true or (history and cache:hasHistory()) then
 		chart:snapToTail()
 	end
 end)

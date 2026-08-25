@@ -11,6 +11,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 local Protocol = require(ReplicatedStorage.Shared.Net.Protocol)
+local BarStore = require(script.Parent.Data.BarStore)
 local Board = require(script.Parent.Meta.Board)
 local Session = require(script.Parent.Replay.Session)
 
@@ -167,6 +168,11 @@ game:BindToClose(function()
 		end
 	end
 end)
+
+-- The deep 1h history is one ~3 MB key read once per server. Warmed at startup
+-- so the first session's send finds it in memory instead of waiting on it;
+-- nothing blocks on this, and a server without the key just keeps nil.
+task.spawn(BarStore.hourlyHistory)
 
 -- Records whether OrderedDataStore really rejects negative values, which the
 -- leaderboard encoding assumes but the docs do not state. Studio only, on a

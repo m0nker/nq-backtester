@@ -1,11 +1,15 @@
 --!strict
--- Tool strip for Chart/DrawingLayer: ray, rect, delete. A small vertical panel
--- on the left edge, below the order panel.
+-- Tool strip for Chart/DrawingLayer: ray, line, rect, delete. A small vertical
+-- panel on the left edge, below the order panel.
 --
 -- Arming is exclusive and idempotent (re-arming the live tool disarms), and
 -- Escape disarms — the same contract OrderPanel's four arm buttons have, for
 -- the same reason: the armed tool spends the NEXT chart click, so there must
 -- always be a way to take it back without spending one.
+--
+-- NO button is the layer's select/edit mode: that mode is what the layer does
+-- when nothing here is armed, so disarming is how you reach it. The panel
+-- therefore has nothing to show for it.
 --
 -- KNOWN CAVEAT — double consumption. ChartView broadcasts a plot click to every
 -- subscriber, and this toolbar cannot see whether OrderPanel is also armed. A
@@ -38,6 +42,7 @@ local Z_BTN = 6
 -- armed with.
 local TOOLS: { { tool: string, text: string } } = {
 	{ tool = "ray", text = "ray" },
+	{ tool = "line", text = "line" },
 	{ tool = "rect", text = "rect" },
 	{ tool = "del", text = "del" },
 }
