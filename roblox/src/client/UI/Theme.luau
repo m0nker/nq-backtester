@@ -16,6 +16,19 @@ M.accent = Color3.fromHex("f5b942")
 M.up = Color3.fromHex("26a69a")
 M.down = Color3.fromHex("ef5350")
 M.crosshair = Color3.fromHex("585c6b")
+-- 1px separators between the plot and each axis strip (web/LWC borderColor).
+M.axisBorder = Color3.fromHex("232a3b")
+
+-- Order-line colors, straight from the web chart (ReplayChart.tsx:317-367).
+-- The reduce-only legs reuse up/down (a bracket must read as a stop and a
+-- target); an ENTRY gets its own softer per-side pair so it never reads as an
+-- exit, and the open position is amber.
+M.entryBuy = Color3.fromHex("4caf9d")
+M.entrySell = Color3.fromHex("e57373")
+M.pos = Color3.fromHex("f5b942")
+-- Axis chips are colored by their line, so their type has to hold contrast
+-- against every one of those grounds — white is the only value that does.
+M.chipText = Color3.fromHex("ffffff")
 
 -- Type. Every TextLabel/TextButton/TextBox in the client reads its Font and
 -- TextSize from here — a module that names an Enum.Font itself is a bug,

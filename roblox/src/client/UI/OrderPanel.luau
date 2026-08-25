@@ -6,23 +6,34 @@
 --
 -- Market orders fill at the NEXT bar's open (Shared.Trading.Fills), so the
 -- price row is hidden for them: there is no level to name.
+--
+-- The four arm buttons are the second way in: arming hands the next chart click
+-- to this panel, which turns the clicked price into a limit or stop at the qty
+-- and bracket the fields currently hold. Exactly one arm can be live, Escape
+-- clears it, and a click always disarms whether or not the order went out.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ContractMath = require(Shared:WaitForChild("Trading"):WaitForChild("ContractMath"))
 
 local Client = script.Parent.Parent
+local ChartViewModule = require(Client:WaitForChild("Chart"):WaitForChild("ChartView"))
 local Theme = require(Client:WaitForChild("UI"):WaitForChild("Theme"))
 
 type Send = ({ [string]: any }) -> ()
+type ChartView = ChartViewModule.ChartView
 
 local PANEL_W = 176
 local PAD = 6
 local ROW_H = 22
 local ROW_GAP = 4
 local SUBMIT_H = 28
+local HINT_H = 16
 local INNER = PANEL_W - PAD * 2
+local ARM_BTN_W = 80
+local ARM_BTN_GAP = 4
 
 local QTY_STEP = ContractMath.QTY_STEP
 local DEFAULT_QTY = 1
@@ -36,6 +47,15 @@ local TYPE_LABELS: { { type: string, text: string } } = {
 	{ type = "stop", text = "STP" },
 }
 
+-- Click-to-place arms, in panel order (two per row). The index into this list
+-- IS the armed state; 0 means nothing is armed.
+local ARM_BUTTONS: { { side: string, type: string, text: string } } = {
+	{ side = "buy", type = "limit", text = "Buy Lmt" },
+	{ side = "sell", type = "limit", text = "Sell Lmt" },
+	{ side = "buy", type = "stop", text = "Buy Stp" },
+	{ side = "sell", type = "stop", text = "Sell Stp" },
+}
+
 -- Overlapping flashes on one box would each schedule their own restore; the
 -- newest flash wins by bumping the box's sequence number.
 local flashSeq: { [TextBox]: number } = {}
@@ -45,9 +65,13 @@ OrderPanel.__index = OrderPanel
 
 type Row = { frame: Frame, h: number }
 
+type Draft = { qty: number, slPts: number?, tpPts: number? }
+
 type Fields = {
 	send: Send,
 	getLastClose: () -> number?,
+	-- only :setClickCursor and :onPlotClick are used from it
+	chart: ChartView,
 	panel: Frame,
 	rows: { Row },
 
@@ -62,11 +86,15 @@ type Fields = {
 	slBox: TextBox,
 	tpBox: TextBox,
 	submitBtn: TextButton,
+	armBtns: { TextButton },
+	hintRow: Frame,
 
 	side: string,
 	otype: string,
 	qty: number,
 	bracketOn: boolean,
+	-- index into ARM_BUTTONS, 0 = nothing armed
+	armed: number,
 }
 
 export type OrderPanel = typeof(setmetatable({} :: Fields, OrderPanel))
@@ -252,24 +280,34 @@ function OrderPanel.setQty(self: OrderPanel, qty: number)
 	setBoxText(self.qtyBox, string.format("%.1f", self.qty))
 end
 
+-- Arming is exclusive and idempotent: re-arming the live one disarms. The chart
+-- owns both the cursor affordance and the click routing, so it is told exactly
+-- once per transition.
+function OrderPanel.setArmed(self: OrderPanel, index: number)
+	if self.armed == index then
+		return
+	end
+	self.armed = index
+	for i, btn in ipairs(self.armBtns) do
+		styleToggle(btn, i == index, Theme.accent)
+	end
+	self.hintRow.Visible = index ~= 0
+	self.chart:setClickCursor(index ~= 0)
+	relayout(self)
+end
+
 -- ---------------------------------------------------------------------------
 
-function OrderPanel.submit(self: OrderPanel)
+-- The qty and bracket the server wants, or nil once a bad box has flashed.
+-- Shared by the submit button and the click-to-place path: the two differ only
+-- in where the price comes from.
+local function readDraft(self: OrderPanel): Draft?
 	local ok = true
 
 	local qty = parseNum(self.qtyBox.Text)
 	if qty == nil or qty <= 0 then
 		flash(self.qtyBox)
 		ok = false
-	end
-
-	local price: number? = nil
-	if self.otype ~= "market" then
-		price = parseNum(self.priceBox.Text)
-		if price == nil then
-			flash(self.priceBox)
-			ok = false
-		end
 	end
 
 	local slPts: number? = nil
@@ -290,28 +328,66 @@ function OrderPanel.submit(self: OrderPanel)
 	end
 
 	if not ok or qty == nil then
-		return
+		return nil
 	end
 	self:setQty(qty)
+	return { qty = self.qty, slPts = slPts, tpPts = tpPts }
+end
 
+local function sendOrder(self: OrderPanel, side: string, otype: string, price: number?, draft: Draft)
 	local payload: { [string]: any } = {
 		cmd = "placeOrder",
-		side = self.side,
-		type = self.otype,
-		qty = self.qty,
+		side = side,
+		type = otype,
+		qty = draft.qty,
 	}
-	if self.otype == "limit" then
+	if otype == "limit" then
 		payload.limitPrice = price
-	elseif self.otype == "stop" then
+	elseif otype == "stop" then
 		payload.stopPrice = price
 	end
-	if slPts ~= nil and tpPts ~= nil then
-		payload.bracket = { stopLossPts = slPts, takeProfitPts = tpPts }
+	if draft.slPts ~= nil and draft.tpPts ~= nil then
+		payload.bracket = { stopLossPts = draft.slPts, takeProfitPts = draft.tpPts }
 	end
 	self.send(payload)
 end
 
-function OrderPanel.new(gui: ScreenGui, send: Send, getLastClose: () -> number?): OrderPanel
+function OrderPanel.submit(self: OrderPanel)
+	local price: number? = nil
+	if self.otype ~= "market" then
+		price = parseNum(self.priceBox.Text)
+		if price == nil then
+			flash(self.priceBox)
+			-- keep going: readDraft still flashes whatever else is wrong, so one
+			-- click reports every bad field rather than one per attempt
+		end
+	end
+	local draft = readDraft(self)
+	if draft == nil or (self.otype ~= "market" and price == nil) then
+		return
+	end
+	sendOrder(self, self.side, self.otype, price, draft)
+end
+
+-- A clicked price is a REQUEST like every other field here: the server rounds
+-- it to the tick.
+function OrderPanel.placeAtPrice(self: OrderPanel, price: number)
+	local index = self.armed
+	if index == 0 then
+		return
+	end
+	local spec = ARM_BUTTONS[index]
+	-- Disarmed before the fields are read: a click answered by a red qty box
+	-- must not leave the chart still waiting for another one.
+	self:setArmed(0)
+	local draft = readDraft(self)
+	if draft == nil then
+		return
+	end
+	sendOrder(self, spec.side, spec.type, price, draft)
+end
+
+function OrderPanel.new(gui: ScreenGui, send: Send, getLastClose: () -> number?, chart: ChartView): OrderPanel
 	local panel = Instance.new("Frame")
 	panel.Name = "OrderPanel"
 	panel.BorderSizePixel = 0
@@ -354,10 +430,26 @@ function OrderPanel.new(gui: ScreenGui, send: Send, getLastClose: () -> number?)
 	local submitRow = newRow(panel, "Submit", SUBMIT_H)
 	local submitBtn = newButton(submitRow, "BUY MKT", PAD, INNER, SUBMIT_H)
 
+	-- Two per row, in ARM_BUTTONS order.
+	local armRows = { newRow(panel, "Arm1", ROW_H), newRow(panel, "Arm2", ROW_H) }
+	local armBtns: { TextButton } = {}
+	for i, entry in ipairs(ARM_BUTTONS) do
+		local col = (i - 1) % 2
+		local row = armRows[math.floor((i - 1) / 2) + 1]
+		armBtns[i] = newButton(row, entry.text, PAD + col * (ARM_BTN_W + ARM_BTN_GAP), ARM_BTN_W, ROW_H)
+	end
+
+	local hintRow = newRow(panel, "Hint", HINT_H)
+	local hint = newLabel(hintRow, PAD, INNER, "click chart px, esc cancels")
+	hint.TextColor3 = Theme.accent
+	hint.Size = UDim2.fromOffset(INNER, HINT_H)
+	hintRow.Visible = false
+
 	local self: OrderPanel = setmetatable(
 		{
 			send = send,
 			getLastClose = getLastClose,
+			chart = chart,
 			panel = panel,
 			rows = {
 				{ frame = sideRow, h = ROW_H },
@@ -367,6 +459,9 @@ function OrderPanel.new(gui: ScreenGui, send: Send, getLastClose: () -> number?)
 				{ frame = bracketRow, h = ROW_H },
 				{ frame = ptsRow, h = ROW_H },
 				{ frame = submitRow, h = SUBMIT_H },
+				{ frame = armRows[1], h = ROW_H },
+				{ frame = armRows[2], h = ROW_H },
+				{ frame = hintRow, h = HINT_H },
 			},
 			buyBtn = buyBtn,
 			sellBtn = sellBtn,
@@ -379,10 +474,13 @@ function OrderPanel.new(gui: ScreenGui, send: Send, getLastClose: () -> number?)
 			slBox = slBox,
 			tpBox = tpBox,
 			submitBtn = submitBtn,
+			armBtns = armBtns,
+			hintRow = hintRow,
 			side = "buy",
 			otype = "market",
 			qty = DEFAULT_QTY,
 			bracketOn = false,
+			armed = 0,
 		} :: Fields,
 		OrderPanel
 	)
@@ -427,6 +525,23 @@ function OrderPanel.new(gui: ScreenGui, send: Send, getLastClose: () -> number?)
 	end)
 	submitBtn.Activated:Connect(function()
 		self:submit()
+	end)
+	for i, btn in ipairs(armBtns) do
+		btn.Activated:Connect(function()
+			self:setArmed(if self.armed == i then 0 else i)
+		end)
+	end
+	-- Subscribed ONCE, for the panel's whole life: the chart delivers every plot
+	-- click and this handler is a no-op unless an arm is live.
+	chart:onPlotClick(function(_plotPos: Vector2, price: number)
+		self:placeAtPrice(price)
+	end)
+	-- Escape is not routed through ContextActionService: it must not be sunk
+	-- away from the rest of the client, and disarming an unarmed panel is free.
+	UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
+		if not processed and input.KeyCode == Enum.KeyCode.Escape then
+			self:setArmed(0)
+		end
 	end)
 
 	return self

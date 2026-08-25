@@ -32,6 +32,7 @@ local Types = require(Shared.Types)
 
 local BarStore = require(script.Parent.Parent.Data.BarStore)
 local PlayerStore = require(script.Parent.Parent.Data.PlayerStore)
+local Board = require(script.Parent.Parent.Meta.Board)
 
 type Bar = Types.Bar
 type Timeframe = Types.Timeframe
@@ -176,6 +177,7 @@ local function sendClock(s: Session)
 		playing = s.playing,
 		speed = s.speed,
 		stepSize = s.stepSize,
+		atEnd = s.date ~= nil and s.revealedCount >= #s.bars,
 	})
 	s.clockDirty = false
 end
@@ -581,6 +583,13 @@ end
 -- Fold the outgoing session into lifetime stats and drop it. The live log wins
 -- over the last snapshot; when nothing is loaded in memory (the player never
 -- sent ready and started a fresh day) the saved log is folded instead.
+--
+-- THIS IS THE ONLY STATS FOLD, and it runs from startSessionInner alone — i.e.
+-- when the player starts their NEXT day. PlayerRemoving/BindToClose save the
+-- active log for resume but deliberately never fold it: an unfinished session
+-- is still resumable, and folding it on disconnect would count it twice when
+-- they come back. The visible consequence is that a player who plays one day
+-- and leaves does not reach the leaderboard until they return.
 local function finalizeActive(s: Session)
 	local data = s.persist.data
 	local outgoing: Engine.EngineState? = nil
@@ -597,13 +606,65 @@ local function finalizeActive(s: Session)
 	end
 	if outgoing ~= nil then
 		local stats = data.stats
+		local won = outgoing.realizedUsd > 0 and #outgoing.trades > 0
+		local tradeWins = 0
+		for _, trade in ipairs(outgoing.trades) do
+			if trade.pnlUsd > 0 then
+				tradeWins += 1
+			end
+		end
 		stats.sessions += 1
 		stats.trades += #outgoing.trades
 		stats.pnlUsd += outgoing.realizedUsd
 		-- A session that never traded is neither a win nor a loss, whatever
 		-- rounding left behind in realizedUsd.
-		if outgoing.realizedUsd > 0 and #outgoing.trades > 0 then
+		if won then
 			stats.wins += 1
+		end
+		stats.tradeWins += tradeWins
+		-- The week bucket is keyed on REAL-WORLD time, not the replayed day: the
+		-- weekly board is a competition among whoever is playing this week.
+		local key = Board.weekKey(os.time())
+		local prior = stats.week
+		local week: PlayerStore.WeekStats
+		if prior ~= nil and prior.key == key then
+			week = prior
+		else
+			week = { key = key, sessions = 0, trades = 0, pnlUsd = 0, wins = 0 }
+			stats.week = week
+		end
+		week.sessions += 1
+		week.trades += #outgoing.trades
+		week.pnlUsd += outgoing.realizedUsd
+		if won then
+			week.wins += 1
+		end
+		-- The SECOND fold: leaderboard-eligible sessions only, and the only one
+		-- the boards read. The lifetime counters above bank a rewound session's
+		-- voided-away profit too, so a board sourced from them could be farmed in
+		-- an ineligible session and laundered through one clean one afterwards.
+		if Board.eligible(outgoing, s) then
+			local elig = stats.elig
+			elig.sessions += 1
+			elig.trades += #outgoing.trades
+			elig.tradeWins += tradeWins
+			elig.pnlUsd += outgoing.realizedUsd
+			-- Same key, same rotation as the lifetime week bucket. Nothing else
+			-- creates this bucket, which is what makes its presence under the
+			-- current key mean "at least one eligible session this week".
+			local priorElig = stats.elig.week
+			local eligWeek: PlayerStore.EligWeek
+			if priorElig ~= nil and priorElig.key == key then
+				eligWeek = priorElig
+			else
+				eligWeek = { key = key, pnlUsd = 0 }
+				elig.week = eligWeek
+			end
+			eligWeek.pnlUsd += outgoing.realizedUsd
+			-- A board write is a DataStore round trip and this runs inside
+			-- startSessionInner's switching guard, on the path the player is
+			-- waiting on: Board.post snapshots synchronously and spawns the write.
+			Board.post(s.player, stats)
 		end
 	end
 	data.active = nil

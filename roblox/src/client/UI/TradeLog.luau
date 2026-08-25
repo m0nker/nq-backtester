@@ -10,29 +10,55 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ContractMath = require(Shared:WaitForChild("Trading"):WaitForChild("ContractMath"))
+local Et = require(Shared:WaitForChild("Time"):WaitForChild("Et"))
 local Protocol = require(Shared:WaitForChild("Net"):WaitForChild("Protocol"))
 
 local Client = script.Parent.Parent
 local Theme = require(Client:WaitForChild("UI"):WaitForChild("Theme"))
 
-local PANEL_W = 430
+local PANEL_W = 576
 local PANEL_H = 240
-local HEADER_H = 22
+local TITLE_H = 22
+local HEAD_H = 18
 local ROW_H = 18
 -- Rows past this are simply not drawn; a session that produces more than this
 -- many round trips has outgrown a scrolling strip anyway.
 local MAX_ROWS = 200
 
-local COL_SIDE = { x = 4, w = 56 }
-local COL_PRICES = { x = 64, w = 180 }
-local COL_PNL = { x = 248, w = 88 }
-local COL_R = { x = 340, w = 56 }
-local COL_FLAG = { x = 400, w = 12 }
+type Col = { x: number, w: number, align: Enum.TextXAlignment, head: string }
+
+local LEFT = Enum.TextXAlignment.Left
+local RIGHT = Enum.TextXAlignment.Right
+
+-- Entry/exit are wall times only: every trade in a session shares its trading
+-- day, so the date would be the same string on every row.
+local COL_SIDE: Col = { x = 4, w = 44, align = LEFT, head = "dir" }
+local COL_ENTRY: Col = { x = 52, w = 44, align = LEFT, head = "in" }
+local COL_EXIT: Col = { x = 100, w = 44, align = LEFT, head = "out" }
+local COL_DUR: Col = { x = 148, w = 48, align = RIGHT, head = "dur" }
+local COL_PRICES: Col = { x = 202, w = 150, align = LEFT, head = "prices" }
+local COL_PTS: Col = { x = 356, w = 58, align = RIGHT, head = "pts" }
+local COL_PNL: Col = { x = 418, w = 78, align = RIGHT, head = "P&L" }
+local COL_R: Col = { x = 500, w = 52, align = RIGHT, head = "R" }
+local COL_FLAG: Col = { x = 556, w = 12, align = LEFT, head = "" }
+
+local COLUMNS: { Col } = { COL_SIDE, COL_ENTRY, COL_EXIT, COL_DUR, COL_PRICES, COL_PTS, COL_PNL, COL_R, COL_FLAG }
 
 local TradeLog = {}
 TradeLog.__index = TradeLog
 
-type Row = { frame: Frame, side: TextLabel, prices: TextLabel, pnl: TextLabel, r: TextLabel, flag: TextLabel }
+type Row = {
+	frame: Frame,
+	side: TextLabel,
+	entry: TextLabel,
+	exit: TextLabel,
+	dur: TextLabel,
+	prices: TextLabel,
+	pts: TextLabel,
+	pnl: TextLabel,
+	r: TextLabel,
+	flag: TextLabel,
+}
 
 type Fields = {
 	panel: Frame,
@@ -47,18 +73,18 @@ type Fields = {
 
 export type TradeLog = typeof(setmetatable({} :: Fields, TradeLog))
 
-local function newCell(parent: Instance, x: number, w: number, align: Enum.TextXAlignment): TextLabel
+local function newCell(parent: Instance, col: Col): TextLabel
 	local l = Instance.new("TextLabel")
 	l.BackgroundTransparency = 1
 	l.BorderSizePixel = 0
-	l.Position = UDim2.fromOffset(x, 0)
-	l.Size = UDim2.fromOffset(w, ROW_H)
+	l.Position = UDim2.fromOffset(col.x, 0)
+	l.Size = UDim2.fromOffset(col.w, ROW_H)
 	-- a column of prices, dollars and R multiples only reads as a column with
 	-- a fixed advance behind it
 	l.Font = Theme.fontMono
 	l.TextSize = Theme.textSm
 	l.TextColor3 = Theme.text
-	l.TextXAlignment = align
+	l.TextXAlignment = col.align
 	l.Text = ""
 	l.ZIndex = 9
 	l.Parent = parent
@@ -75,11 +101,15 @@ local function makeRow(list: ScrollingFrame): Row
 	frame.Parent = list
 	return {
 		frame = frame,
-		side = newCell(frame, COL_SIDE.x, COL_SIDE.w, Enum.TextXAlignment.Left),
-		prices = newCell(frame, COL_PRICES.x, COL_PRICES.w, Enum.TextXAlignment.Left),
-		pnl = newCell(frame, COL_PNL.x, COL_PNL.w, Enum.TextXAlignment.Right),
-		r = newCell(frame, COL_R.x, COL_R.w, Enum.TextXAlignment.Right),
-		flag = newCell(frame, COL_FLAG.x, COL_FLAG.w, Enum.TextXAlignment.Left),
+		side = newCell(frame, COL_SIDE),
+		entry = newCell(frame, COL_ENTRY),
+		exit = newCell(frame, COL_EXIT),
+		dur = newCell(frame, COL_DUR),
+		prices = newCell(frame, COL_PRICES),
+		pts = newCell(frame, COL_PTS),
+		pnl = newCell(frame, COL_PNL),
+		r = newCell(frame, COL_R),
+		flag = newCell(frame, COL_FLAG),
 	}
 end
 
@@ -94,6 +124,16 @@ end
 
 local function pnlColor(v: number): Color3
 	return if v > 0 then Theme.up elseif v < 0 then Theme.down else Theme.textDim
+end
+
+-- mm:ss under the hour, h:mm above it. Exits land on bar boundaries so the
+-- seconds are usually 00; the column exists to separate a 3-minute scalp from
+-- a 3-hour hold at a glance.
+local function fmtDuration(sec: number): string
+	if sec < 3600 then
+		return string.format("%d:%02d", math.floor(sec / 60), sec % 60)
+	end
+	return string.format("%d:%02d", math.floor(sec / 3600), math.floor(sec % 3600 / 60))
 end
 
 local function rebuild(self: TradeLog)
@@ -122,7 +162,11 @@ local function rebuild(self: TradeLog)
 			string.format("%s %.1f", if t.side == "buy" then "L" else "S", t.qty),
 			if t.side == "buy" then Theme.up else Theme.down
 		)
+		setCell(row.entry, Et.formatET(t.entryTs, false), Theme.textDim)
+		setCell(row.exit, Et.formatET(t.exitTs, false), Theme.textDim)
+		setCell(row.dur, fmtDuration(t.exitTs - t.entryTs), Theme.textDim)
 		setCell(row.prices, string.format("%.2f -> %.2f", t.avgEntry, t.avgExit), Theme.text)
+		setCell(row.pts, string.format("%+.2f", t.pnlPts), pnlColor(t.pnlPts))
 		setCell(row.pnl, ContractMath.fmtUsd(t.pnlUsd), pnlColor(t.pnlUsd))
 		local riskPts = t.riskPts
 		-- R is only defined where the entry carried a stop to measure it against
@@ -174,7 +218,7 @@ function TradeLog.new(gui: ScreenGui): TradeLog
 	title.BackgroundTransparency = 1
 	title.BorderSizePixel = 0
 	title.Position = UDim2.fromOffset(8, 0)
-	title.Size = UDim2.new(1, -16, 0, HEADER_H)
+	title.Size = UDim2.new(1, -16, 0, TITLE_H)
 	title.Font = Theme.fontUiMedium
 	title.TextSize = Theme.textMd
 	title.TextColor3 = Theme.textDim
@@ -183,12 +227,32 @@ function TradeLog.new(gui: ScreenGui): TradeLog
 	title.ZIndex = 9
 	title.Parent = panel
 
+	-- The header sits OUTSIDE the ScrollingFrame so the columns stay named while
+	-- the rows scroll under them.
+	local head = Instance.new("Frame")
+	head.Name = "Header"
+	head.BorderSizePixel = 0
+	head.BackgroundTransparency = 1
+	head.Position = UDim2.fromOffset(0, TITLE_H)
+	head.Size = UDim2.new(1, 0, 0, HEAD_H)
+	head.ZIndex = 9
+	head.Parent = panel
+	for _, col in ipairs(COLUMNS) do
+		if col.head ~= "" then
+			local cell = newCell(head, col)
+			-- column names are words, not numbers
+			cell.Font = Theme.fontUi
+			cell.TextColor3 = Theme.textDim
+			cell.Text = col.head
+		end
+	end
+
 	local list = Instance.new("ScrollingFrame")
 	list.Name = "Rows"
 	list.BorderSizePixel = 0
 	list.BackgroundTransparency = 1
-	list.Position = UDim2.fromOffset(0, HEADER_H)
-	list.Size = UDim2.new(1, 0, 1, -HEADER_H)
+	list.Position = UDim2.fromOffset(0, TITLE_H + HEAD_H)
+	list.Size = UDim2.new(1, 0, 1, -(TITLE_H + HEAD_H))
 	list.CanvasSize = UDim2.fromOffset(0, 0)
 	list.ScrollBarThickness = 6
 	list.ZIndex = 8

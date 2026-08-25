@@ -5,6 +5,10 @@
 // Run: `npx tsx roblox/tools/prepareData.ts [--months 2025-04,2025-05,2025-06]
 //       [--sample-days 3]` with cwd = repo root.
 //
+// `--hist-only` rebuilds ONLY the deep 1h history from the month buffers already
+// on disk — no Supabase round trip, no credentials needed, months and
+// SampleData/Codec fixtures left untouched.
+//
 // roblox/src/shared/Data/BarCodec.luau is the SINGLE source of truth for the
 // byte layout; pack()/unpack() here mirror it field for field and the generated
 // tests/fixtures/Codec.json pins the two implementations byte-for-byte. Change
@@ -19,6 +23,10 @@
 // subset produces a DIFFERENT shift than a full run: only full runs are
 // canonical (see DATA.md).
 //
+// The deep 1h history (META_PLAN §4) is folded from the SAME normalized bars the
+// months are packed from, so it carries the same dataset-wide shift for free and
+// splices onto live minute data without a seam.
+//
 // Nothing here is a replay-clock read: this is an offline preprocessing tool
 // operating on whole trading days, the same as scripts/ingest.mjs.
 
@@ -26,6 +34,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { join } from 'node:path';
 
+import { aggregate } from '../../web/src/lib/replay/aggregate';
 import { roundToTick } from '../../web/src/lib/trading/contractMath';
 import type { Bar } from '../../web/src/lib/types';
 
@@ -41,6 +50,20 @@ const NORMALIZED_OPEN = 20_000;
 // Script.Source caps at 200k chars; SampleData.luau is Rojo-mapped to a
 // ModuleScript, so the base64 payload plus wrapper must stay under this.
 const MAX_SAMPLE_CHARS = 190_000;
+
+// The deep-history timeframe. 1h is the finest resolution the whole dataset fits
+// into one DataStore value at; everything coarser (4h/1D/1W/1M) is aggregated
+// from it client-side, and nothing finer can be recovered from it.
+const HIST_TF = '1h' as const;
+const HIST_KEY = 'hist:1h';
+
+// DataStore value hard limit, in characters of the base64 the key holds.
+const MAX_VALUE_CHARS = 4_194_304;
+// META_PLAN §4.1's split trigger. Below this the series is ONE key; at or above
+// it the year-boundary split (`hist:1h:1`, `hist:1h:2`, …) has to be built —
+// deliberately unimplemented while the real series sits ~20% under the trigger,
+// because untested split code is worse than an assert that names the design.
+const HIST_SPLIT_CHARS = 3_800_000;
 
 const FETCH_CONCURRENCY = 6;
 const FETCH_ATTEMPTS = 3;
@@ -151,12 +174,39 @@ interface DayOut {
   barCount: number;
 }
 
+interface MonthOut {
+  month: string;
+  key: string;
+  byteSize: number;
+  days: DayOut[];
+}
+
+// META_PLAN §4.1: the whole 1h series in one DataStore key. Optional because a
+// manifest written before §4 landed has no `hist` and must still load.
+interface HistOut {
+  key: string;
+  file: string;
+  barCount: number;
+  byteSize: number;
+  firstTs: number;
+  lastTs: number;
+}
+
+interface OutManifest {
+  tickSize: number;
+  baseSec: number;
+  months: MonthOut[];
+  hist?: HistOut;
+}
+
 const ROOT = process.cwd();
 if (!existsSync(join(ROOT, 'roblox', 'tools', 'prepareData.ts'))) {
   throw new Error(`run from the repo root (cwd is ${ROOT})`);
 }
 const OUT_DIR = join(ROOT, 'roblox', 'data-out');
 const MONTH_DIR = join(OUT_DIR, 'm');
+const HIST_DIR = join(OUT_DIR, 'hist');
+const MANIFEST_PATH = join(OUT_DIR, 'manifest.json');
 const SAMPLE_PATH = join(ROOT, 'roblox', 'src', 'server', 'Data', 'SampleData.luau');
 const CODEC_FIXTURE_PATH = join(ROOT, 'roblox', 'tests', 'fixtures', 'Codec.json');
 
@@ -168,6 +218,10 @@ function argValue(flag: string): string | null {
 const monthsArg = argValue('--months');
 const onlyMonths = monthsArg ? new Set(monthsArg.split(',').map((s) => s.trim()).filter(Boolean)) : null;
 const sampleDaysWanted = Math.max(1, Number(argValue('--sample-days') ?? 3));
+const histOnly = process.argv.includes('--hist-only');
+if (histOnly && onlyMonths) {
+  throw new Error('--hist-only rebuilds the history from every packed month; --months does not apply');
+}
 
 // web/.env.local is the one place these credentials live; parsed by hand so the
 // tool stays dependency-free (it runs via npx tsx, not through Next).
@@ -191,15 +245,23 @@ function loadEnvFile(path: string): Record<string, string> {
   return out;
 }
 
-const envPath = join(ROOT, 'web', '.env.local');
-if (!existsSync(envPath)) throw new Error(`missing ${envPath} (NEXT_PUBLIC_SUPABASE_URL / _KEY)`);
-const env = loadEnvFile(envPath);
-const SUPABASE_URL = env.NEXT_PUBLIC_SUPABASE_URL;
-const SUPABASE_KEY = env.NEXT_PUBLIC_SUPABASE_KEY;
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  throw new Error('web/.env.local must define NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_KEY');
+// Resolved on first fetch, not at import: --hist-only reads the packed months
+// off disk and must run on a machine with no Supabase credentials at all.
+let supabase: { url: string; headers: Record<string, string> } | null = null;
+
+function supabaseEnv(): { url: string; headers: Record<string, string> } {
+  if (supabase) return supabase;
+  const envPath = join(ROOT, 'web', '.env.local');
+  if (!existsSync(envPath)) throw new Error(`missing ${envPath} (NEXT_PUBLIC_SUPABASE_URL / _KEY)`);
+  const env = loadEnvFile(envPath);
+  const url = env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = env.NEXT_PUBLIC_SUPABASE_KEY;
+  if (!url || !key) {
+    throw new Error('web/.env.local must define NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_KEY');
+  }
+  supabase = { url, headers: { apikey: key, Authorization: `Bearer ${key}` } };
+  return supabase;
 }
-const authHeaders = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -238,15 +300,16 @@ async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise
 // ordered by trading_date, paged 1000) — the Roblox port must ship the same set
 // of days the web app sees.
 async function loadDayManifest(): Promise<DayRow[]> {
+  const { url, headers } = supabaseEnv();
   const select = 'trading_date,storage_path,bar_count,first_ts,last_ts,checksum';
   const base =
-    `${SUPABASE_URL}/rest/v1/dataset_days?select=${select}` +
+    `${url}/rest/v1/dataset_days?select=${select}` +
     `&instrument_id=eq.${INSTRUMENT}&resolution=eq.${RESOLUTION}&order=trading_date.asc`;
   const days: DayRow[] = [];
   for (let from = 0; ; from += PAGE) {
     const res = await fetchRetry(
       base,
-      { headers: { ...authHeaders, Range: `${from}-${from + PAGE - 1}`, 'Range-Unit': 'items' } },
+      { headers: { ...headers, Range: `${from}-${from + PAGE - 1}`, 'Range-Unit': 'items' } },
       `manifest page ${from}`,
     );
     const rows = (await res.json()) as DayRow[];
@@ -258,7 +321,7 @@ async function loadDayManifest(): Promise<DayRow[]> {
 
 async function fetchDayBars(day: DayRow): Promise<Bar[]> {
   const res = await fetchRetry(
-    `${SUPABASE_URL}/storage/v1/object/public/chunks/${day.storage_path}`,
+    `${supabaseEnv().url}/storage/v1/object/public/chunks/${day.storage_path}`,
     { cache: 'no-cache' },
     `chunk ${day.storage_path}`,
   );
@@ -450,9 +513,127 @@ function writeCodecFixture(realBars: Bar[]): number {
   return json.length;
 }
 
+// ------------------------------------------------------------- 1h deep history
+
+// Buckets MUST be the game's buckets: `aggregate` anchors 1h to the 18:00 ET
+// trading-day open, not to UTC hours. Hand-rolling the bucketing here would
+// split the hour differently from the live minute data the history splices onto,
+// and the seam would be a one-candle lie at every session start.
+//
+// Months are folded one at a time and only the OPEN bucket survives the
+// boundary, so a full-history run never holds more than one month of 1m bars.
+// Returns 1 when the boundary bucket actually straddled the two months.
+function foldMonthHourly(acc: Bar[], monthBars: Bar[], label: string): number {
+  const hours = aggregate(monthBars, HIST_TF, BASE_SEC);
+  if (hours.length === 0) return 0;
+  const open = acc[acc.length - 1];
+  let from = 0;
+  if (open !== undefined) {
+    if (hours[0].t < open.t) {
+      throw new Error(`${label}: 1h bucket ${hours[0].t} precedes the open bucket ${open.t} — months out of order`);
+    }
+    if (hours[0].t === open.t) {
+      // A month's first trading date opens 18:00 ET the previous evening, which
+      // is itself a bucket start, so this merge is not expected to fire. It
+      // exists because a dropped straddle would corrupt exactly one candle per
+      // month boundary and nothing downstream would ever notice.
+      open.h = Math.max(open.h, hours[0].h);
+      open.l = Math.min(open.l, hours[0].l);
+      open.c = hours[0].c;
+      open.v += hours[0].v;
+      from = 1;
+    }
+  }
+  for (let i = from; i < hours.length; i++) acc.push(hours[i]);
+  return from;
+}
+
+function writeHourly(hourly: Bar[]): HistOut {
+  if (hourly.length === 0) throw new Error('hourly history is empty');
+  const buf = pack(hourly, TICK_SIZE);
+  assertRoundTrip('hist:1h', hourly, buf);
+  const b64Chars = Math.ceil(buf.length / 3) * 4;
+  if (b64Chars >= HIST_SPLIT_CHARS) {
+    throw new Error(
+      `hist:1h is ${b64Chars} base64 chars, at/over the ${HIST_SPLIT_CHARS} split trigger ` +
+        `(DataStore cap ${MAX_VALUE_CHARS}) — implement META_PLAN §4.1's year-boundary split ` +
+        `into hist:1h:1, hist:1h:2, … and teach the server to concatenate keys until GetAsync returns nil`,
+    );
+  }
+  mkdirSync(HIST_DIR, { recursive: true });
+  writeFileSync(join(HIST_DIR, '1h.bin'), buf);
+  return {
+    key: HIST_KEY,
+    file: '1h.bin',
+    barCount: hourly.length,
+    byteSize: buf.length,
+    firstTs: hourly[0].t,
+    lastTs: hourly[hourly.length - 1].t,
+  };
+}
+
+function reportHourly(hist: HistOut, straddles: number): void {
+  const b64Chars = Math.ceil(hist.byteSize / 3) * 4;
+  const headroomBars = Math.floor(((MAX_VALUE_CHARS - b64Chars) * 3) / 4 / BAR_SIZE);
+  console.log(
+    `\nhist:1h: ${hist.barCount} bars, ${hist.byteSize} B (${(hist.byteSize / 1048576).toFixed(2)} MiB), ` +
+      `${b64Chars} base64 chars = ${((b64Chars / MAX_VALUE_CHARS) * 100).toFixed(1)}% of the ${MAX_VALUE_CHARS} cap`,
+  );
+  console.log(
+    `         headroom ${MAX_VALUE_CHARS - b64Chars} chars ≈ ${headroomBars} more bars; ` +
+      `split trigger at ${HIST_SPLIT_CHARS} chars (not reached, split not implemented)`,
+  );
+  console.log(`         month-boundary straddles merged: ${straddles}`);
+}
+
+function readManifestFile(): OutManifest {
+  if (!existsSync(MANIFEST_PATH)) throw new Error(`missing ${MANIFEST_PATH} — run a full prepareData first`);
+  return JSON.parse(readFileSync(MANIFEST_PATH, 'utf8')) as OutManifest;
+}
+
+function writeManifestFile(manifest: OutManifest): void {
+  writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2), 'utf8');
+}
+
+// --hist-only: rebuild the 1h series from the packed months already on disk.
+// The months carry the dataset-wide shift, so the history inherits it verbatim —
+// there is nothing to renormalize and nothing to refetch.
+function histOnlyRun(): void {
+  const manifest = readManifestFile();
+  if (manifest.months.length === 0) throw new Error('manifest.json lists no months');
+  console.log(`--hist-only: folding ${manifest.months.length} packed month(s) from ${MONTH_DIR}`);
+
+  const hourly: Bar[] = [];
+  let straddles = 0;
+  let sourceBars = 0;
+  for (const meta of [...manifest.months].sort((a, b) => a.month.localeCompare(b.month))) {
+    const path = join(MONTH_DIR, `${meta.month}.bin`);
+    if (!existsSync(path)) throw new Error(`missing ${path} — the manifest and data-out/m/ disagree`);
+    const buf = readFileSync(path);
+    if (buf.length !== meta.byteSize) {
+      throw new Error(`${meta.month}.bin: ${buf.length} bytes, manifest says ${meta.byteSize} — regenerate`);
+    }
+    const bars = unpack(buf);
+    sourceBars += bars.length;
+    straddles += foldMonthHourly(hourly, bars, meta.month);
+  }
+
+  const hist = writeHourly(hourly);
+  manifest.hist = hist;
+  writeManifestFile(manifest);
+  console.log(`folded ${sourceBars} 1m bars from ${manifest.months.length} month(s)`);
+  reportHourly(hist, straddles);
+  console.log('round-trip: OK (hist:1h unpacked and compared exactly)');
+}
+
 // ---------------------------------------------------------------------- main
 
 async function main(): Promise<void> {
+  if (histOnly) {
+    histOnlyRun();
+    return;
+  }
+
   const manifest = await loadDayManifest();
   console.log(`manifest: ${manifest.length} ${INSTRUMENT}/${RESOLUTION} trading days`);
 
@@ -481,8 +662,13 @@ async function main(): Promise<void> {
   mkdirSync(MONTH_DIR, { recursive: true });
 
   const failed: string[] = [];
-  const monthsOut: Array<{ month: string; key: string; byteSize: number; days: DayOut[] }> = [];
+  const monthsOut: MonthOut[] = [];
   let totalBars = 0;
+
+  // Folded as the months stream past; `aggregate` builds fresh bars, so nothing
+  // here keeps a month's 1m array alive past its iteration.
+  const hourly: Bar[] = [];
+  let histStraddles = 0;
 
   // Months are processed in ascending order, so the first month with usable
   // days carries the earliest packed day — the anchor for the whole dataset.
@@ -523,6 +709,7 @@ async function main(): Promise<void> {
     assertRoundTrip(month, bars, buf);
     writeFileSync(join(MONTH_DIR, `${month}.bin`), buf);
     totalBars += bars.length;
+    histStraddles += foldMonthHourly(hourly, bars, month);
 
     monthsOut.push({
       month,
@@ -553,8 +740,9 @@ async function main(): Promise<void> {
     throw new Error('aborting: incomplete data — rerun (fetches are idempotent)');
   }
 
-  const outManifest = { tickSize: TICK_SIZE, baseSec: BASE_SEC, months: monthsOut };
-  writeFileSync(join(OUT_DIR, 'manifest.json'), JSON.stringify(outManifest, null, 2), 'utf8');
+  const hist = writeHourly(hourly);
+  const outManifest: OutManifest = { tickSize: TICK_SIZE, baseSec: BASE_SEC, months: monthsOut, hist };
+  writeManifestFile(outManifest);
 
   const chosen = sampleRun ?? sampleFallback;
   if (!chosen) throw new Error(`no run of ${sampleDaysWanted} consecutive weekday trading days found`);
@@ -570,11 +758,12 @@ async function main(): Promise<void> {
       `(${chosen.map((d) => d.date).join(', ')}), ${sample.chars} chars`,
   );
   console.log(`tests/fixtures/Codec.json: ${fixtureChars} chars`);
+  reportHourly(hist, histStraddles);
   console.log(
     `normalization: global shift ${shift}, post-shift range ${minLow} .. ${maxHigh} ` +
       `(${ticks(minLow, TICK_SIZE)} .. ${ticks(maxHigh, TICK_SIZE)} ticks, i32 limit ±2147483647)`,
   );
-  console.log('round-trip: OK (every month + sample + fixture unpacked and compared exactly)');
+  console.log('round-trip: OK (every month + hist:1h + sample + fixture unpacked and compared exactly)');
   console.log(
     `data quality: off-grid raw prices ${quality.offGridPrices} across ${quality.offGridDays.size} day(s), ` +
       `max deviation ${quality.maxRawDevTicks.toExponential(3)} ticks` +

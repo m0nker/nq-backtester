@@ -47,6 +47,13 @@ between the two.
 `rojo serve` + the Studio plugin syncs the filesystem into Studio. Tool
 versions are pinned in `rokit.toml`.
 
+LINT GATE (run from roblox/): `rojo sourcemap default.project.json -o
+sourcemap.json` then `luau-lsp analyze --sourcemap=sourcemap.json
+--definitions=globalTypes.d.luau --platform=roblox --ignore="Packages/**"
+src tests` (zero diagnostics required) and `stylua --check src tests`.
+`globalTypes.d.luau` is vendored at roblox/ root (from the luau-lsp repo);
+refresh it occasionally.
+
 PORTS: 34872 (Rojo's default) and 34873 are TAKEN on this machine. Always
 serve with `rojo serve --port 34875` and point the Studio plugin at that port.
 

@@ -1,5 +1,5 @@
-// Uploads the packed month buffers from roblox/data-out/ into the experience's
-// standard DataStore via Open Cloud.
+// Uploads the packed month buffers and the deep 1h history from
+// roblox/data-out/ into the experience's standard DataStore via Open Cloud.
 //
 // Run: `npx tsx roblox/tools/uploadData.ts --universe <universeId> [--dry-run]`
 // with cwd = repo root. Requires ROBLOX_OPENCLOUD_KEY in the environment — see
@@ -12,7 +12,7 @@
 //
 // Rate: standard DataStore writes are throttled to ~1 per 500 ms here, well
 // under Open Cloud's per-key and per-universe limits, so a full-history upload
-// of ~190 month keys takes ~2 minutes.
+// of ~190 month keys plus `hist:1h` takes ~2 minutes.
 
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
@@ -34,10 +34,20 @@ interface MonthMeta {
   days: Array<{ date: string; firstTs: number; lastTs: number; barCount: number }>;
 }
 
+interface HistMeta {
+  key: string;
+  file: string;
+  barCount: number;
+  byteSize: number;
+  firstTs: number;
+  lastTs: number;
+}
+
 interface OutManifest {
   tickSize: number;
   baseSec: number;
   months: MonthMeta[];
+  hist?: HistMeta;
 }
 
 const ROOT = process.cwd();
@@ -46,6 +56,7 @@ if (!existsSync(join(ROOT, 'roblox', 'tools', 'uploadData.ts'))) {
 }
 const OUT_DIR = join(ROOT, 'roblox', 'data-out');
 const MONTH_DIR = join(OUT_DIR, 'm');
+const HIST_DIR = join(OUT_DIR, 'hist');
 
 function argValue(flag: string): string | null {
   const i = process.argv.indexOf(flag);
@@ -125,20 +136,46 @@ async function main(): Promise<void> {
   }
 
   const plan: Array<{ key: string; file: string; b64: number; bars: number }> = [];
-  for (const meta of manifest.months) {
-    const buf = readFileSync(join(MONTH_DIR, `${meta.month}.bin`));
+
+  const readChunk = (path: string, label: string, byteSize: number): Buffer => {
+    const buf = readFileSync(path);
     if (buf.readUInt32LE(0) !== MAGIC || buf.readUInt8(4) !== VERSION) {
-      throw new Error(`${meta.month}.bin: not a BarCodec v1 chunk`);
+      throw new Error(`${label}: not a BarCodec v1 chunk`);
     }
-    if (buf.length !== meta.byteSize) {
-      throw new Error(`${meta.month}.bin: ${buf.length} bytes, manifest says ${meta.byteSize} — regenerate`);
+    if (buf.length !== byteSize) {
+      throw new Error(`${label}: ${buf.length} bytes, manifest says ${byteSize} — regenerate`);
     }
+    return buf;
+  };
+
+  for (const meta of manifest.months) {
+    const file = `${meta.month}.bin`;
+    const buf = readChunk(join(MONTH_DIR, file), file, meta.byteSize);
     const b64 = buf.toString('base64');
-    plan.push({ key: meta.key, file: `${meta.month}.bin`, b64: b64.length, bars: buf.readUInt32LE(8) });
+    plan.push({ key: meta.key, file, b64: b64.length, bars: buf.readUInt32LE(8) });
     if (!DRY_RUN) {
       await setEntry(meta.key, b64);
       await sleep(WRITE_INTERVAL_MS);
     }
+  }
+
+  // The deep 1h history (META_PLAN §4). ~3 MB base64 against a 4 MB/min per-key
+  // write ceiling, so it is written exactly once per run — never rewrite this
+  // key inside a minute.
+  if (manifest.hist) {
+    const hist = manifest.hist;
+    const buf = readChunk(join(HIST_DIR, hist.file), hist.file, hist.byteSize);
+    if (buf.readUInt32LE(8) !== hist.barCount) {
+      throw new Error(`${hist.file}: ${buf.readUInt32LE(8)} bars, manifest says ${hist.barCount} — regenerate`);
+    }
+    const b64 = buf.toString('base64');
+    plan.push({ key: hist.key, file: hist.file, b64: b64.length, bars: hist.barCount });
+    if (!DRY_RUN) {
+      await setEntry(hist.key, b64);
+      await sleep(WRITE_INTERVAL_MS);
+    }
+  } else {
+    console.warn('WARNING: manifest.json has no `hist` entry — deep history will be absent in game');
   }
 
   if (!DRY_RUN) await setEntry(MANIFEST_KEY, manifest);

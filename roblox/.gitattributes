@@ -1,0 +1,4 @@
+# Luau/TS/json/md sources are LF everywhere; core.autocrlf on this machine
+# has already caused one repo-wide CRLF churn via git stash. text=auto keeps
+# binary detection, eol=lf pins the working tree.
+* text=auto eol=lf

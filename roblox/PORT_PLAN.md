@@ -59,8 +59,17 @@ toolchain, chart rendering, data delivery). Revisit only with new evidence.
    stats fold (sessions/trades/pnlUsd/wins — the future leaderboard source).
    In-memory fallback exercised in Studio; live DataStore path needs the
    game's API access enabled.
-5. **Meta (future)** — OrderedDataStore leaderboard, daily challenge (seeded
-   mystery day), 1v1 rooms. Not part of the base backtester.
+5. **Meta** — IN PROGRESS (designs in META_PLAN.md).
+   ✅ Leaderboard (2026-08-24): OrderedDataStore boards (all-time pnl, weekly
+   pnl, per-trade win rate) fed by eligible-only stats (`elig` bucket closes
+   the rewind-laundering hole), Meta remote + client panel. Sparse until real
+   players finish gated sessions.
+   ✅ Also landed: drawing tools v1 (rays/rects, session-local), drill-down
+   session picker (dismissible), deep 1h history ARTIFACT (hist:1h key packed
+   + upload-ready; server/client splicing still open), ServerSpec suite
+   (383 assertions over the live Session).
+   Remaining: daily challenge (§2), 1v1 (§3), deep-history integration
+   (§4.3/4.4), drawing persistence + trend lines (§5 v2+).
 
 Cleanup backlog: `export type Cmd` in Protocol (client declares a local Send
 alias in four modules); chip-vs-follow-button overlap at the plot's right

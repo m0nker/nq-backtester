@@ -28,17 +28,27 @@ local Types = require(Shared:WaitForChild("Types"))
 
 local Client = script.Parent.Parent
 local BarCacheModule = require(Client:WaitForChild("State"):WaitForChild("BarCache"))
+local DashLineModule = require(script.Parent:WaitForChild("DashLine"))
 local Theme = require(Client:WaitForChild("UI"):WaitForChild("Theme"))
 
 type Bar = Types.Bar
 type BarCache = BarCacheModule.BarCache
+type DashLine = DashLineModule.DashLine
 
 local CANDLE_POOL_INITIAL = 350
--- Hard ceiling on simultaneously drawn candles. The zoom clamp below is
--- derived from it, so the pool never has to grow during a repaint.
+-- Hard ceiling on simultaneously drawn candles. Below the width at which the
+-- pool can afford one Frame per bar the repaint DECIMATES instead of the pool
+-- growing (see drawStep), so this is a bound on Frames, not on zoom.
 local CANDLE_POOL_MAX = 700
-local PRICE_LABELS = 9
-local TIME_LABELS = 8
+-- Zoom-out floor, in bars: a full session (context + day) on a 1m chart is
+-- ~3400 bars, and the whole point of the floor is that it fits on one screen.
+local VISIBLE_BAR_CEILING = 3500
+-- Axis density is a function of the plot, not a constant: a fullscreen chart
+-- with 9 price ticks reads as empty. Pools are allocated once at the MAX.
+local PRICE_LABEL_PX = 45
+local TIME_LABEL_PX = 90
+local PRICE_LABELS_MIN, PRICE_LABELS_MAX = 3, 15
+local TIME_LABELS_MIN, TIME_LABELS_MAX = 3, 16
 local PRICE_AXIS_W = 62
 local TIME_AXIS_H = 20
 local MIN_BAR_W = 2
@@ -63,16 +73,28 @@ local MAX_PRICE_RANGE = 1e7
 -- window on the same strip are one.
 local DOUBLE_CLICK_SEC = 0.35
 
--- Dashed crosshair (the web chart's large-dash style). A Frame has no stroke
--- pattern, so each line is a transparent CONTAINER holding one small Frame per
--- dash. Only the container moves on mouse move; the dashes are laid out once
--- per resize, so the per-frame cost is still two Position writes.
+-- Dashed crosshair (the web chart's large-dash style) and the dotted
+-- last-price line, both built out of Chart/DashLine's pooled segments. The
+-- pool caps below are the instance budget for this ScreenGui: past a cap the
+-- DashLine stretches its period rather than allocating, so an oversized plot
+-- costs a sparser pattern instead of Frames.
 local DASH_LEN = 4
 local DASH_PERIOD = 8
--- Enough for a 4K-wide plot; past it the line simply stops, which no display
--- this game runs on will reach.
-local DASH_POOL_MAX = 480
+local DASH_POOL_V = 320 -- exact pattern to a 2560px-tall plot
+local DASH_POOL_H = 480 -- exact pattern to a 3840px-wide plot
+-- The last-price line is DOTTED, so it is twice as dense as the crosshair for
+-- the same span — hence its own, larger cap.
+local DOT_LEN = 2
+local DOT_PERIOD = 4
+local DOT_POOL_MAX = 480
 local CROSS_TIME_W = 96
+local LAST_CHIP_H = 16
+
+-- Price-axis stacking, lowest first: tick labels, per-order chips (owned by
+-- OrderLayer, which hardcodes 3), the last-price chip, the crosshair readout.
+-- The crosshair is on top because it is the transient one.
+local Z_LAST_CHIP = 4
+local Z_CROSS_CHIP = 5
 
 -- Axis steps come from the 1 / 2 / 2.5 / 5 x 10^k ladder.
 local STEP_MULTIPLIERS: { number } = { 1, 2, 2.5, 5, 10 }
@@ -123,14 +145,16 @@ type Fields = {
 	priceText: { string },
 	timeText: { string },
 
-	crossV: Frame,
-	crossH: Frame,
-	crossVDashes: { Frame },
-	crossHDashes: { Frame },
-	crossVShown: number,
-	crossHShown: number,
+	crossV: DashLine,
+	crossH: DashLine,
 	crossPrice: TextLabel,
 	crossTime: TextLabel,
+	crossArmed: boolean,
+
+	-- last close: dotted line across the plot + an always-on axis chip
+	lastLine: DashLine,
+	lastChip: TextLabel,
+	lastChipText: string,
 
 	-- viewport
 	barWidthPx: number,
@@ -186,6 +210,10 @@ type Fields = {
 	repaintListeners: { () -> () },
 	-- set while an overlay owns the mouse; a chip drag must not also pan
 	panLocked: boolean,
+
+	-- click-to-place: a press on the plot that ends without becoming a pan
+	clickListeners: { (Vector2, number, number?) -> () },
+	clickCandidate: boolean,
 }
 
 export type ChartView = typeof(setmetatable({} :: Fields, ChartView))
@@ -290,35 +318,6 @@ local function makeSlot(plot: Frame): CandleSlot
 	return { wick = wick, body = body }
 end
 
--- Dashes along one crosshair line. Called on resize only — growth is a one-off
--- pool extension, exactly like the candle slots.
-local function layoutDashes(container: Frame, dashes: { Frame }, shown: number, span: number, vertical: boolean): number
-	local want = math.min(math.ceil(span / DASH_PERIOD), DASH_POOL_MAX)
-	for i = #dashes + 1, want do
-		local d = newFrame(container, "D" .. i, Theme.crosshair, 1)
-		d.Visible = false
-		dashes[i] = d
-	end
-	for i = 1, want do
-		local off = (i - 1) * DASH_PERIOD
-		local d = dashes[i]
-		if vertical then
-			d.Position = UDim2.fromOffset(0, off)
-			d.Size = UDim2.fromOffset(1, DASH_LEN)
-		else
-			d.Position = UDim2.fromOffset(off, 0)
-			d.Size = UDim2.fromOffset(DASH_LEN, 1)
-		end
-	end
-	for k = want + 1, shown do
-		dashes[k].Visible = false
-	end
-	for k = shown + 1, want do
-		dashes[k].Visible = true
-	end
-	return want
-end
-
 -- Growth is amortized and capped, never per repaint: the pool only extends the
 -- first time a zoom level needs more slots than it has.
 local function ensureSlots(self: ChartView, want: number)
@@ -329,10 +328,27 @@ local function ensureSlots(self: ChartView, want: number)
 	end
 end
 
--- Smallest bar width the pool can cover at this plot width. -2 leaves slack for
--- the partially clipped candles at either edge.
-local function minBarWidth(plotW: number): number
+-- Narrowest DRAWN candle: one Frame per bar below this either overruns the
+-- pool or paints sub-pixel bodies. -2 leaves slack for the partially clipped
+-- candles at either edge.
+local function poolBarWidth(plotW: number): number
 	return math.max(MIN_BAR_W, plotW / (CANDLE_POOL_MAX - 2))
+end
+
+-- Zoom-out floor. It is deliberately BELOW poolBarWidth: past that point the
+-- repaint draws every Nth candle with the skipped highs/lows folded in, so the
+-- pool bounds the number of Frames while the camera still reaches a whole
+-- session. Purely visual — the bar array is never touched.
+local function minBarWidth(plotW: number): number
+	return plotW / VISIBLE_BAR_CEILING
+end
+
+-- Candles per drawn Frame at this width. 1 whenever every bar fits.
+local function drawStep(plotW: number, barWidthPx: number): number
+	if barWidthPx <= 0 then
+		return 1
+	end
+	return math.max(1, math.ceil(poolBarWidth(plotW) / barWidthPx))
 end
 
 -- ---------------------------------------------------------------------------
@@ -369,12 +385,13 @@ function ChartView.markDirty(self: ChartView)
 	self.dirty = true
 end
 
--- Re-cut both dashed crosshair lines to the plot's size. Resize only: mouse
--- movement moves the containers, never the dashes inside them.
-function ChartView.layoutCrosshair(self: ChartView)
+-- Re-cut every dashed line to the plot's size. Resize only: mouse movement and
+-- repaints move the containers, never the dashes inside them.
+function ChartView.layoutDashLines(self: ChartView)
 	local size = self.plot.AbsoluteSize
-	self.crossVShown = layoutDashes(self.crossV, self.crossVDashes, self.crossVShown, size.Y, true)
-	self.crossHShown = layoutDashes(self.crossH, self.crossHDashes, self.crossHShown, size.X, false)
+	self.crossV:layout(size.Y)
+	self.crossH:layout(size.X)
+	self.lastLine:layout(size.X)
 end
 
 -- --------------------------------------------------------------- price scale
@@ -412,6 +429,13 @@ function ChartView.getPlot(self: ChartView): Frame
 	return self.plot
 end
 
+-- Overlays that own an axis chip parent it here. The strip clips, so a chip
+-- whose y falls outside the plot disappears on its own — but an overlay must
+-- still hide it, or an off-scale level reads as one pinned to the edge.
+function ChartView.getPriceAxis(self: ChartView): Frame
+	return self.priceAxis
+end
+
 -- Plot-local pixel y for a price. Values outside [priceMin, priceMax] map
 -- outside the plot; callers hide rather than clamp, so a chip never lies.
 function ChartView.priceToY(self: ChartView, price: number): number
@@ -444,6 +468,52 @@ function ChartView.setPanLocked(self: ChartView, locked: boolean)
 	self.panLocked = locked
 	if locked then
 		self.dragging = false
+		-- an overlay seizing the mouse mid-press cancels the click: the release
+		-- belongs to that overlay's gesture, not to the plot
+		self.clickCandidate = false
+	end
+end
+
+-- Click-to-place. `fn` fires on a COMPLETED click on the plot: press and
+-- release with less than DRAG_THRESHOLD of movement between them, never while
+-- an overlay owns the mouse (a chip drag), and never on a blank chart — with
+-- no painted scale there is no price to report. Arguments are the plot-local
+-- press position, the price at that y, and the OPEN time of the bar nearest
+-- that x (nil past either end of the data).
+function ChartView.onPlotClick(self: ChartView, fn: (plotPos: Vector2, price: number, tSec: number?) -> ())
+	table.insert(self.clickListeners, fn)
+end
+
+-- The chart has no cursor image to swap (a custom Mouse.Icon needs an uploaded
+-- asset), so "armed" is the crosshair going accent-colored.
+function ChartView.setClickCursor(self: ChartView, on: boolean)
+	if self.crossArmed == on then
+		return
+	end
+	self.crossArmed = on
+	local color = if on then Theme.accent else Theme.crosshair
+	self.crossV:setColor(color)
+	self.crossH:setColor(color)
+end
+
+function ChartView.firePlotClick(self: ChartView)
+	if not self.scaled or #self.clickListeners == 0 then
+		return
+	end
+	local size = self.plot.AbsoluteSize
+	if size.X < 1 or size.Y < 1 then
+		return
+	end
+	local m = self:mouseToPlot()
+	if m.X < 0 or m.Y < 0 or m.X > size.X or m.Y > size.Y then
+		return
+	end
+	local price = yToPrice(m.Y, self.priceMin, self.priceMax, size.Y)
+	local candles = self.cache:getCandles()
+	local c = candles[math.round(xToIndex(m.X, self.rightIndex, self.barWidthPx, size.X))]
+	local t: number? = if c ~= nil then c.t else nil
+	for _, fn in ipairs(self.clickListeners) do
+		fn(m, price, t)
 	end
 end
 
@@ -496,22 +566,40 @@ function ChartView.repaint(self: ChartView)
 	self.scaled = true
 	self:syncCrosshairVisibility()
 
-	ensureSlots(self, last - first + 1)
+	-- Decimation: one Frame per `step` candles once the tape is zoomed out past
+	-- what the pool can draw bar-for-bar. Groups are anchored to absolute index
+	-- (i = 1 mod step) rather than to `first`, so panning slides the tape
+	-- instead of re-cutting the groups under it and shimmering.
+	local step = drawStep(plotW, bw)
+	local firstGroup = first - (first - 1) % step
+	ensureSlots(self, math.floor((last - firstGroup) / step) + 1)
 
-	local bodyW = math.max(1, math.round(bw * BODY_WIDTH_FRACTION))
+	local bodyW = math.max(1, math.round(bw * step * BODY_WIDTH_FRACTION))
 	local used = 0
-	for i = first, last do
+	for i = firstGroup, last, step do
 		local slot = self.slots[used + 1]
 		if slot == nil then
 			break
 		end
 		used += 1
 		local c = candles[i]
+		-- the drawn bar keeps its OWN open/close (and so its own direction); only
+		-- the extremes of the bars it stands in for are folded in
+		local hi, lo = c.h, c.l
+		for j = i + 1, math.min(i + step - 1, last) do
+			local s = candles[j]
+			if s.h > hi then
+				hi = s.h
+			end
+			if s.l < lo then
+				lo = s.l
+			end
+		end
 		local up = c.c >= c.o
 		local color = if up then Theme.up else Theme.down
 		local x = math.round(indexToX(i, right, bw, plotW))
-		local yHigh = math.round(priceToY(c.h, pMin, pMax, plotH))
-		local yLow = math.round(priceToY(c.l, pMin, pMax, plotH))
+		local yHigh = math.round(priceToY(hi, pMin, pMax, plotH))
+		local yLow = math.round(priceToY(lo, pMin, pMax, plotH))
 		local yTop = math.round(priceToY(if up then c.c else c.o, pMin, pMax, plotH))
 		local yBot = math.round(priceToY(if up then c.o else c.c, pMin, pMax, plotH))
 
@@ -535,13 +623,49 @@ function ChartView.repaint(self: ChartView)
 	end
 	self.drawn = used
 
+	self:paintLastPrice(candles[n], plotH)
 	self:paintPriceAxis(plotH)
 	self:paintTimeAxis(candles, first, last, right, bw, plotW)
 end
 
+-- Last close: a dotted line across the plot plus a permanent axis chip in the
+-- bar's own direction color. Off-scale (a manual range panned away from price)
+-- both hide — a chip clamped to an edge would quote a level the chart is not
+-- showing, which is the one thing this element must never do.
+function ChartView.paintLastPrice(self: ChartView, bar: Bar?, plotH: number)
+	if bar == nil then
+		self.lastLine:setVisible(false)
+		self.lastChip.Visible = false
+		return
+	end
+	local price = bar.c
+	local inRange = price >= self.priceMin and price <= self.priceMax
+	self.lastLine:setVisible(inRange)
+	if self.lastChip.Visible ~= inRange then
+		self.lastChip.Visible = inRange
+	end
+	if not inRange then
+		return
+	end
+	local color = if bar.c >= bar.o then Theme.up else Theme.down
+	self.lastLine:setColor(color)
+	if self.lastChip.BackgroundColor3 ~= color then
+		self.lastChip.BackgroundColor3 = color
+	end
+	local y = math.round(priceToY(price, self.priceMin, self.priceMax, plotH))
+	self.lastLine:setPosition(UDim2.fromOffset(0, y))
+	self.lastChip.Position = UDim2.fromOffset(0, y)
+	local s = string.format("%.2f", price)
+	if self.lastChipText ~= s then
+		self.lastChipText = s
+		self.lastChip.Text = s
+	end
+end
+
 function ChartView.paintPriceAxis(self: ChartView, plotH: number)
 	local pMin, pMax = self.priceMin, self.priceMax
-	local step = niceStep(pMax - pMin, PRICE_LABELS - 1)
+	local want = math.clamp(math.floor(plotH / PRICE_LABEL_PX), PRICE_LABELS_MIN, PRICE_LABELS_MAX)
+	local step = niceStep(pMax - pMin, want - 1)
 	-- two decimals at EVERY zoom: a scale that drops decimals as it widens
 	-- makes two adjacent ticks read as the same price
 	local fmt = "%.2f"
@@ -549,7 +673,7 @@ function ChartView.paintPriceAxis(self: ChartView, plotH: number)
 	-- otherwise make the labels wander off the round values
 	local k0 = math.ceil(pMin / step)
 	local shown = 0
-	for j = 0, PRICE_LABELS - 1 do
+	for j = 0, want - 1 do
 		local price = (k0 + j) * step
 		if price > pMax then
 			break
@@ -586,10 +710,11 @@ function ChartView.paintTimeAxis(
 	plotW: number
 )
 	local sessionTf = Types.isSessionTf(self.cache:getTimeframe())
+	local want = math.clamp(math.floor(plotW / TIME_LABEL_PX), TIME_LABELS_MIN, TIME_LABELS_MAX)
 	local span = candles[last].t - candles[first].t
 	local stepSec = TIME_STEPS[#TIME_STEPS]
 	for _, s in ipairs(TIME_STEPS) do
-		if span / s <= TIME_LABELS then
+		if span / s <= want then
 			stepSec = s
 			break
 		end
@@ -599,7 +724,7 @@ function ChartView.paintTimeAxis(
 	local nextT = math.ceil(candles[first].t / stepSec) * stepSec
 	local prevDate = ""
 	for i = first, last do
-		if shown >= TIME_LABELS then
+		if shown >= want then
 			break
 		end
 		local t = candles[i].t
@@ -654,6 +779,8 @@ function ChartView.hideAll(self: ChartView)
 		self.timeLabels[k].Visible = false
 		self.vLines[k].Visible = false
 	end
+	self.lastLine:setVisible(false)
+	self.lastChip.Visible = false
 	self.drawn, self.priceShown, self.timeShown = 0, 0, 0
 	-- nothing drawn means no scale to read prices or times off
 	self.scaled = false
@@ -664,7 +791,7 @@ end
 -- with no bars the placeholder range would otherwise print a price the chart
 -- is not showing.
 function ChartView.syncCrosshairVisibility(self: ChartView)
-	local readouts = self.crossV.Visible and self.scaled
+	local readouts = self.crossV:isVisible() and self.scaled
 	if self.crossPrice.Visible ~= readouts then
 		self.crossPrice.Visible = readouts
 		self.crossTime.Visible = readouts
@@ -672,11 +799,11 @@ function ChartView.syncCrosshairVisibility(self: ChartView)
 end
 
 function ChartView.setCrosshairVisible(self: ChartView, v: boolean)
-	if self.crossV.Visible == v then
+	if self.crossV:isVisible() == v then
 		return
 	end
-	self.crossV.Visible = v
-	self.crossH.Visible = v
+	self.crossV:setVisible(v)
+	self.crossH:setVisible(v)
 	self:syncCrosshairVisibility()
 end
 
@@ -694,8 +821,8 @@ function ChartView.updateCrosshair(self: ChartView, mouse: Vector2?)
 		return
 	end
 	self:setCrosshairVisible(true)
-	self.crossV.Position = UDim2.fromOffset(math.round(x), 0)
-	self.crossH.Position = UDim2.fromOffset(0, math.round(y))
+	self.crossV:setPosition(UDim2.fromOffset(math.round(x), 0))
+	self.crossH:setPosition(UDim2.fromOffset(0, math.round(y)))
 	if not self.scaled then
 		return
 	end
@@ -758,6 +885,9 @@ local function wireInput(self: ChartView)
 			local m = mouseLocation(self)
 			self.dragging = true
 			self.dragMoved = false
+			-- A chip is a TextButton and sinks the press, so this handler never
+			-- runs for one; the flag only has to survive until the release.
+			self.clickCandidate = true
 			self.dragStartX = m.X
 			self.dragStartY = m.Y
 			self.dragStartRight = self.rightIndex
@@ -793,8 +923,16 @@ local function wireInput(self: ChartView)
 		self.dirty = true
 	end)
 	UserInputService.InputEnded:Connect(function(input: InputObject)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			self.dragging = false
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+			return
+		end
+		self.dragging = false
+		-- `dragMoved` is exactly "travelled DRAG_THRESHOLD or more", so a press
+		-- that never set it is the click; anything else was a pan.
+		local click = self.clickCandidate and not self.dragMoved and not self.panLocked
+		self.clickCandidate = false
+		if click then
+			self:firePlotClick()
 		end
 	end)
 end
@@ -921,9 +1059,21 @@ function ChartView.new(cache: BarCache): ChartView
 	timeAxis.ClipsDescendants = true
 	timeAxis.Active = true
 
+	-- 1px separators plot|price-axis and plot|time-axis. They belong to the
+	-- axes, so each is drawn on the axis side of the boundary and sits above
+	-- both strips by ZIndex; the plot clips, so neither can bleed into the tape.
+	local vBorder = newFrame(root, "PriceAxisBorder", Theme.axisBorder, 2)
+	vBorder.Position = UDim2.new(1, -PRICE_AXIS_W, 0, 0)
+	vBorder.Size = UDim2.new(0, 1, 1, -TIME_AXIS_H)
+	local hBorder = newFrame(root, "TimeAxisBorder", Theme.axisBorder, 2)
+	hBorder.Position = UDim2.new(0, 0, 1, -TIME_AXIS_H)
+	hBorder.Size = UDim2.new(1, -PRICE_AXIS_W, 0, 1)
+
+	-- Both label pools are allocated at their MAX; the density a repaint asks
+	-- for is a function of the plot size and never exceeds it.
 	local hLines: { Frame } = {}
 	local priceLabels: { TextLabel } = {}
-	for i = 1, PRICE_LABELS do
+	for i = 1, PRICE_LABELS_MAX do
 		local line = newFrame(plot, "H" .. i, Theme.grid, 1)
 		line.Size = UDim2.new(1, 0, 0, 1)
 		line.Visible = false
@@ -937,7 +1087,7 @@ function ChartView.new(cache: BarCache): ChartView
 
 	local vLines: { Frame } = {}
 	local timeLabels: { TextLabel } = {}
-	for i = 1, TIME_LABELS do
+	for i = 1, TIME_LABELS_MAX do
 		local line = newFrame(plot, "V" .. i, Theme.grid, 1)
 		line.Size = UDim2.new(0, 1, 1, 0)
 		line.Visible = false
@@ -950,17 +1100,55 @@ function ChartView.new(cache: BarCache): ChartView
 		timeLabels[i] = label
 	end
 
-	-- containers only: the dashes are children, cut to size by layoutCrosshair
-	local crossV = newFrame(plot, "CrossV", Theme.crosshair, 4)
-	crossV.BackgroundTransparency = 1
-	crossV.Size = UDim2.new(0, 1, 1, 0)
-	crossV.Visible = false
-	local crossH = newFrame(plot, "CrossH", Theme.crosshair, 4)
-	crossH.BackgroundTransparency = 1
-	crossH.Size = UDim2.new(1, 0, 0, 1)
-	crossH.Visible = false
+	local crossV = DashLineModule.new({
+		parent = plot,
+		name = "CrossV",
+		vertical = true,
+		color = Theme.crosshair,
+		zIndex = 5,
+		dashLen = DASH_LEN,
+		period = DASH_PERIOD,
+		poolMax = DASH_POOL_V,
+	})
+	local crossH = DashLineModule.new({
+		parent = plot,
+		name = "CrossH",
+		vertical = false,
+		color = Theme.crosshair,
+		zIndex = 5,
+		dashLen = DASH_LEN,
+		period = DASH_PERIOD,
+		poolMax = DASH_POOL_H,
+	})
 
-	local crossPrice = newLabel(priceAxis, "CrossPrice", 3)
+	-- Under the crosshair, over the candles: the last price is a permanent
+	-- reference, but the thing the cursor is on always wins.
+	local lastLine = DashLineModule.new({
+		parent = plot,
+		name = "LastPrice",
+		vertical = false,
+		color = Theme.up,
+		zIndex = 4,
+		dashLen = DOT_LEN,
+		period = DOT_PERIOD,
+		poolMax = DOT_POOL_MAX,
+	})
+	lastLine:getContainer().AnchorPoint = Vector2.new(0, 0.5)
+
+	local lastChip = newLabel(priceAxis, "LastPrice", Z_LAST_CHIP)
+	lastChip.AnchorPoint = Vector2.new(0, 0.5)
+	lastChip.Size = UDim2.fromOffset(PRICE_AXIS_W, LAST_CHIP_H)
+	lastChip.BackgroundTransparency = 0
+	lastChip.BackgroundColor3 = Theme.up
+	lastChip.TextColor3 = Theme.chipText
+	lastChip.TextXAlignment = Enum.TextXAlignment.Left
+	lastChip.Visible = false
+	local lastPad = Instance.new("UIPadding")
+	lastPad.PaddingLeft = UDim.new(0, 4)
+	lastPad.PaddingRight = UDim.new(0, 4)
+	lastPad.Parent = lastChip
+
+	local crossPrice = newLabel(priceAxis, "CrossPrice", Z_CROSS_CHIP)
 	crossPrice.AnchorPoint = Vector2.new(0, 0.5)
 	crossPrice.Size = UDim2.fromOffset(PRICE_AXIS_W, 16)
 	crossPrice.BackgroundTransparency = 0
@@ -972,7 +1160,7 @@ function ChartView.new(cache: BarCache): ChartView
 	pricePad.PaddingLeft = UDim.new(0, 4)
 	pricePad.PaddingRight = UDim.new(0, 4)
 	pricePad.Parent = crossPrice
-	local crossTime = newLabel(timeAxis, "CrossTime", 3)
+	local crossTime = newLabel(timeAxis, "CrossTime", Z_CROSS_CHIP)
 	crossTime.AnchorPoint = Vector2.new(0.5, 0)
 	crossTime.Size = UDim2.fromOffset(CROSS_TIME_W, 16)
 	crossTime.BackgroundTransparency = 0
@@ -1013,12 +1201,12 @@ function ChartView.new(cache: BarCache): ChartView
 			timeText = {},
 			crossV = crossV,
 			crossH = crossH,
-			crossVDashes = {},
-			crossHDashes = {},
-			crossVShown = 0,
-			crossHShown = 0,
 			crossPrice = crossPrice,
 			crossTime = crossTime,
+			crossArmed = false,
+			lastLine = lastLine,
+			lastChip = lastChip,
+			lastChipText = "",
 			barWidthPx = DEFAULT_BAR_W,
 			rightIndex = TAIL_PAD,
 			followTail = true,
@@ -1050,6 +1238,8 @@ function ChartView.new(cache: BarCache): ChartView
 			timeAxisLastClick = 0,
 			repaintListeners = {},
 			panLocked = false,
+			clickListeners = {},
+			clickCandidate = false,
 		} :: Fields,
 		ChartView
 	)
@@ -1065,10 +1255,10 @@ function ChartView.new(cache: BarCache): ChartView
 		self.dirty = true
 	end)
 	plot:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
-		self:layoutCrosshair()
+		self:layoutDashLines()
 		self.dirty = true
 	end)
-	self:layoutCrosshair()
+	self:layoutDashLines()
 	wireInput(self)
 	wireAxes(self)
 

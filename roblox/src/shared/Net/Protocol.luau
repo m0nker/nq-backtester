@@ -30,6 +30,17 @@
 --           baseSec: number,            -- base bar resolution (60)
 --           tickSize: number,
 --           startingBalance: number }
+--   Meta  (RemoteEvent, server -> client): { kind: string, ... }, a tagged
+--         union. ONE remote for the whole meta layer keeps REMOTE_NAMES short
+--         and the client's boundary casts in one place.
+--     kind = "board" -> { board: string, rows: { BoardRow }, you: BoardRow? }
+--         Sent only in reply to a "board" command. `rows` is already ranked and
+--         ordered (rank 1 first); `value` is USD on "pnlAll"/"pnlWeek" and
+--         basis points (0..10000) on "winRate". `you` is the requesting
+--         player's row; its rank is 0 when they are outside `rows`, because a
+--         true global rank would mean paging the whole board.
+--         META_PLAN §2/§3 reserve kind = "challenge" | "duelInvite" |
+--         "duelState" | "duelResult" on this same remote; not sent yet.
 --
 -- Cmd shapes (server validates everything; qty is quantized, prices
 -- tick-rounded server-side — the client is untrusted):
@@ -50,6 +61,11 @@
 --     changes = { limitPrice = number?, stopPrice = number?, qty = number? } }
 --   { cmd = "cancelOrder", orderId = string }
 --   { cmd = "flatten" }                            -- market-close the position, cancel all
+--   { cmd = "board", board = "pnlAll"|"pnlWeek"|"winRate" }
+--                                                  -- server replies Meta { kind = "board" }.
+--                                                  -- Board reads are cached server-side, so
+--                                                  -- spamming this costs the caller, not the
+--                                                  -- server's DataStore list budget
 
 local M = {}
 
@@ -87,6 +103,7 @@ export type Clock = {
 	playing: boolean,
 	speed: number,
 	stepSize: string,
+	atEnd: boolean?, -- every bar revealed; step/play are no-ops until rewind
 }
 
 export type TradeState = {
@@ -108,8 +125,21 @@ export type SessionInfo = {
 	date: string?, -- its trading date, when running
 }
 
+export type BoardRow = { rank: number, userId: number, name: string, value: number }
+
+export type MetaBoard = {
+	kind: string,
+	board: string,
+	rows: { BoardRow },
+	you: BoardRow?,
+}
+
 M.REMOTES_FOLDER = "Remotes"
-M.REMOTE_NAMES = { "Cmd", "Clock", "Bars", "TradeState", "SessionInfo" }
+M.REMOTE_NAMES = { "Cmd", "Clock", "Bars", "TradeState", "SessionInfo", "Meta" }
+
+-- The board ids the "board" command accepts. Ordered, because the client's tab
+-- strip is built from it and tab order is observable output.
+M.BOARD_IDS = { "pnlAll", "pnlWeek", "winRate" }
 
 M.SPEEDS = { 1, 2, 5, 10, 20, 50, 100, 200, 500 } -- base bars per second
 

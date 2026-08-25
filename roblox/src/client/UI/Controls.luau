@@ -28,6 +28,15 @@ local PAD = 4
 local TF_BTN_W = 34
 local BTN_H = 26
 
+-- Jump-to-time group (right-hand end of the bar). The box takes an ET wall
+-- time inside the session's own trading day; the preset is the RTH open.
+local JUMP_BOX_W = 60
+local JUMP_GO_W = 30
+local JUMP_PRESET_W = 52
+local JUMP_GAP = 4
+local JUMP_PRESET = "09:30"
+local FLASH_SEC = 0.6
+
 -- Step size is either a concrete timeframe or this: "follow the chart". The
 -- server has no such mode (Protocol), so "view" never travels — it only
 -- decides which CONCRETE timeframe setStepSize carries.
@@ -64,6 +73,8 @@ type Fields = {
 	cbs: Callbacks,
 	clockLabel: TextLabel,
 	playBtn: TextButton,
+	fwdBtn: TextButton,
+	jumpBox: TextBox,
 	speedBtn: TextButton,
 	stepBtn: TextButton,
 	stepMenu: Frame,
@@ -73,6 +84,12 @@ type Fields = {
 	tf: Timeframe,
 	playing: boolean,
 	speed: number,
+	-- every bar revealed: step/play are no-ops until a rewind
+	atEnd: boolean,
+	-- the trading date the jump box's HH:MM is resolved against, nil until a
+	-- session is running
+	sessionDate: string?,
+	jumpSeq: number,
 	-- A concrete Types.TIMEFRAMES value pins stepping to that timeframe;
 	-- STEP_VIEW follows the chart's. Either way the CONCRETE timeframe is what
 	-- travels in setStepSize.
@@ -120,6 +137,108 @@ local function newLabel(parent: Instance, x: number, w: number, color: Color3): 
 	l.Text = ""
 	l.Parent = parent
 	return l
+end
+
+-- Right-hand jump group: box + go + the RTH-open preset. Anchored to the right
+-- edge so it never collides with the timeframe ladder growing from the left.
+local function newJumpGroup(bar: Frame): (TextBox, TextButton, TextButton)
+	local group = Instance.new("Frame")
+	group.Name = "JumpGroup"
+	group.BorderSizePixel = 0
+	group.BackgroundTransparency = 1
+	group.AnchorPoint = Vector2.new(1, 0.5)
+	group.Position = UDim2.new(1, -PAD, 0.5, 0)
+	group.Size = UDim2.fromOffset(JUMP_BOX_W + JUMP_GO_W + JUMP_PRESET_W + JUMP_GAP * 2, BTN_H)
+	group.Parent = bar
+
+	local box = Instance.new("TextBox")
+	box.Name = "JumpBox"
+	box.BorderSizePixel = 0
+	box.Size = UDim2.fromOffset(JUMP_BOX_W, BTN_H)
+	box.BackgroundColor3 = Theme.border
+	box.TextColor3 = Theme.text
+	-- a wall-clock time, rewritten in place
+	box.Font = Theme.fontMono
+	box.TextSize = Theme.textMd
+	box.PlaceholderText = "HH:MM"
+	box.PlaceholderColor3 = Theme.textDim
+	box.Text = ""
+	box.ClearTextOnFocus = false
+	box.Parent = group
+
+	local go = newButton(group, JUMP_BOX_W + JUMP_GAP, JUMP_GO_W, "go")
+	local preset = newButton(group, JUMP_BOX_W + JUMP_GAP + JUMP_GO_W + JUMP_GAP, JUMP_PRESET_W, JUMP_PRESET)
+	return box, go, preset
+end
+
+-- Overlapping flashes would each schedule their own restore; the newest wins by
+-- bumping the sequence number.
+local function flashJump(self: Controls)
+	self.jumpSeq += 1
+	local seq = self.jumpSeq
+	self.jumpBox.BackgroundColor3 = Theme.down
+	task.delay(FLASH_SEC, function()
+		if self.jumpSeq == seq then
+			self.jumpBox.BackgroundColor3 = Theme.border
+		end
+	end)
+end
+
+local function parseHhMm(text: string): (number?, number?)
+	local hs, ms = string.match(text, "^%s*(%d%d?):(%d%d)%s*$")
+	local h = tonumber(hs)
+	local mi = tonumber(ms)
+	if h == nil or mi == nil or h > 23 or mi > 59 then
+		return nil, nil
+	end
+	return h, mi
+end
+
+-- The epoch second an ET wall time names inside the RUNNING session's day. A
+-- trading day runs from 18:00 ET the evening before its trading date through
+-- that afternoon, so an evening wall time belongs to the calendar day BEFORE
+-- the date the session is named for. Et's civil-date arithmetic is linear in
+-- the day number, so day 0 is exactly the last day of the previous month.
+--
+-- The server refuses anything outside [startTs, endTs] silently, so a time this
+-- returns is still only a request.
+local function jumpTarget(self: Controls, h: number, mi: number): number?
+	local date = self.sessionDate
+	if date == nil then
+		return nil
+	end
+	local ys, mos, ds = string.match(date, "^(%d%d%d%d)-(%d%d)-(%d%d)$")
+	local y = tonumber(ys)
+	local mo = tonumber(mos)
+	local d = tonumber(ds)
+	if y == nil or mo == nil or d == nil then
+		return nil
+	end
+	return Et.etWallToUtc(y, mo, if h >= 18 then d - 1 else d, h, mi)
+end
+
+local function doJump(self: Controls, text: string)
+	local h, mi = parseHhMm(text)
+	local t = if h ~= nil and mi ~= nil then jumpTarget(self, h, mi) else nil
+	if t == nil then
+		flashJump(self)
+		return
+	end
+	self.cbs.send({ cmd = "jumpTo", t = t })
+end
+
+-- Dimmed, never disabled: the buttons still send and the server answers a step
+-- past the last bar by doing nothing, so the dimming is a statement about the
+-- data rather than a lock on the transport.
+local function syncEnd(self: Controls)
+	local fwd = if self.atEnd then Theme.textDim else Theme.text
+	if self.fwdBtn.TextColor3 ~= fwd then
+		self.fwdBtn.TextColor3 = fwd
+	end
+	local play = if self.atEnd then Theme.textDim elseif self.playing then Theme.bg else Theme.text
+	if self.playBtn.TextColor3 ~= play then
+		self.playBtn.TextColor3 = play
+	end
 end
 
 -- The concrete timeframe the server should step by, given the local mode.
@@ -233,7 +352,17 @@ local function wireKeyboard(self: Controls)
 			return Enum.ContextActionResult.Pass -- typing a space, not commanding
 		end
 		if state == Enum.UserInputState.Begin then
-			self.cbs.send({ cmd = if self.playing then "pause" else "play" })
+			-- Ctrl+Space steps exactly one bar and never touches play/pause (the
+			-- web's binding). The action is bound to the Space KeyCode alone, so
+			-- the modifier has to be read here rather than come in with it.
+			if
+				UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+				or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+			then
+				self.cbs.send({ cmd = "stepForward" })
+			else
+				self.cbs.send({ cmd = if self.playing then "pause" else "play" })
+			end
 		end
 		return Enum.ContextActionResult.Sink
 	end, false, Enum.KeyCode.Space)
@@ -272,17 +401,39 @@ function Controls.setTimeframe(self: Controls, tf: Timeframe)
 	end
 end
 
+-- The trading date the jump box resolves its HH:MM against. It arrives either
+-- with a resumed SessionInfo or with the startSession the picker just sent —
+-- the server does NOT re-send SessionInfo on start — and until one of the two
+-- lands there is no day for a jump to fall in.
+function Controls.setSessionDate(self: Controls, date: string?)
+	self.sessionDate = date
+end
+
 -- Authoritative transport state: the bar renders what the server reports, not
 -- what the last click asked for.
 function Controls.onClock(self: Controls, msg: Protocol.Clock)
-	local t = Et.formatET(msg.t, true)
+	local atEnd = msg.atEnd == true
+	-- The suffix rides on the clock's own text so the two can never disagree
+	-- about which timestamp is the last one.
+	local t = Et.formatET(msg.t, true) .. (if atEnd then " - end" else "")
 	if self.clockLabel.Text ~= t then
 		self.clockLabel.Text = t
+	end
+	local restyle = false
+	if self.atEnd ~= atEnd then
+		self.atEnd = atEnd
+		restyle = true
 	end
 	if self.playing ~= msg.playing then
 		self.playing = msg.playing
 		self.playBtn.Text = if msg.playing then "|| pause" else "> play"
+		-- styleButton owns the active/inactive pair; syncEnd overrides the text
+		-- colour afterwards, so it has to run second.
 		styleButton(self.playBtn, msg.playing)
+		restyle = true
+	end
+	if restyle then
+		syncEnd(self)
 	end
 	if self.speed ~= msg.speed then
 		self.speed = msg.speed
@@ -306,8 +457,9 @@ function Controls.new(gui: ScreenGui, cbs: Callbacks): Controls
 	bar.Parent = gui
 
 	local x = PAD
-	local clockLabel = newLabel(bar, x, 178, Theme.accent)
-	x += 178 + PAD
+	-- wide enough for the timestamp plus the range-end suffix
+	local clockLabel = newLabel(bar, x, 204, Theme.accent)
+	x += 204 + PAD
 
 	local backBtn = newButton(bar, x, 34, "|<")
 	x += 34 + 2
@@ -327,11 +479,15 @@ function Controls.new(gui: ScreenGui, cbs: Callbacks): Controls
 		x += TF_BTN_W + 2
 	end
 
+	local jumpBox, jumpGo, jumpPreset = newJumpGroup(bar)
+
 	local self: Controls = setmetatable(
 		{
 			cbs = cbs,
 			clockLabel = clockLabel,
 			playBtn = playBtn,
+			fwdBtn = fwdBtn,
+			jumpBox = jumpBox,
 			speedBtn = speedBtn,
 			stepBtn = stepBtn,
 			stepMenu = stepMenu,
@@ -341,6 +497,9 @@ function Controls.new(gui: ScreenGui, cbs: Callbacks): Controls
 			tf = "1m" :: Timeframe,
 			playing = false,
 			speed = Protocol.SPEEDS[1],
+			atEnd = false,
+			sessionDate = nil :: string?,
+			jumpSeq = 0,
 			stepMode = "1m",
 			serverStepSize = "1m",
 		} :: Fields,
@@ -380,6 +539,20 @@ function Controls.new(gui: ScreenGui, cbs: Callbacks): Controls
 			self:setTimeframe(tf)
 		end)
 	end
+	jumpGo.Activated:Connect(function()
+		doJump(self, jumpBox.Text)
+	end)
+	-- Only Enter commits: a click elsewhere on the HUD blurs the box too, and
+	-- jumping the clock on that would be a rewind nobody asked for.
+	jumpBox.FocusLost:Connect(function(enterPressed: boolean)
+		if enterPressed then
+			doJump(self, jumpBox.Text)
+		end
+	end)
+	jumpPreset.Activated:Connect(function()
+		jumpBox.Text = JUMP_PRESET
+		doJump(self, JUMP_PRESET)
+	end)
 	wireKeyboard(self)
 
 	return self

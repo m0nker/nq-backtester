@@ -23,7 +23,36 @@ type SessionEvent = EventTypes.SessionEvent
 local M = {}
 
 export type ActiveSession = { date: string, events: { SessionEvent }, savedAt: number }
-export type Stats = { sessions: number, trades: number, pnlUsd: number, wins: number }
+-- One trading week's slice of the same counters. `key` is the week's identity
+-- (Board.weekKey); the fold resets the bucket when it no longer matches, so a
+-- stale week never leaks into the current one.
+export type WeekStats = { key: string, sessions: number, trades: number, pnlUsd: number, wins: number }
+-- The same counters folded from LEADERBOARD-ELIGIBLE sessions only. The boards
+-- read exclusively from here: the lifetime fields above absorb every session,
+-- rewound ones included, so posting them would let a player farm free money in
+-- a rewound session and then launder it onto the board through one clean one.
+-- `week` here is the weekly board's number and needs no counters beyond pnl —
+-- its mere presence under the current key IS "at least one eligible session
+-- this week", because nothing else creates it.
+export type EligWeek = { key: string, pnlUsd: number }
+export type EligStats = {
+	sessions: number,
+	trades: number,
+	tradeWins: number,
+	pnlUsd: number,
+	week: EligWeek?,
+}
+-- `wins` counts winning SESSIONS, `tradeWins` winning TRADES. Neither derives
+-- from the other and the leaderboard labels them differently; keep both.
+export type Stats = {
+	sessions: number,
+	trades: number,
+	pnlUsd: number,
+	wins: number,
+	tradeWins: number,
+	week: WeekStats?,
+	elig: EligStats,
+}
 export type PlayerData = { active: ActiveSession?, stats: Stats }
 
 local DATASTORE_NAME = "players_v1"
@@ -132,12 +161,56 @@ local function copyValue(v: any, depth: number): (boolean, any)
 	return true, out
 end
 
+local function freshElig(): EligStats
+	return { sessions = 0, trades = 0, tradeWins = 0, pnlUsd = 0 }
+end
+
 local function freshStats(): Stats
-	return { sessions = 0, trades = 0, pnlUsd = 0, wins = 0 }
+	return { sessions = 0, trades = 0, pnlUsd = 0, wins = 0, tradeWins = 0, elig = freshElig() }
 end
 
 function M.empty(): PlayerData
 	return { stats = freshStats() }
+end
+
+-- Unknown or malformed drops THIS BRANCH ONLY: an unreadable week costs the
+-- player one week's board entry, and taking their lifetime totals down with it
+-- would be the larger loss. (The all-or-nothing rule stays specific to
+-- `active`, whose partial read is genuinely dangerous.)
+local function sanitizeWeek(v: any): WeekStats?
+	if typeof(v) ~= "table" or typeof(v.key) ~= "string" then
+		return nil
+	end
+	return {
+		key = v.key,
+		sessions = numberOr(v.sessions, 0),
+		trades = numberOr(v.trades, 0),
+		pnlUsd = numberOr(v.pnlUsd, 0),
+		wins = numberOr(v.wins, 0),
+	}
+end
+
+local function sanitizeEligWeek(v: any): EligWeek?
+	if typeof(v) ~= "table" or typeof(v.key) ~= "string" then
+		return nil
+	end
+	return { key = v.key, pnlUsd = numberOr(v.pnlUsd, 0) }
+end
+
+-- Malformed or absent resets the branch to zeros rather than dropping it: the
+-- boards read from here and only from here, so an unreadable bucket must mean
+-- "no eligible history", never "fall back to the lifetime numbers".
+local function sanitizeElig(v: any): EligStats
+	if typeof(v) ~= "table" then
+		return freshElig()
+	end
+	return {
+		sessions = numberOr(v.sessions, 0),
+		trades = numberOr(v.trades, 0),
+		tradeWins = numberOr(v.tradeWins, 0),
+		pnlUsd = numberOr(v.pnlUsd, 0),
+		week = sanitizeEligWeek(v.week),
+	}
 end
 
 local function sanitizeStats(v: any): Stats
@@ -149,6 +222,14 @@ local function sanitizeStats(v: any): Stats
 		trades = numberOr(v.trades, 0),
 		pnlUsd = numberOr(v.pnlUsd, 0),
 		wins = numberOr(v.wins, 0),
+		-- Added after players already had stats: everyone existing starts at 0
+		-- winning trades against a non-zero trade count. The board's min-session
+		-- gate is what keeps that discontinuity off the leaderboard.
+		tradeWins = numberOr(v.tradeWins, 0),
+		week = sanitizeWeek(v.week),
+		-- Players who predate this branch start with an empty one, so their boards
+		-- start clean. That is the point of it, not a migration gap.
+		elig = sanitizeElig(v.elig),
 	}
 end
 

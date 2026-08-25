@@ -11,6 +11,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 local Protocol = require(ReplicatedStorage.Shared.Net.Protocol)
+local Board = require(script.Parent.Meta.Board)
 local Session = require(script.Parent.Replay.Session)
 
 local MAX_CMDS_PER_SEC = 30
@@ -29,6 +30,9 @@ local remotes: Session.Remotes = {
 	sessionInfo = remotesFolder:WaitForChild("SessionInfo") :: RemoteEvent,
 }
 local cmdRemote = remotesFolder:WaitForChild("Cmd") :: RemoteEvent
+-- The meta layer is not part of a replay session, so it stays out of
+-- Session.Remotes: nothing in Session sends on it.
+local metaRemote = remotesFolder:WaitForChild("Meta") :: RemoteEvent
 
 type Bucket = { tokens: number, last: number }
 
@@ -122,6 +126,15 @@ cmdRemote.OnServerEvent:Connect(function(player: Player, msg: any)
 		end
 		return
 	end
+	if typeof(msg) == "table" and msg.cmd == "board" then
+		-- A cold board read hits OrderedDataStore, so this yields; like "ready" it
+		-- stays on the remote's own thread rather than blocking the heartbeat.
+		local okBoard, errBoard = guard(Board.handleRequest, player, metaRemote, msg.board)
+		if not okBoard then
+			warn(`[backtester] board request failed for {player.Name}: {errBoard}`)
+		end
+		return
+	end
 	local ok, err = guard(Session.handleCmd, s, msg)
 	if not ok then
 		warn(`[backtester] command failed for {player.Name}: {err}`)
@@ -154,6 +167,11 @@ game:BindToClose(function()
 		end
 	end
 end)
+
+-- Records whether OrderedDataStore really rejects negative values, which the
+-- leaderboard encoding assumes but the docs do not state. Studio only, on a
+-- throwaway scope, and nothing waits on it.
+task.spawn(Board.probeNegativeValues)
 
 Players.PlayerAdded:Connect(onPlayerAdded)
 Players.PlayerRemoving:Connect(onPlayerRemoving)

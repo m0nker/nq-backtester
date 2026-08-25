@@ -134,6 +134,15 @@ function BarCache.getCandles(self: BarCache): { Bar }
 	return self.candles
 end
 
+-- Close of the newest revealed candle, or nil before the first packet. At an
+-- aggregated timeframe that candle is the still-growing bucket, whose close is
+-- the latest revealed base close — which is exactly the price a mark-to-market
+-- readout wants.
+function BarCache.getLastClose(self: BarCache): number?
+	local last = self.candles[#self.candles]
+	return if last ~= nil then last.c else nil
+end
+
 function BarCache.onChanged(self: BarCache, fn: () -> ())
 	table.insert(self.listeners, fn)
 end

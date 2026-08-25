@@ -19,12 +19,22 @@ npx tsx roblox/tools/uploadData.ts --universe <universeId> --dry-run
 npx tsx roblox/tools/uploadData.ts --universe <universeId>
 ```
 
+A fourth, narrow one: `--hist-only` rebuilds just the deep 1h history from the
+month buffers already in `data-out/m/`. No Supabase round trip, no credentials,
+months and `SampleData.luau` / `Codec.json` untouched — use it after a codec or
+aggregation change, not to produce data from scratch.
+
+```sh
+npx tsx roblox/tools/prepareData.ts --hist-only
+```
+
 ## What gets produced
 
 | Path | Content | Committed? |
 |---|---|---|
 | `roblox/data-out/m/YYYY-MM.bin` | one BarCodec v1 chunk per calendar month | no (gitignored) |
-| `roblox/data-out/manifest.json` | `{ tickSize, baseSec, months:[{ month, key, byteSize, days:[{ date, firstTs, lastTs, barCount }] }] }` | no (gitignored) |
+| `roblox/data-out/hist/1h.bin` | the whole dataset as 1h bars, one BarCodec v1 chunk | no (gitignored) |
+| `roblox/data-out/manifest.json` | `{ tickSize, baseSec, months:[{ month, key, byteSize, days:[{ date, firstTs, lastTs, barCount }] }], hist:{ key, file, barCount, byteSize, firstTs, lastTs } }` | no (gitignored) |
 | `roblox/src/server/Data/SampleData.luau` | 3 consecutive weekday trading days, base64, for Studio/offline runs | yes |
 | `roblox/tests/fixtures/Codec.json` | ~8 bars + their exact packed bytes — pins the TS packer to `BarCodec.luau` | yes |
 
@@ -76,6 +86,44 @@ negative and sign-extreme cases with synthetic bars instead. The run prints the
 post-shift min low / max high in both price and ticks, so the i32 margin stays
 visible if the dataset is ever extended backwards.
 
+## Deep 1h history (`META_PLAN.md` §4)
+
+One extra artifact: the entire dataset folded to 1h bars, so the game can draw a
+multi-year 1h/4h/1D/1W/1M chart without loading 190 month keys.
+
+```
+hist:1h   95,789 bars   2,298,956 B raw   3,065,276 base64 chars
+                                          = 73.1% of the 4,194,304 DataStore cap
+```
+
+Headroom is ~1.13 M chars ≈ 35,000 more hourly bars ≈ six more years of daily
+data. Past the `3,800,000`-char split trigger, `META_PLAN.md` §4.1's year-boundary
+split (`hist:1h:1`, `hist:1h:2`, … concatenated by the server until a `GetAsync`
+returns nil) has to be built; until then the tool **aborts** at that threshold
+rather than shipping untested split code.
+
+Three properties this artifact must keep, all enforced in the tool:
+
+- **It shares the global shift.** The hourly bars are folded from the same
+  normalized 1m bars the months are packed from, so the shift is inherited, not
+  reapplied — the history and the live minute data are in one price frame and
+  splice without a step. There is no separate normalization pass to keep in sync.
+- **Buckets are the game's buckets.** Aggregation goes through
+  `web/src/lib/replay/aggregate.ts`, which anchors 1h to the **18:00 ET
+  trading-day open**, not to UTC hours. Hand-rolled hourly bucketing would split
+  the hour differently from the live data and put a one-candle lie at every
+  session start.
+- **Months are folded one at a time**, carrying only the currently open bucket
+  across the boundary, so a full run never holds 5.4 M bars at once. A month's
+  first trading date opens 18:00 ET the previous evening — itself a bucket
+  start — so the carry never actually merges anything; the run prints the
+  straddle count (observed: 0) so a silent change would be visible.
+
+The packed chunk is round-tripped like every month. Independently verified once
+against a from-scratch recomputation off the month `.bin`s (all 95,789 buckets
+identical, volume conserved, every bucket start 1h-aligned and monotonic), and
+two runs produce byte-identical output.
+
 ## One-time Open Cloud setup (user action)
 
 `uploadData.ts` cannot run until this exists — no key is provisioned yet.
@@ -106,12 +154,16 @@ DataStore `bars_v1`, standard (not ordered):
 - `m:YYYY-MM` → the `.bin` as a **base64 string** (Open Cloud values are JSON,
   so binary travels as text; the server decodes with `EncodingService` and
   hands the buffer to `BarCodec.decode`).
+- `hist:1h` → `hist/1h.bin` the same way. Written **once per run**: 3 MB against
+  a 4 MB/min per-key write ceiling. Read once per server and cached forever on
+  the read side (25 MB/min ⇒ 8 reads/min), never per session.
 - `manifest` → the `manifest.json` object verbatim, the day index the server
   reads before it knows which month key to fetch.
 
 Writes go to the `standard-datastores/.../entries/entry` endpoint with the
 required `content-md5` header, throttled to one per 500 ms. A full-history
 upload is ~190 month keys, roughly two minutes. Each key stays well under the
-4 MB DataStore limit (a 22-day month is ~950 KiB base64); `uploadData.ts`
-refuses any value that would exceed it, and cross-checks `manifest.json`
-against the files on disk in both directions before writing anything.
+4 MB DataStore limit (a 22-day month is ~950 KiB base64; `hist:1h` is the one
+big key at 73%); `uploadData.ts` refuses any value that would exceed it, and
+cross-checks `manifest.json` against the files on disk in both directions before
+writing anything.

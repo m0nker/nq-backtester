@@ -225,14 +225,31 @@ Size: **M**.
 
 ### 1.1 Metrics and boards
 
-Three boards, all sourced from `PlayerStore.Stats` — the fold that already
-exists, no new accounting.
+Three boards, all sourced from `PlayerStore.Stats.elig` — the eligible-only
+fold (see the revision note below).
 
 | Board id | Metric | Source | Gate |
 |---|---|---|---|
-| `pnlAll` | lifetime realized USD | `stats.pnlUsd` | ≥ 3 eligible sessions |
-| `pnlWeek` | this trading week's realized USD | `stats.week.pnlUsd` | ≥ 1 eligible session this week |
-| `winRate` | **session** win rate, basis points | `stats.wins / stats.sessions` | ≥ 10 eligible sessions |
+| `pnlAll` | lifetime realized USD | `stats.elig.pnlUsd` | `elig.sessions` ≥ 3 |
+| `pnlWeek` | this trading week's realized USD | `stats.elig.week.pnlUsd` | `elig.week.key` is the current week |
+| `winRate` | **trade** win rate, basis points | `stats.elig.tradeWins / stats.elig.trades` | `elig.sessions` ≥ 10 |
+
+**REVISION (implementation of §1, landed): boards read `stats.elig`, never the
+lifetime counters.** As originally written, §1.5 gated which *session* was
+allowed to trigger a post, but the value posted was the lifetime total — and
+`finalizeActive` folds every session into that total, ineligible ones included.
+A player could therefore rewind-farm free money in session 1 (never posted, but
+banked in `stats.pnlUsd`), then play one clean session 2 and launder the whole
+contaminated total onto the board. `Stats` now carries a second bucket,
+`elig = { sessions, trades, tradeWins, pnlUsd, week = { key, pnlUsd }? }`,
+folded **only** when `Board.eligible` passes; the lifetime fields stay as the
+HUD/lifetime truth and are folded unconditionally as before. This also makes
+the "≥ N eligible sessions" gates exact rather than an approximation against
+`stats.sessions`. `elig.week` is created solely by an eligible fold, so its
+presence under the current week key *is* "≥ 1 eligible session this week" and
+needs no session counter of its own. Players who predate the branch start with
+an empty one — their boards start clean, which is the intent, not a migration
+gap.
 
 **Read `wins` carefully before implementing.** `finalizeActive` increments
 `stats.wins` when `outgoing.realizedUsd > 0 and #outgoing.trades > 0` — that is
@@ -244,6 +261,11 @@ every existing player, so it needs a schema-version bump or an accepted
 discontinuity. **Recommendation: add `tradeWins`, ship `winRate` off it, and
 accept that pre-existing players start at 0/0 (gated out by the min-sessions
 rule anyway).**
+
+**LANDED: the recommendation was taken.** `winRate` is a per-TRADE rate off
+`elig.tradeWins / elig.trades`, so §1.7's UI must label it "win rate" (per
+trade), NOT "session win rate". `stats.wins` still counts winning sessions and
+is kept for the HUD; no board reads it.
 
 ### 1.2 OrderedDataStore layout
 
