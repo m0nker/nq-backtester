@@ -83,6 +83,9 @@ function sanitizeChartColors(raw: unknown): ChartColors {
 
 interface Persisted {
   enabled: Timeframe[];
+  // Also draw the gaps of whatever timeframe each chart is currently on
+  // (follows TF switches). Additive to `enabled`, deduped when they overlap.
+  fvgCurrentTf: boolean;
   statuses: FVGStatus[]; // which gap statuses are drawn
   showCE: boolean;
   fvgBull: string; // FVG box colors + outline toggle (visibility on light canvases)
@@ -106,6 +109,7 @@ interface Persisted {
 
 const DEFAULTS: Persisted = {
   enabled: ['15m'],
+  fvgCurrentTf: false,
   statuses: [...ALL_STATUSES],
   showCE: true,
   fvgBull: '#26a69a',
@@ -145,6 +149,7 @@ function loadPersisted(): Persisted {
       enabled: (p.enabled ?? DEFAULTS.enabled).filter((tf): tf is Timeframe =>
         FVG_TF_CHOICES.includes(tf as Timeframe),
       ),
+      fvgCurrentTf: p.fvgCurrentTf ?? DEFAULTS.fvgCurrentTf,
       statuses: readStatuses(p),
       showCE: p.showCE ?? DEFAULTS.showCE,
       fvgBull: typeof p.fvgBull === 'string' && COLOR_RE.test(p.fvgBull) ? p.fvgBull : DEFAULTS.fvgBull,
@@ -185,6 +190,7 @@ function save(s: Persisted) {
 interface ConceptsState extends Persisted {
   openPanel: OverlayPanel;
   toggleTf: (tf: Timeframe) => void;
+  setFvgCurrentTf: (v: boolean) => void;
   toggleStatus: (s: FVGStatus) => void;
   setShowCE: (v: boolean) => void;
   updateFvgStyle: (patch: Partial<Pick<Persisted, 'fvgBull' | 'fvgBear' | 'fvgOutline'>>) => void;
@@ -210,6 +216,7 @@ export const useConcepts = create<ConceptsState>((set) => {
   const commit = (s: ConceptsState, patch: Partial<Persisted>): Partial<Persisted> => {
     save({
       enabled: patch.enabled ?? s.enabled,
+      fvgCurrentTf: patch.fvgCurrentTf ?? s.fvgCurrentTf,
       statuses: patch.statuses ?? s.statuses,
       showCE: patch.showCE ?? s.showCE,
       fvgBull: patch.fvgBull ?? s.fvgBull,
@@ -239,6 +246,8 @@ export const useConcepts = create<ConceptsState>((set) => {
           enabled: s.enabled.includes(tf) ? s.enabled.filter((t) => t !== tf) : [...s.enabled, tf],
         }),
       ),
+
+    setFvgCurrentTf: (v) => set((s) => commit(s, { fvgCurrentTf: v })),
 
     toggleStatus: (st) =>
       set((s) =>

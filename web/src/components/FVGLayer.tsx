@@ -69,6 +69,8 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
   const currentTime = useReplay((s) => s.currentTime);
   const dataVersion = useReplay((s) => s.dataVersion);
   const enabled = useConcepts((s) => s.enabled);
+  const fvgCurrentTf = useConcepts((s) => s.fvgCurrentTf);
+  const chartTf = useReplay((s) => s.timeframes[instrument]);
   const statuses = useConcepts((s) => s.statuses);
   const showCE = useConcepts((s) => s.showCE);
   const fvgBull = useConcepts((s) => s.fvgBull);
@@ -92,10 +94,14 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
   // re-renders only re-map boxes to pixels.
   const gaps = useMemo<FVG[]>(() => {
     void dataVersion; // new chunks / trims change the candle set
-    if (currentTime === null || enabled.length === 0) return [];
+    // Pinned timeframes plus (optionally) this chart's own timeframe. Session
+    // timeframes (1D/1W/1M) aren't FVG choices, so "current" adds nothing there.
+    const tfs = [...enabled];
+    if (fvgCurrentTf && FVG_TF_CHOICES.includes(chartTf) && !tfs.includes(chartTf)) tfs.push(chartTf);
+    if (currentTime === null || tfs.length === 0) return [];
     const src = sources[instrument];
     const out: FVG[] = [];
-    for (const tf of enabled) {
+    for (const tf of tfs) {
       // windowed: the detector's own default lookback is the real bound, so
       // folding the whole visible series (250k 1s bars on 15s/30s) is waste
       out.push(...computeFVGs(src.getRecentCandles(currentTime, tf, OVERLAY_LOOKBACK + 5), tf, currentTime, {
@@ -103,7 +109,7 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
       }));
     }
     return out;
-  }, [currentTime, dataVersion, enabled, instrument]);
+  }, [currentTime, dataVersion, enabled, fvgCurrentTf, chartTf, instrument]);
 
   // Draw-on-liquidity levels (mech concepts). Only the categories toggled on
   // in the LIQ panel are drawn (display-only — the bot's own DOL config is
@@ -433,7 +439,7 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
       <div className="pointer-events-auto absolute bottom-16 left-2 z-20 flex items-end gap-1">
         <button
           className={`flex h-7 items-center justify-center rounded border px-1.5 font-mono text-[11px] ${
-            enabled.length > 0
+            enabled.length > 0 || fvgCurrentTf
               ? 'border-teal-500 bg-teal-950/80 text-teal-300'
               : 'border-slate-700 bg-slate-900/90 text-slate-400 hover:bg-slate-800'
           }`}
@@ -441,6 +447,7 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
           onClick={() => useConcepts.getState().setOpenPanel(openPanel === 'fvg' ? null : 'fvg')}
         >
           FVG{enabled.length > 0 ? ` ${enabled.length}` : ''}
+          {fvgCurrentTf ? (enabled.length > 0 ? '+TF' : ' TF') : ''}
         </button>
         <button
           className={`flex h-7 items-center justify-center rounded border px-1.5 font-mono text-[11px] ${
@@ -599,6 +606,18 @@ export default function FVGLayer({ instrument, chartRef, seriesRef, geoRef, over
         )}
         {openPanel === 'fvg' && (
           <div className="flex flex-wrap items-center gap-1 rounded border border-slate-700 bg-[#0d1119]/95 p-1.5">
+            <button
+              className={`rounded border px-1.5 py-0.5 font-mono text-[11px] ${
+                fvgCurrentTf
+                  ? 'border-teal-500 bg-teal-900/60 text-teal-200'
+                  : 'border-slate-700 bg-slate-900 text-slate-400 hover:bg-slate-800'
+              }`}
+              title="Also show the gaps of each chart's CURRENT timeframe — follows timeframe switches, works alongside the pinned timeframes"
+              onClick={() => useConcepts.getState().setFvgCurrentTf(!fvgCurrentTf)}
+            >
+              chart TF
+            </button>
+            <span className="mx-0.5 h-4 w-px bg-slate-700" />
             {FVG_TF_CHOICES.map((tf) => (
               <button
                 key={tf}

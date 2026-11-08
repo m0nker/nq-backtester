@@ -14,12 +14,12 @@ export interface SessionRow {
   created_at: string;
 }
 
-export async function listSessions(includeArchived = false): Promise<SessionRow[]> {
+export async function listSessions(includeArchived = false, limit = 100): Promise<SessionRow[]> {
   let q = supabase
     .from('sessions')
     .select('id, instrument_id, start_ts, starting_balance, config, status, created_at')
     .order('created_at', { ascending: false })
-    .limit(100);
+    .limit(limit);
   if (!includeArchived) q = q.eq('status', 'active');
   const { data, error } = await q;
   if (error) throw new Error(`session list failed: ${error.message}`);
